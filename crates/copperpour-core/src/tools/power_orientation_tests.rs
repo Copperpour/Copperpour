@@ -50,7 +50,10 @@ fn remove_one_new_saved_item(
             is_target(&node) && !existing.contains(&&node)
         });
     let (start, end) = spans.next().expect("the writer saved the new item");
-    assert!(spans.next().is_none(), "the edit must remove exactly one item");
+    assert!(
+        spans.next().is_none(),
+        "the edit must remove exactly one item"
+    );
     let edited = apply_edits(saved.clone(), vec![SexpEdit::delete(start, end)]);
     write_atomic_if_unchanged(path, &saved, &edited).unwrap();
 }
@@ -162,7 +165,7 @@ fn an_unrelated_existing_wire_is_not_licensed_by_an_ordinary_route() {
 fn only_a_wire_running_outward_from_the_tip_consumes_its_corridor() {
     // The probe's rectangle intersects either corridor from (20, 20), but
     // misses the pin tip itself. Use one facing per sheet to isolate each test.
-    let source = r#"(kicad_sch
+    let source = r##"(kicad_sch
         (lib_symbols
             (symbol "test:Pin" (symbol "Pin_1_1" PIN))
             (symbol "test:Probe" (symbol "Probe_0_1"
@@ -170,7 +173,7 @@ fn only_a_wire_running_outward_from_the_tip_consumes_its_corridor() {
         (symbol (lib_id "test:Pin") (at 20 20 0) (unit 1)
             (uuid "pin") (property "Reference" "J1"))
         (symbol (lib_id "test:Probe") PROBE_AT (unit 1)
-            (uuid "probe") (property "Reference" "#PWR01")))"#;
+            (uuid "probe") (property "Reference" "#PWR01")))"##;
     for (angle, probe_at, outward, behind, remote) in [
         (
             180,
@@ -187,9 +190,8 @@ fn only_a_wire_running_outward_from_the_tip_consumes_its_corridor() {
             (20.0, 25.08),
         ),
     ] {
-        let pin = format!(
-            r#"(pin passive line (at 0 0 {angle}) (length 1.27) (name "~") (number "1"))"#
-        );
+        let pin =
+            format!(r#"(pin passive line (at 0 0 {angle}) (length 1.27) (name "~") (number "1"))"#);
         let candidate =
             parse_sexp(&source.replace("PIN", &pin).replace("PROBE_AT", probe_at)).unwrap();
         for (start, end, expected) in [
@@ -684,7 +686,10 @@ async fn assert_power_length_refused(tool: &str, mut args: Value, reason: &str) 
     };
     let reply: Value = serde_json::from_str(text).unwrap();
     assert!(result.is_error, "{tool}: {reply}");
-    assert_eq!(reply["error"]["kind"], "invalid_argument", "{tool}: {reply}");
+    assert_eq!(
+        reply["error"]["kind"], "invalid_argument",
+        "{tool}: {reply}"
+    );
     assert_eq!(reply["error"]["field"], "stub_length", "{tool}: {reply}");
     assert_eq!(reply["error"]["reason"], reason, "{tool}: {reply}");
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -1488,7 +1493,10 @@ async fn a_missing_saved_power_stub_junction_reports_an_uncertain_mutation() {
     let handler = handler().await;
     let (_dir, path) = fixture_with_wire_exit(&handler).await;
     let (_, before) = read_schematic(&path).unwrap();
-    let counts = (before.find_all("symbol").len(), before.find_all("wire").len());
+    let counts = (
+        before.find_all("symbol").len(),
+        before.find_all("wire").len(),
+    );
     save_before_power_readback(&path, move |path| {
         remove_one_new_saved_item(path, "junction", &before, |dot| {
             parse_at(dot).is_some_and(|(x, y, _)| (x, y) == (68.58, 124.46))
@@ -1507,12 +1515,18 @@ async fn a_missing_saved_power_stub_junction_reports_an_uncertain_mutation() {
     assert_eq!(after.find_all("wire").len(), counts.1 + 1);
     assert!(!copperpour_sexp::schematic::extract_junctions(&after).contains(&(68.58, 124.46)));
     assert_eq!(reply["is_error"], true, "{reply}");
-    assert_eq!(reply["error"]["kind"], "mutation_outcome_uncertain", "{reply}");
-    assert_eq!(reply["error"]["operation"], tool, "{reply}");
-    assert_eq!(reply["error"]["path"], path.display().to_string(), "{reply}");
     assert_eq!(
-        reply["error"]["reason"],
-        "a new junction was not found in the saved file",
+        reply["error"]["kind"], "mutation_outcome_uncertain",
+        "{reply}"
+    );
+    assert_eq!(reply["error"]["operation"], tool, "{reply}");
+    assert_eq!(
+        reply["error"]["path"],
+        path.display().to_string(),
+        "{reply}"
+    );
+    assert_eq!(
+        reply["error"]["reason"], "a new junction was not found in the saved file",
         "{reply}"
     );
 }
@@ -1522,7 +1536,10 @@ async fn a_missing_saved_power_bar_wire_reports_an_uncertain_mutation() {
     let handler = handler().await;
     let (_dir, path) = fixture();
     let (_, before) = read_schematic(&path).unwrap();
-    let counts = (before.find_all("symbol").len(), before.find_all("wire").len());
+    let counts = (
+        before.find_all("symbol").len(),
+        before.find_all("wire").len(),
+    );
     save_before_power_readback(&path, move |path| {
         // Remove the vertical bar only. Both horizontal stubs, the symbol
         // and the planned junction must survive the simulated save.
@@ -1544,9 +1561,16 @@ async fn a_missing_saved_power_bar_wire_reports_an_uncertain_mutation() {
     assert_eq!(after.find_all("wire").len(), counts.1 + 2);
     assert!(copperpour_sexp::schematic::extract_junctions(&after).contains(&(71.12, 137.16)));
     assert_eq!(reply["is_error"], true, "{reply}");
-    assert_eq!(reply["error"]["kind"], "mutation_outcome_uncertain", "{reply}");
+    assert_eq!(
+        reply["error"]["kind"], "mutation_outcome_uncertain",
+        "{reply}"
+    );
     assert_eq!(reply["error"]["operation"], tool, "{reply}");
-    assert_eq!(reply["error"]["path"], path.display().to_string(), "{reply}");
+    assert_eq!(
+        reply["error"]["path"],
+        path.display().to_string(),
+        "{reply}"
+    );
     let reason = reply["error"]["reason"].as_str().unwrap();
     assert!(
         reason.starts_with("wire ") && reason.ends_with(" is not in the saved file"),

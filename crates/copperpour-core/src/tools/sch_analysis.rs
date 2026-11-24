@@ -1742,7 +1742,10 @@ mod clearance_tests {
                 (effects (font (size 1.27 1.27))) (uuid "label")))"#;
         let after = parse_sexp(after_source).unwrap();
         for (id, previous) in [
-            ("label", after_source.replace("(at 20 20 0)", "(at 20 40 0)")),
+            (
+                "label",
+                after_source.replace("(at 20 20 0)", "(at 20 40 0)"),
+            ),
             ("body", after_source.replace("(at 24 20 0)", "(at 24 40 0)")),
         ] {
             let before = parse_sexp(&previous).unwrap();
