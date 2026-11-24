@@ -68,6 +68,150 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+#[test]
+fn a_power_wire_readback_requires_its_uuid_and_planned_start() {
+    let saved = [
+        Wire {
+            x1: 20.0,
+            y1: 20.0,
+            x2: 22.54,
+            y2: 20.0,
+            uuid: Some("other".into()),
+        },
+        Wire {
+            x1: 21.27,
+            y1: 20.0,
+            x2: 22.54,
+            y2: 20.0,
+            uuid: Some("stub".into()),
+        },
+    ];
+    let start = (20.0, 20.0);
+    let end = (22.54, 20.0);
+    assert!(observed_power_wire(&saved[..1], "stub", start, end).is_none());
+    assert!(observed_power_wire(&saved[1..], "stub", start, end).is_none());
+    assert!(observed_power_wire(&saved, "stub", (21.27, 20.0), end).is_some());
+}
+
+#[test]
+fn a_nearby_junction_does_not_authorize_contact_at_a_foreign_point() {
+    // A diagonal meets the proposed stub within the segment tolerance, just
+    // past its end. The nearby junction is farther out, beyond that tolerance.
+    let junction = (22.556, 20.008);
+    let obstacles = PowerObstacles {
+        points: vec![(junction, "junction")],
+        wires: vec![((21.548, 19.0), (23.548, 21.0))],
+        junctions: vec![junction],
+        unresolved_pins: vec![],
+    };
+    let start = (20.0, 20.0);
+    let end = (22.54, 20.0);
+    assert_eq!(
+        obstacles.blocking(&[(start, end)], &[start]).as_deref(),
+        Some("a wire would touch an existing wire at (22.548, 20)")
+    );
+}
+
+#[test]
+fn a_route_can_tap_an_existing_wire_but_a_power_stub_cannot_adopt_its_net() {
+    let before = parse_sexp(
+        r#"(kicad_sch
+            (wire (pts (xy 10 20) (xy 30 20)) (uuid "existing"))
+            (label "SIGNAL" (at 10 20 0) (uuid "signal")))"#,
+    )
+    .unwrap();
+    let after = parse_sexp(
+        r#"(kicad_sch
+            (wire (pts (xy 10 20) (xy 30 20)) (uuid "existing"))
+            (wire (pts (xy 20 20) (xy 20 30)) (uuid "new"))
+            (junction (at 20 20) (uuid "dot"))
+            (label "SIGNAL" (at 10 20 0) (uuid "signal")))"#,
+    )
+    .unwrap();
+    let from = (20.0, 20.0);
+    let ordinary = RouteGuard::new(&before, from, &[]).unwrap();
+    assert!(ordinary.foreign_joins(&after).is_empty());
+    let joined = RouteGuard::for_power(&before, from, &[], "GND").foreign_joins(&after);
+    assert_eq!(joined.len(), 1, "{joined:?}");
+    assert!(joined[0].contains("label SIGNAL"), "{joined:?}");
+}
+
+#[test]
+fn an_unrelated_existing_wire_is_not_licensed_by_an_ordinary_route() {
+    let before = parse_sexp(
+        r#"(kicad_sch
+            (wire (pts (xy 30 20) (xy 40 20)) (uuid "existing"))
+            (label "OTHER" (at 40 20 0) (uuid "other")))"#,
+    )
+    .unwrap();
+    let after = parse_sexp(
+        r#"(kicad_sch
+            (wire (pts (xy 30 20) (xy 40 20)) (uuid "existing"))
+            (wire (pts (xy 20 20) (xy 30 20)) (uuid "new"))
+            (label "OTHER" (at 40 20 0) (uuid "other")))"#,
+    )
+    .unwrap();
+    let joined = RouteGuard::new(&before, (20.0, 20.0), &[])
+        .unwrap()
+        .foreign_joins(&after);
+    assert_eq!(joined.len(), 1, "{joined:?}");
+    assert!(joined[0].contains("label OTHER"), "{joined:?}");
+}
+
+#[test]
+fn only_a_wire_running_outward_from_the_tip_consumes_its_corridor() {
+    // The probe's rectangle intersects either corridor from (20, 20), but
+    // misses the pin tip itself. Use one facing per sheet to isolate each test.
+    let source = r#"(kicad_sch
+        (lib_symbols
+            (symbol "test:Pin" (symbol "Pin_1_1" PIN))
+            (symbol "test:Probe" (symbol "Probe_0_1"
+                (rectangle (start -1 1) (end 1 -1)))))
+        (symbol (lib_id "test:Pin") (at 20 20 0) (unit 1)
+            (uuid "pin") (property "Reference" "J1"))
+        (symbol (lib_id "test:Probe") PROBE_AT (unit 1)
+            (uuid "probe") (property "Reference" "#PWR01")))"#;
+    for (angle, probe_at, outward, behind, remote) in [
+        (
+            180,
+            "(at 22 20 0)",
+            (22.54, 20.0),
+            (17.46, 20.0),
+            (25.08, 20.0),
+        ),
+        (
+            90,
+            "(at 20 22 0)",
+            (20.0, 22.54),
+            (20.0, 17.46),
+            (20.0, 25.08),
+        ),
+    ] {
+        let pin = format!(
+            r#"(pin passive line (at 0 0 {angle}) (length 1.27) (name "~") (number "1"))"#
+        );
+        let candidate =
+            parse_sexp(&source.replace("PIN", &pin).replace("PROBE_AT", probe_at)).unwrap();
+        for (start, end, expected) in [
+            ((20.0, 20.0), outward, 0),
+            ((20.0, 20.0), behind, 1),
+            (remote, outward, 1),
+        ] {
+            let before = parse_sexp(&format!(
+                "(kicad_sch (wire (pts (xy {} {}) (xy {} {}))))",
+                start.0, start.1, end.0, end.1
+            ))
+            .unwrap();
+            let crossings = power_corridor_crossings(&before, &candidate, "probe", (0.0, 0.0));
+            assert_eq!(crossings.len(), expected, "{angle}: {start:?} to {end:?}");
+            if let Some(crossing) = crossings.first() {
+                assert_eq!(crossing["b"]["reference"], "J1");
+                assert_eq!(crossing["b"]["pin_number"], "1");
+            }
+        }
+    }
+}
+
 async fn place(handler: &McpHandler, path: &Path, net: &str, pin: &str) -> Value {
     let (reference, pin_number) = pin.split_once('.').unwrap();
     let reply = serve(

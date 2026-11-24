@@ -1709,6 +1709,79 @@ mod clearance_tests {
     }
 
     #[test]
+    fn a_changed_first_label_reports_its_overlap_with_an_unchanged_label() {
+        let before = parse_sexp(
+            r#"(kicad_sch
+                (label "LONG_SIGNAL_B" (at 21.27 20 0)
+                    (effects (font (size 1.27 1.27))) (uuid "b")))"#,
+        )
+        .unwrap();
+        let after = parse_sexp(
+            r#"(kicad_sch
+                (label "LONG_SIGNAL_A" (at 20 20 0)
+                    (effects (font (size 1.27 1.27))) (uuid "a"))
+                (label "LONG_SIGNAL_B" (at 21.27 20 0)
+                    (effects (font (size 1.27 1.27))) (uuid "b")))"#,
+        )
+        .unwrap();
+        let findings = added_clearance_findings(&before, &after, &["a"]).findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0]["type"], "text_overlap");
+        assert_eq!(findings[0]["a"]["uuid"], "a");
+        assert_eq!(findings[0]["b"]["uuid"], "b");
+    }
+
+    #[test]
+    fn a_text_body_overlap_is_attributed_to_each_changed_side() {
+        let after_source = r#"(kicad_sch
+            (lib_symbols (symbol "test:Box"
+                (symbol "Box_0_1" (rectangle (start -5 4) (end 5 -4)))))
+            (symbol (lib_id "test:Box") (at 24 20 0) (unit 1)
+                (uuid "body") (property "Reference" "U1"))
+            (label "SIGNAL" (at 20 20 0)
+                (effects (font (size 1.27 1.27))) (uuid "label")))"#;
+        let after = parse_sexp(after_source).unwrap();
+        for (id, previous) in [
+            ("label", after_source.replace("(at 20 20 0)", "(at 20 40 0)")),
+            ("body", after_source.replace("(at 24 20 0)", "(at 24 40 0)")),
+        ] {
+            let before = parse_sexp(&previous).unwrap();
+            let findings = added_clearance_findings(&before, &after, &[id]).findings;
+            assert_eq!(findings.len(), 1, "{id}: {findings:?}");
+            assert_eq!(findings[0]["type"], "text_overlap");
+            assert_eq!(findings[0]["a"]["uuid"], "label");
+            assert_eq!(findings[0]["b"]["symbol_uuid"], "body");
+        }
+    }
+
+    #[test]
+    fn only_a_changed_wire_can_introduce_a_collinear_overlap() {
+        let source = r#"(kicad_sch
+            (wire (pts (xy 10 19) (xy 16 19)) (uuid "a"))
+            (wire (pts (xy 12 25) (xy 17 25)) (uuid "b"))
+            (label "SIG" (at 50 50 0) (uuid "label")))"#;
+        let before = parse_sexp(source).unwrap();
+        let after = parse_sexp(
+            &source
+                .replace("(xy 10 19) (xy 16 19)", "(xy 10 20) (xy 16 20)")
+                .replace("(xy 12 25) (xy 17 25)", "(xy 12 20) (xy 17 20)")
+                .replace("(at 50 50 0)", "(at 60 50 0)"),
+        )
+        .unwrap();
+        // Both wire positions in the pair can authorize the finding. A label
+        // edit must not report the new overlap between unrelated wires.
+        for id in ["a", "b"] {
+            let findings = added_clearance_findings(&before, &after, &[id]).findings;
+            assert_eq!(findings.len(), 1, "{id}: {findings:?}");
+            assert_eq!(findings[0]["type"], "collinear_overlap");
+            assert_eq!(findings[0]["a"]["uuid"], "a");
+            assert_eq!(findings[0]["b"]["uuid"], "b");
+        }
+        let findings = added_clearance_findings(&before, &after, &["label"]).findings;
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
     fn moving_a_symbol_onto_another_pin_reports_the_contact() {
         let before = parse_sexp(SOURCE).unwrap();
         let mut after = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
