@@ -107,6 +107,7 @@ mod sch_label_rename;
 mod sch_layout_score;
 mod sch_page_fit;
 mod sch_pin_contacts;
+mod sch_placement_check;
 pub mod sch_readability;
 mod sch_shapes;
 mod sch_texts;
