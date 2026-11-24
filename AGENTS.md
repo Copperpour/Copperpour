@@ -5,6 +5,13 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and review,
 [the reliability contract](docs/RELIABILITY_CONTRACT.md) for tool behavior,
 and [the naming conventions](docs/NAMING_CONVENTIONS.md) for identifiers and API names.
 
+## Definition of done
+
+A PR is done when it meets [the pull request checklist](CONTRIBUTING.md#pull-request-checklist).
+Test what the PR changes, not every corner case
+([Tests and fixtures](CONTRIBUTING.md#tests-and-fixtures)). The `PR shape` CI job
+checks the issue reference and the migration note.
+
 ## Before you push
 
 Run the checks for the changed paths in [.github/workflows/ci.yml](.github/workflows/ci.yml).

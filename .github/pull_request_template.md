@@ -1,12 +1,16 @@
 ## Summary
 
 <!--
+The definition of done is CONTRIBUTING.md's pull request checklist:
+https://github.com/Copperpour/Copperpour/blob/main/CONTRIBUTING.md#pull-request-checklist
 What user-visible problem does this solve? Keep the scope to one reviewable outcome.
 Use "Part of #N" for a partial PR. Use "Closes #N" only for the terminal PR that
-satisfies every current acceptance criterion.
+satisfies every current acceptance criterion. Keep it on a line of its own: a
+prose "Issue: #N" line does not link the issue, and the PR shape check fails.
+A mechanical change says "No issue: <reason>" instead.
 -->
 
-Issue: #
+Closes # (or Part of #)
 
 ## Approach
 
@@ -43,7 +47,11 @@ List public API/config/schema changes and their migration path, and add a
 note in docs/api-migrations/ for each.
 For file or IPC mutations, explain target validation, atomicity/rollback, and failure behavior.
 Write "No public compatibility impact" when applicable.
+When tool code changes but no caller can see it, keep the line below with a
+reason; otherwise delete it and add the note.
 -->
+
+API migration: none — <reason>
 
 ## Validation
 
@@ -83,7 +91,7 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
   has been reviewed on the new exact head. An unchanged unique diff may use a
   focused refresh review; changed behavior received substantive re-review.
 - [ ] New names follow `docs/NAMING_CONVENTIONS.md`; public renames include compatibility handling.
-- [ ] New behavior and failure paths have regression coverage.
+- [ ] Each changed behavior and each new refusal has a test ([Tests and fixtures](../CONTRIBUTING.md#tests-and-fixtures)); failures use a typed error kind.
 - [ ] File mutations are atomic and preserve unrelated content.
 - [ ] IPC mutations verify the requested board; atomic/partial behavior and safe recovery are explicit under the reliability contract.
 - [ ] If tools were added/removed: `tool-directory.md` rows updated; tool counts left for the release (CONTRIBUTING.md).
