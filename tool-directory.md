@@ -194,7 +194,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `check_connector_pin_signals` | Report which connector pins show their signal on one saved schematic sheet. Lists connected pins with no signal evidence as findings. |
-| `check_placement` | Report the overlaps `check_schematic_overlaps` finds, from the same code, and placed symbol pin tips off KiCad's nominal 1.27 mm grid, on one saved sheet. Refuses a sheet whose pins cannot all be resolved. Read-only. |
+| `check_placement` | Report the overlaps `check_schematic_overlaps` finds, placed symbol pin tips off KiCad's nominal 1.27 mm grid, and caller-specified pin pairs that do not share the expected row or column on one saved sheet. Refuses unresolved pin geometry or selectors. Read-only. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text). Report wires drawn through a symbol body, label text, visible power symbol Value text, or visible Reference or Value text on ordinary symbols. Name symbols checked using the origin fallback. |
 | `check_schematic_page_fit` | Check a saved schematic against its inner drawing frame and title block. Report per-item overflow, intrusion and missing coverage without editing the schematic or changing paper size. |
 | `check_schematic_wire_runs` | Report long or indirect orthogonal wire runs, including collinear backtracking, on one saved sheet. Includes drawn length, detour length, bends and endpoint status. Read-only. |

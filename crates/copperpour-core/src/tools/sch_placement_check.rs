@@ -6,25 +6,73 @@
 
 use super::sch_analysis::{overlap_findings, OVERLAP_TOLERANCE};
 use super::sch_layout_score::read_saved_sheet;
-use super::{drawn_symbol_pins, get_path, ToolDef, UNRESOLVED_PIN_GEOMETRY};
+use super::{
+    drawn_symbol_pins, get_path, invalid_arg, PlacedPinsByReference, ToolDef,
+    UNRESOLVED_PIN_GEOMETRY,
+};
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use copperpour_sexp::geometry::{is_on_schematic_pin_grid, SCHEMATIC_PIN_GRID_MM};
+use copperpour_sexp::geometry::{is_on_schematic_pin_grid, round6, SCHEMATIC_PIN_GRID_MM};
 use copperpour_sexp::schematic::{extract_wires, parse_at, pin_endpoint, SymbolInstance};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Alignment {
+    Row,
+    Column,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PinSelector {
+    symbol_uuid: String,
+    pin_number: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlignmentPair {
+    a: PinSelector,
+    b: PinSelector,
+    alignment: Alignment,
+}
+
 pub(super) fn definition() -> ToolDef {
+    let pin = json!({
+        "type": "object",
+        "properties": {
+            "symbol_uuid": {"type": "string", "minLength": 1, "description": "Saved placed symbol UUID"},
+            "pin_number": {"type": "string", "minLength": 1, "description": "Pin number on that placed unit and body style"}
+        },
+        "required": ["symbol_uuid", "pin_number"]
+    });
     tool!(
         "check_placement",
         "Check one saved schematic sheet's placement: the overlaps check_schematic_overlaps \
          reports, from the same code, and placed symbol pin tips off KiCad's nominal 1.27 mm \
-         grid. Refuses a sheet whose symbol pins cannot all be resolved rather than \
-         reporting it clean. Does not open KiCad, follow child sheets or write.",
+         grid. Optionally check caller-specified pin pairs for row or column alignment. \
+         Refuses unresolved pin geometry or a pair that does not name two unique pins. \
+         Does not open KiCad, follow child sheets or write.",
         json!({
             "type": "object",
             "properties": {
-                "schematic": {"type": "string", "description": "Path to the saved .kicad_sch sheet"}
+                "schematic": {"type": "string", "description": "Path to the saved .kicad_sch sheet"},
+                "alignment_pairs": {
+                    "type": ["array", "null"],
+                    "description": "Pairs to check. Row means equal pin-tip Y; column means equal pin-tip X. Omit or pass null or [] to check no pairs.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "a": pin,
+                            "b": pin,
+                            "alignment": {"type": "string", "enum": ["row", "column"]}
+                        },
+                        "required": ["a", "b", "alignment"]
+                    }
+                }
             },
             "required": ["schematic"]
         }),
@@ -34,7 +82,13 @@ pub(super) fn definition() -> ToolDef {
 
 fn handle_check_placement(args: &Value) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "schematic")?;
-    Ok(match check_placement(&path) {
+    let pairs =
+        match serde_json::from_value::<Option<Vec<AlignmentPair>>>(args["alignment_pairs"].clone())
+        {
+            Ok(pairs) => pairs.unwrap_or_default(),
+            Err(err) => return Ok(invalid_arg("alignment_pairs", &err.to_string())),
+        };
+    Ok(match check_placement(&path, &pairs) {
         Ok(report) => CallToolResult::json(&report),
         Err(err) => err,
     })
@@ -59,6 +113,51 @@ impl PinPosition<'_> {
     }
 }
 
+fn pair_pin<'a, 'sheet>(
+    placed: &PlacedPinsByReference,
+    pins: &'a [PinPosition<'sheet>],
+    selector: &PinSelector,
+    field: &str,
+) -> Result<&'a PinPosition<'sheet>, CallToolResult> {
+    let uuid = field.to_owned() + ".symbol_uuid";
+    if selector.symbol_uuid.is_empty() {
+        return Err(invalid_arg(&uuid, "expected a non-empty symbol UUID"));
+    }
+    let mut symbols = placed
+        .iter()
+        .filter(|(symbol, _)| symbol.uuid.as_deref() == Some(selector.symbol_uuid.as_str()));
+    if symbols.next().is_none() {
+        return Err(invalid_arg(
+            &uuid,
+            "symbol UUID not found on the saved sheet",
+        ));
+    }
+    if symbols.next().is_some() {
+        return Err(invalid_arg(
+            &uuid,
+            "symbol UUID is not unique on the saved sheet",
+        ));
+    }
+    let number = field.to_owned() + ".pin_number";
+    if selector.pin_number.is_empty() {
+        return Err(invalid_arg(&number, "expected a non-empty pin number"));
+    }
+    let mut matching = pins.iter().filter(|pin| {
+        pin.symbol.uuid.as_deref() == Some(selector.symbol_uuid.as_str())
+            && pin.number == selector.pin_number
+    });
+    let Some(pin) = matching.next() else {
+        return Err(invalid_arg(&number, "pin not found on the placed symbol"));
+    };
+    if matching.next().is_some() {
+        return Err(invalid_arg(
+            &number,
+            "pin number has multiple placed endpoints",
+        ));
+    }
+    Ok(pin)
+}
+
 fn malformed(path: &Path, reason: &str) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::MalformedFile {
@@ -69,7 +168,7 @@ fn malformed(path: &Path, reason: &str) -> CallToolResult {
     )
 }
 
-fn check_placement(path: &Path) -> Result<Value, CallToolResult> {
+fn check_placement(path: &Path, pairs: &[AlignmentPair]) -> Result<Value, CallToolResult> {
     let (_, tree) = read_saved_sheet(path)?;
     let placed =
         drawn_symbol_pins(&tree).ok_or_else(|| malformed(path, UNRESOLVED_PIN_GEOMETRY))?;
@@ -125,6 +224,33 @@ fn check_placement(path: &Path) -> Result<Value, CallToolResult> {
         .filter(|pin| !is_on_schematic_pin_grid(pin.at.0) || !is_on_schematic_pin_grid(pin.at.1))
         .map(PinPosition::json)
         .collect();
+    let mut misaligned_pairs = Vec::new();
+    for (index, pair) in pairs.iter().enumerate() {
+        let field = format!("alignment_pairs[{index}]");
+        if pair.a == pair.b {
+            return Err(invalid_arg(&field, "expected two distinct pin selectors"));
+        }
+        let a = pair_pin(&placed, &pins, &pair.a, &format!("{field}.a"))?;
+        let b = pair_pin(&placed, &pins, &pair.b, &format!("{field}.b"))?;
+        let (left, right) = match pair.alignment {
+            Alignment::Row => (a.at.1, b.at.1),
+            Alignment::Column => (a.at.0, b.at.0),
+        };
+        // Pin endpoints are already rounded by the shared schematic transform.
+        if left != right {
+            let offset_mm = round6((left - right).abs());
+            if !offset_mm.is_finite() {
+                return Err(malformed(path, "pin alignment offset is not finite"));
+            }
+            misaligned_pairs.push(json!({
+                "pair_index": index,
+                "alignment": pair.alignment,
+                "offset_mm": offset_mm,
+                "a": a.json(),
+                "b": b.json(),
+            }));
+        }
+    }
     let (overlaps, bounds_resolved, bounds_unresolved) =
         overlap_findings(&tree, &wires, OVERLAP_TOLERANCE);
     Ok(json!({
@@ -134,6 +260,8 @@ fn check_placement(path: &Path) -> Result<Value, CallToolResult> {
         "pin_count": pins.len(),
         "off_grid_pin_count": off_grid_pins.len(),
         "off_grid_pins": off_grid_pins,
+        "alignment_pair_count": pairs.len(),
+        "misaligned_pairs": misaligned_pairs,
         "overlap_count": overlaps.len(),
         "overlaps": overlaps,
         "bounds_resolved": bounds_resolved,
