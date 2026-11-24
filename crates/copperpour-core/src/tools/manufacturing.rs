@@ -83,8 +83,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "validate_for_manufacturing",
             "Pre-flight check before ordering: verifies the design is ready for the target \
-             fab house. Runs KiCad's DRC and checks board outline, design rules, footprints, \
-             and routing evidence. Returns NOT READY — never READY — if \
+             fab house. Reads the saved .kicad_pcb file on disk and runs KiCad's DRC on that \
+             saved snapshot (unsaved KiCad editor changes are excluded), checks board outline, \
+             design rules, footprints, and routing evidence, and reports provenance. Returns \
+             NOT READY — never READY — if \
              DRC reports errors or could not be run, so a READY verdict always rests on \
              evidence rather than on an absence of findings. The response lists the first \
              `limit` issues, `issues_count` all of them; `output` writes the whole response \
@@ -109,6 +111,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "estimate_cost",
             "Estimate the total manufacturing cost for PCB fabrication and assembly at a given fab house. \
+             Reads the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) and \
+             reports provenance. \
              Counts the parts the board's BOM lists and returns an itemized rough estimate: \
              PCB, components, assembly, and total. For jlcpcb, parts with an LCSC field are priced \
              from the local JLCPCB catalog at the price break for the order's quantity, plus the \
@@ -1225,6 +1229,15 @@ async fn handle_validate_for_manufacturing(
         "net_count": net_count,
         "track_count": track_count
     });
+    let sources = json!({
+        "board": super::board_source::FROM_SAVED_BOARD,
+        "drc": if drc.is_ok() {
+            super::board_source::FROM_KICAD_CLI
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        },
+    });
+    let source_evidence = super::board_source::saved_snapshot_evidence(ctx, &board);
     let response = |limit| {
         let listed = super::BoundedList::new(&issues, limit);
         ValidationResponse {
@@ -1233,6 +1246,8 @@ async fn handle_validate_for_manufacturing(
             fab_house,
             board_info: &board_info,
             drc: &drc_summary,
+            sources: &sources,
+            source_evidence: &source_evidence,
             issues_count: listed.count,
             issues_shown: listed.shown,
             issues_truncated: listed.truncated,
@@ -1271,6 +1286,8 @@ struct ValidationResponse<'a> {
     /// object: this tool must not be able to imply a clean board it never
     /// checked.
     drc: &'a serde_json::Value,
+    sources: &'a serde_json::Value,
+    source_evidence: &'a serde_json::Value,
     /// `issues` holds the first `issues_shown` of `issues_count`, as
     /// `run_drc` reports `shown` and `truncated` beside its list.
     issues_count: usize,
@@ -1493,36 +1510,50 @@ async fn handle_estimate_cost(
         "[BETA] Cost estimate calculated"
     );
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "fab_house": fab_house,
-            "quantity": quantity,
-            "board": {
-                "width_mm": width_mm,
-                "height_mm": height_mm,
-                // What this estimate was priced at, and what the board itself
-                // declares. They differ only when the caller passed `layers`.
-                "copper_layers": copper_layers,
-                "board_copper_layers": board_copper_layers,
-                "component_count": component_count
-            },
-            "warnings": warnings,
-            "components": components,
-            "cost_estimate": {
-                "pcb_fabrication": format!("${:.2}", pcb_cost),
-                "smt_assembly": format!("${:.2}", assembly_cost),
-                "components_estimate": format!("${:.2}", component_est),
-                "extended_parts_fee": format!("${:.2}", extended_parts_fee),
-                "total_estimate": format!("${:.2}", total),
-                "per_board": format!("${:.2}", total / quantity as f64),
-                // The PCB and assembly prices have no cited source (#209).
-                "approximate": approximate
-            },
-            "notes": notes,
-            "disclaimer": "BETA: Cost estimates are indicative only. Always confirm with the fab house's online quoting tool."
-        }))
-        .unwrap(),
-    ))
+    let copper_layers_source = if requested_layers.is_some() {
+        super::board_source::FROM_ARGUMENT
+    } else if board_copper_layers > 0 {
+        super::board_source::FROM_SAVED_BOARD
+    } else {
+        super::board_source::FROM_UNAVAILABLE
+    };
+    let mut body = json!({
+        "fab_house": fab_house,
+        "quantity": quantity,
+        "board": {
+            "width_mm": width_mm,
+            "height_mm": height_mm,
+            // What this estimate was priced at, and what the board itself
+            // declares. They differ only when the caller passed `layers`.
+            "copper_layers": copper_layers,
+            "board_copper_layers": board_copper_layers,
+            "component_count": component_count
+        },
+        "warnings": warnings,
+        "components": components,
+        "cost_estimate": {
+            "pcb_fabrication": format!("${:.2}", pcb_cost),
+            "smt_assembly": format!("${:.2}", assembly_cost),
+            "components_estimate": format!("${:.2}", component_est),
+            "extended_parts_fee": format!("${:.2}", extended_parts_fee),
+            "total_estimate": format!("${:.2}", total),
+            "per_board": format!("${:.2}", total / quantity as f64),
+            // The PCB and assembly prices have no cited source (#209).
+            "approximate": approximate
+        },
+        "notes": notes,
+        "disclaimer": "BETA: Cost estimates are indicative only. Always confirm with the fab house's online quoting tool."
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "copper_layers": copper_layers_source,
+            "cost_estimate": super::board_source::FROM_DERIVED,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 #[cfg(all(test, feature = "jlcpcb"))]

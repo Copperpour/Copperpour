@@ -99,7 +99,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "audit_manufacturing",
             "DFM checks for the configured fab house: component spacing, silkscreen overlap, \
-             via-in-pad, acid traps, board outline issues.",
+             via-in-pad, acid traps, board outline issues. Reads the saved .kicad_pcb file on \
+             disk (unsaved KiCad editor changes are excluded) and reports provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -120,7 +121,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Run all available audit checks and produce a consolidated design review report. \
              Audits every reachable schematic sheet, and when a board is supplied also runs \
              KiCAD's DRC, folding its errors, unconnected items and schematic-parity findings \
-             into the verdict. Reports status, coverage, and diagnostics. Returns an INCOMPLETE \
+             into the verdict. Reads saved schematic and board files on disk and runs kicad-cli \
+             DRC on the saved board (unsaved editor changes are excluded) and reports provenance. \
+             Reports status, coverage, and diagnostics. Returns an INCOMPLETE \
              verdict instead of approval when coverage is partial, when an audit failed, or \
              when DRC could not run. This is the tool to call when the user asks 'is my board \
              ready?' or 'review my design'.",
@@ -630,7 +633,7 @@ fn pool_global_rail_findings(findings: Vec<Value>, bodies: &[(String, Value)]) -
 
 async fn handle_audit_manufacturing(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
@@ -720,16 +723,19 @@ async fn handle_audit_manufacturing(
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "audit": "manufacturing",
-            "fab_house": fab_house,
-            "components": { "front": front_count, "back": back_count },
-            "findings": findings,
-            "summary": format!("{} DFM issues found for {}.", findings.len(), fab_house)
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "audit": "manufacturing",
+        "fab_house": fab_house,
+        "components": { "front": front_count, "back": back_count },
+        "findings": findings,
+        "summary": format!("{} DFM issues found for {}.", findings.len(), fab_house)
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({ "board": super::board_source::FROM_SAVED_BOARD }),
+        super::board_source::saved_snapshot_evidence(ctx, &board_path),
+    );
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 // ─── Unified design review ───────────────────────────────────────────────────
@@ -1460,44 +1466,75 @@ async fn handle_run_design_review(
     );
     outcome["diagnostic_count"] = json!(diagnostics.len());
 
+    let (sources, source_evidence) = if let Some(board) = args["board"].as_str() {
+        let board_path = PathBuf::from(board);
+        let evidence = if board_coverage.is_some() || drc_summary.is_some() {
+            super::board_source::saved_snapshot_evidence(ctx, &board_path)
+        } else {
+            super::board_source::saved_board_unavailable_evidence(ctx, &board_path)
+        };
+        (
+            json!({
+                "schematic": super::board_source::FROM_SAVED_SCHEMATIC,
+                "board": if board_coverage.is_some() {
+                    super::board_source::FROM_SAVED_BOARD
+                } else {
+                    super::board_source::FROM_UNAVAILABLE
+                },
+                "drc": if drc_summary.is_some() {
+                    super::board_source::FROM_KICAD_CLI
+                } else {
+                    super::board_source::FROM_UNAVAILABLE
+                },
+            }),
+            evidence,
+        )
+    } else {
+        (
+            json!({
+                "schematic": super::board_source::FROM_SAVED_SCHEMATIC,
+            }),
+            super::board_source::schematic_only_evidence(),
+        )
+    };
+    let mut body = json!({
+        "design_review": {
+            "status": status,
+            "verdict": verdict,
+            "errors": error_count,
+            "warnings": warning_count,
+            "info": info_count,
+            "severity_filter": severity_filter,
+            "findings": all_findings,
+            "audits": audit_summaries,
+            "coverage": {
+                "schematic": {
+                    "sheet_instances": schematic_coverage.sheet_instances,
+                    "schematic_files": schematic_coverage.schematic_files,
+                    "symbol_instances": schematic_coverage.symbol_instances,
+                    "resolved_symbols": schematic_coverage.resolved_symbols,
+                    "unresolved_symbols": schematic_coverage.unresolved_symbols,
+                    "named_nets": schematic_coverage.named_nets,
+                    "multi_unit_symbols": schematic_coverage.multi_unit_symbols
+                },
+                "board": board_coverage.map(|coverage| json!({
+                    "footprints": coverage.footprints,
+                    "pads": coverage.pads,
+                    "named_nets": coverage.named_nets
+                }))
+            },
+            // Null when no board was supplied, or when DRC could not run
+            // — in the latter case `diagnostics` says so and the verdict
+            // is INCOMPLETE. Never zero: this review must not be able to
+            // imply a clean board it did not check.
+            "drc": drc_summary,
+            "diagnostics": diagnostics
+        }
+    });
+    super::board_source::provenance(&mut body, sources, source_evidence);
+
     Ok(crate::outcome::attach(
-        CallToolResult::text(
-            serde_json::to_string(&json!({
-                "design_review": {
-                    "status": status,
-                    "verdict": verdict,
-                    "errors": error_count,
-                    "warnings": warning_count,
-                    "info": info_count,
-                    "severity_filter": severity_filter,
-                    "findings": all_findings,
-                    "audits": audit_summaries,
-                    "coverage": {
-                        "schematic": {
-                            "sheet_instances": schematic_coverage.sheet_instances,
-                            "schematic_files": schematic_coverage.schematic_files,
-                            "symbol_instances": schematic_coverage.symbol_instances,
-                            "resolved_symbols": schematic_coverage.resolved_symbols,
-                            "unresolved_symbols": schematic_coverage.unresolved_symbols,
-                            "named_nets": schematic_coverage.named_nets,
-                            "multi_unit_symbols": schematic_coverage.multi_unit_symbols
-                        },
-                        "board": board_coverage.map(|coverage| json!({
-                            "footprints": coverage.footprints,
-                            "pads": coverage.pads,
-                            "named_nets": coverage.named_nets
-                        }))
-                    },
-                    // Null when no board was supplied, or when DRC could not run
-                    // — in the latter case `diagnostics` says so and the verdict
-                    // is INCOMPLETE. Never zero: this review must not be able to
-                    // imply a clean board it did not check.
-                    "drc": drc_summary,
-                    "diagnostics": diagnostics
-                }
-            }))
-            .unwrap(),
-        ),
+        CallToolResult::text(serde_json::to_string(&body).unwrap()),
         outcome,
     ))
 }

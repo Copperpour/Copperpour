@@ -245,7 +245,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "check_3d_models",
-            "Audit placed footprints in the saved .kicad_pcb file (unsaved editor changes are not included) for missing 3D models or broken/unresolvable model file paths before export_3d. Includes hidden models; embedded models are resolved from footprint or board embedded_files.",
+            "Audit placed footprints in the saved .kicad_pcb file (unsaved editor changes are not included) for missing 3D models or broken/unresolvable model file paths before export_3d. Includes hidden models; embedded models are resolved from footprint or board embedded_files. Reports provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -709,7 +709,7 @@ fn model_is_present(
 
 async fn handle_check_3d_models(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_str = match crate::tools::require_str(args, "board") {
         Ok(s) => s,
@@ -792,7 +792,7 @@ async fn handle_check_3d_models(
         "ISSUES_FOUND"
     };
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "verdict": verdict,
         "board": board.to_string_lossy(),
         "total_footprints": total_footprints,
@@ -804,7 +804,13 @@ async fn handle_check_3d_models(
         "skipped_board_only": skipped_board_only,
         "missing_models": missing_models,
         "broken_models": broken_models,
-    })))
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({ "footprints": super::board_source::FROM_SAVED_BOARD }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_bom(

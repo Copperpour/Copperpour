@@ -292,7 +292,8 @@ pub(super) fn list_tool() -> ToolDef {
          hides the rules after it; a string left open, or a text variable, which KiCad expands \
          from the board and the check does not, hides them all. A rule with no name is not \
          listed. kicad-cli is not run, so property names come back unchecked. A board with no \
-         rules file has none.",
+         rules file has none. Reads the saved .kicad_pcb and sibling .kicad_dru files on disk \
+         (unsaved editor changes are excluded) and reports provenance.",
         json!({
             "type": "object",
             "properties": {
@@ -631,22 +632,32 @@ async fn handle_delete_custom_rule(
 
 async fn handle_list_custom_rules(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let BoardFacts { user_layers, .. } = read_board(&board)?;
     let rules_path = sibling_custom_rules_path(&board);
+    let evidence = super::board_source::saved_snapshot_evidence(ctx, &board);
     let text = match read_consistent(&rules_path) {
         Ok(text) => text,
         Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CallToolResult::json(&json!({
+            let mut body = json!({
                 "rules_file": rules_path,
                 "exists": false,
                 "count": 0,
                 "rules": [],
                 "faults": [],
                 "unchecked_properties": [],
-            })))
+            });
+            super::board_source::provenance(
+                &mut body,
+                json!({
+                    "rules": super::board_source::FROM_UNAVAILABLE,
+                    "user_layers": super::board_source::FROM_SAVED_BOARD,
+                }),
+                evidence,
+            );
+            return Ok(CallToolResult::json(&body));
         }
         Err(error) => return Err(error.into()),
     };
@@ -662,14 +673,23 @@ async fn handle_list_custom_rules(
             })
         })
         .collect();
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "rules_file": rules_path,
         "exists": true,
         "count": rules.len(),
         "rules": rules,
         "faults": checked.faults,
         "unchecked_properties": checked.properties,
-    })))
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "rules": super::board_source::FROM_CUSTOM_RULES_FILE,
+            "user_layers": super::board_source::FROM_SAVED_BOARD,
+        }),
+        evidence,
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 /// `text` without the rule at `span`. A rule that ends its line goes with the
@@ -2814,6 +2834,16 @@ mod tests {
                 "rules": [],
                 "faults": [],
                 "unchecked_properties": [],
+                "sources": {
+                    "rules": "unavailable",
+                    "user_layers": "saved_board",
+                },
+                "source_evidence": {
+                    "board_state": "saved_board",
+                    "excludes_unsaved_editor_state": true,
+                    "reason": "saved_snapshot_only",
+                    "detail": "This tool inspects the saved files on disk without consulting KiCad IPC; any unsaved editor changes are excluded.",
+                },
                 "is_error": false
             })
         );
