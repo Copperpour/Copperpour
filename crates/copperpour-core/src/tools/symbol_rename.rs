@@ -166,15 +166,15 @@ fn stored_name(requested: &str) -> Result<String, String> {
 }
 
 /// A top-level symbol of the library.
-struct Symbol {
+pub(super) struct Symbol {
     /// The block, from its `(`.
-    start: usize,
+    pub(super) start: usize,
     end: usize,
-    name: String,
-    extends: Option<String>,
+    pub(super) name: String,
+    pub(super) extends: Option<String>,
 }
 
-fn symbols(source: &str) -> Vec<Symbol> {
+pub(super) fn symbols(source: &str) -> Vec<Symbol> {
     find_direct_child_blocks(source, "kicad_symbol_lib")
         .into_iter()
         .filter_map(|(start, end)| {

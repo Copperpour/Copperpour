@@ -6472,8 +6472,6 @@ mod tests {
         kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
     }
 
-    /// KiCad's report of `reference`, the update `source` builds for it, and
-    /// the domains the plan reports.
     /// KiCad 10.0.8's own placement of stock footprints with custom pads
     /// (`custom_pads_ipc.README.md`), and KiCad's resave of each library
     /// footprint. Two captures are left out because the refresh does not take
@@ -6602,7 +6600,18 @@ mod tests {
             ))
         );
 
-        let anchor = source.replacen("(anchor circle)", "(anchor rect)", 1);
+        // KiCad's default spoke angle follows the anchor, 45° for a circle and
+        // 90° for a rect (`default_thermal_spoke_angle`), so pad 1 states its
+        // 45° first: the anchor is then the only difference the plan can see.
+        assert_eq!(source.matches("(at -1.45 -0.9)").count(), 1);
+        let angled = source.replacen(
+            "(at -1.45 -0.9)",
+            "(at -1.45 -0.9) (thermal_bridge_angle 45)",
+            1,
+        );
+        let (_, _, changed) = custom_pads_refresh(capture, &angled).unwrap();
+        assert_eq!(changed, BTreeSet::new());
+        let anchor = angled.replacen("(anchor circle)", "(anchor rect)", 1);
         let (_, _, changed) = custom_pads_refresh(capture, &anchor).unwrap();
         assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
     }
@@ -6622,6 +6631,8 @@ mod tests {
         );
     }
 
+    /// KiCad's report of `reference`, the update `source` builds for it, and
+    /// the domains the plan reports.
     fn issue_283_refresh(
         reference: &str,
         source: &str,

@@ -13,7 +13,9 @@ number is in more than one unit or body style; `pin_name`, or `pin_x` and
 and its line go; everything else in the library stays as written.
 
 - **Answer:** `removed` gives the pin's number, name, type, style, unit, body
-  style, position, angle, length and visibility.
+  style, position, angle, length and visibility. `derived_symbols` names the
+  symbols that extend the symbol, directly or through other derived symbols:
+  their pins are its, so they lose the pin too.
 - **Refused before writing:** a choice that fits more than one pin
   (`ambiguous_target`, naming the candidates), a number the symbol does not have,
   a selector that matches none, and a derived symbol (`invalid_argument` on

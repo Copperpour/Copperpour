@@ -989,6 +989,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // response field the net-tie guidance names, not callable tools (#85).
         "net_ties",
         "not_carried",
+        // `delete_symbol_pin`'s response field naming the symbols that lose
+        // the pin too, not a callable tool (#830's review).
+        "derived_symbols",
     ];
 
     let mut phantom = Vec::new();

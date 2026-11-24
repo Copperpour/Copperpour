@@ -282,7 +282,8 @@ as `edit_symbol_pin` does: `pin_number`, then `unit` or `body_style` where the
 number is in several, then `pin_name` or `pin_x` and `pin_y` where pins share a
 number in one unit and body style; an ambiguous choice is refused before
 writing. A derived symbol is refused: remove the pin from its root. The answer
-reports the removed pin.
+reports the removed pin, and `derived_symbols` names the symbols that extend
+the symbol, which lose the pin too.
 
 ### Symbol Layout Guidelines
 

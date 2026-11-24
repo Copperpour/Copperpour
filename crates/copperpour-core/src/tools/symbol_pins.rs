@@ -12,6 +12,7 @@ use crate::tools::library::{
 };
 use crate::tools::sch_annotate::opt_string;
 use crate::tools::symbol_fields::{header, symbol_block, unusable, write_checked};
+use crate::tools::symbol_rename::symbols;
 use crate::tools::{invalid_arg, ToolContext, ToolDef};
 use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::writer::{
@@ -1016,7 +1017,8 @@ pub(crate) fn delete_tool() -> ToolDef {
          body style, and pin_name or pin_x and pin_y when pins share a number in one unit and \
          body style. An ambiguous choice is refused before writing; a derived symbol is \
          refused, since its pins are its root's. Everything else, and the rest of the library, \
-         is left as written. Reports the removed pin.",
+         is left as written. The pin is also gone from every symbol that extends the symbol, \
+         since their pins are its. Reports the removed pin and those symbols.",
         json!({
             "type": "object",
             "properties": {
@@ -1080,7 +1082,7 @@ async fn handle_delete_symbol_pin(
         }
         Err(error) => return Err(error.into()),
     };
-    let (removed, replacement) = match prepare_delete(&path, &source, &request) {
+    let (removed, replacement, derived) = match prepare_delete(&path, &source, &request) {
         Ok(delete) => delete,
         Err(error) => return Ok(error),
     };
@@ -1107,17 +1109,19 @@ async fn handle_delete_symbol_pin(
             "angle": leading_integer(&removed.angle),
             "length": measure(&removed.length),
             "hidden": removed.hidden
-        }
+        },
+        "derived_symbols": derived
     })))
 }
 
-/// The chosen pin, and the library without it: its block goes with the
-/// whitespace that leads it, so its line goes and nothing else moves.
+/// The chosen pin, the library without it, and the symbols that lose it too
+/// ([`derived_from`]): its block goes with the whitespace that leads it, so
+/// its line goes and nothing else moves.
 fn prepare_delete(
     path: &Path,
     source: &str,
     request: &Request,
-) -> Result<(Pin, String), CallToolResult> {
+) -> Result<(Pin, String, Vec<String>), CallToolResult> {
     let root = source.len() - source.trim_start().len();
     if header(source, root).map(|(head, _)| head) != Some("kicad_symbol_lib") {
         return Err(unusable(path, "it is not a (kicad_symbol_lib ...) file"));
@@ -1140,7 +1144,45 @@ fn prepare_delete(
     Ok((
         pin,
         apply_edits(source.to_string(), vec![SexpEdit::delete(from, to)]),
+        derived_from(source, start),
     ))
+}
+
+/// The symbols of the library whose pins are those of the root symbol whose
+/// block starts at `root`, in library order: each symbol whose `extends`
+/// chain reaches it, directly or through other derived symbols. KiCad follows
+/// the chain the same way and stops at a cycle (`LIB_SYMBOL::GetRootSymbol`,
+/// `eeschema/lib_symbol.cpp`), so a symbol in a cycle that leaves the root out
+/// is not listed.
+fn derived_from(source: &str, root: usize) -> Vec<String> {
+    let symbols = symbols(source);
+    let Some(root) = symbols.iter().find(|symbol| symbol.start == root) else {
+        return Vec::new();
+    };
+    let parent_of = |name: &str| {
+        symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .and_then(|symbol| symbol.extends.as_deref())
+    };
+    symbols
+        .iter()
+        .filter(|symbol| {
+            let mut visited = std::collections::BTreeSet::from([symbol.name.as_str()]);
+            let mut parent = symbol.extends.as_deref();
+            while let Some(name) = parent {
+                if name == root.name {
+                    return true;
+                }
+                if !visited.insert(name) {
+                    return false;
+                }
+                parent = parent_of(name);
+            }
+            false
+        })
+        .map(|symbol| symbol.name.clone())
+        .collect()
 }
 
 /// Why `written` is not `before` without `removed`, or `None` when it is:
@@ -2455,6 +2497,7 @@ mod tests {
                 "length": 2.54, "hidden": false
             })
         );
+        assert_eq!(body_of(&result)["derived_symbols"], json!([]));
 
         let (result, written) = delete_pin(json!({
             "symbol_name": "GATE", "pin_number": "1", "body_style": 2
@@ -2463,6 +2506,25 @@ mod tests {
         assert!(!result.is_error, "{:?}", result.content);
         assert_eq!(written, DE_MORGAN_REMOVED);
         assert_eq!(body_of(&result)["removed"]["style"], "inverted");
+        assert_eq!(body_of(&result)["derived_symbols"], json!(["GATE_ALT"]));
+    }
+
+    /// The symbols that lose the pin too: every symbol whose `extends` chain
+    /// reaches the root, through other derived symbols as well, and none that
+    /// only loops among themselves.
+    #[test]
+    fn the_symbols_that_extend_the_root_lose_the_pin_too() {
+        let end = DELETE_SOURCE.trim_end().strip_suffix(')').unwrap();
+        let library = format!(
+            "{end}\t(symbol \"GATE_ALT_2\"\n\t\t(extends \"GATE_ALT\")\n\t)\n\
+             \t(symbol \"LOOP_A\"\n\t\t(extends \"LOOP_B\")\n\t)\n\
+             \t(symbol \"LOOP_B\"\n\t\t(extends \"LOOP_A\")\n\t)\n\
+             \t(symbol \"ORPHAN\"\n\t\t(extends \"MISSING\")\n\t)\n)\n"
+        );
+        let derived =
+            |symbol: &str| derived_from(&library, symbol_block(&library, symbol).unwrap().0);
+        assert_eq!(derived("GATE"), ["GATE_ALT", "GATE_ALT_2"]);
+        assert_eq!(derived("DUP"), Vec::<String>::new());
     }
 
     /// The pin is chosen as edit_symbol_pin chooses one; a choice that names
@@ -2552,6 +2614,30 @@ mod tests {
             find_block_with_leading_whitespace(DUPLICATE_REMOVED, last.block.0).unwrap();
         let two_gone = format!("{}{}", &DUPLICATE_REMOVED[..from], &DUPLICATE_REMOVED[to..]);
         assert!(delete_readback_mismatch(&two_gone, DELETE_SOURCE, "DUP", removed).is_some());
+    }
+
+    /// Deleting one block cannot move another pin to another unit or body
+    /// style, or hide it, but the check before writing would refuse a plan
+    /// that did: each kept pin's unit, body style and visibility are compared
+    /// on their own (#830's review).
+    #[test]
+    fn the_readback_check_wants_the_kept_pins_where_and_as_they_were() {
+        let (start, end) = symbol_block(DELETE_SOURCE, "DUP").unwrap();
+        let removed = &symbol_pins(DELETE_SOURCE, start, end).unwrap()[2];
+        let check =
+            |written: &str| delete_readback_mismatch(written, DELETE_SOURCE, "DUP", removed);
+        assert_eq!(check(DUPLICATE_REMOVED), None);
+        assert_eq!(DUPLICATE_REMOVED.matches("(symbol \"DUP_1_1\"").count(), 1);
+        for moved in ["DUP_2_1", "DUP_1_2"] {
+            let written =
+                DUPLICATE_REMOVED.replace("(symbol \"DUP_1_1\"", &format!("(symbol \"{moved}\""));
+            let reason = check(&written).unwrap_or_else(|| panic!("{moved}: no mismatch"));
+            assert!(reason.contains("unit 1 body style 1"), "{moved}: {reason}");
+        }
+        assert_eq!(DUPLICATE_REMOVED.matches("(pin passive line").count(), 2);
+        let hidden = DUPLICATE_REMOVED.replacen("(pin passive line", "(pin passive line hide", 1);
+        let reason = check(&hidden).expect("a newly hidden pin is a mismatch");
+        assert!(reason.contains("pin '1'"), "{reason}");
     }
 
     #[test]
