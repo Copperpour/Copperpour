@@ -1,7 +1,8 @@
 //! `edit_symbol_pin`: change one pin's electrical type, graphic style, name,
 //! number, position, angle, length or visibility in an existing `.kicad_sym`
-//! symbol, leaving everything else as written; and `delete_symbol_pin`, which
-//! removes one pin chosen the same way (#716).
+//! symbol, leaving everything else as written; `edit_symbol_pins`, which
+//! changes several pins of one symbol so in one write (#868); and
+//! `delete_symbol_pin`, which removes one pin chosen the same way (#716).
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -64,11 +65,33 @@ pub(super) fn tool() -> ToolDef {
          (pin_x, pin_y). Everything else, and the rest of the library, is left as written. \
          Reports each changed part's previous and current value, and warns in `warnings` if a \
          supplied `x`/`y` leaves the pin off the 1.27 mm schematic grid.",
-        json!({
-            "type": "object",
-            "properties": {
-                "library_path": { "type": "string", "description": "Path to an existing .kicad_sym library file" },
-                "symbol_name": { "type": "string", "description": "Name of the symbol to change" },
+        {
+            let mut properties = serde_json::Map::from_iter([
+                (
+                    "library_path".to_string(),
+                    json!({ "type": "string", "description": "Path to an existing .kicad_sym library file" }),
+                ),
+                (
+                    "symbol_name".to_string(),
+                    json!({ "type": "string", "description": "Name of the symbol to change" }),
+                ),
+            ]);
+            properties.extend(pin_properties());
+            json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["library_path", "symbol_name", "pin_number"],
+                "additionalProperties": false
+            })
+        },
+        |args, ctx| async move { handle_edit_symbol_pin(args, ctx).await }
+    )
+}
+
+/// The arguments that choose one pin and say what to change in it:
+/// `edit_symbol_pin`'s, and those of each entry of `edit_symbol_pins`.
+fn pin_properties() -> serde_json::Map<String, serde_json::Value> {
+    let properties = json!({
                 "pin_number": { "type": "string", "description": "Number of the pin to change, as written in the symbol (for example '1' or 'A3')" },
                 "unit": { "type": "integer", "minimum": 0, "description": "Unit holding the pin; 0 for a pin common to all units" },
                 "body_style": { "type": "integer", "minimum": 0, "description": "Body style holding the pin: 1 for the first, 2 and up for alternates such as De Morgan, 0 for a pin common to all" },
@@ -92,11 +115,62 @@ pub(super) fn tool() -> ToolDef {
                 "angle": { "type": "integer", "enum": PIN_ANGLES, "description": "New pin direction in degrees, from the connection point toward the body" },
                 "length": { "type": "number", "minimum": 0, "description": "New pin length in mm" },
                 "hidden": { "type": "boolean", "description": "Hide the pin (true) or show it (false), as KiCad's pin dialog does. Written as (hide yes) in the pin, or as a bare hide in a library older than format 20241004, which KiCad 8 can still open. A pin shown where another pin stands, such as a stacked exposed pad, is drawn over it; move it with x and y" }
+    });
+    match properties {
+        serde_json::Value::Object(properties) => properties,
+        _ => unreachable!("an object literal"),
+    }
+}
+
+/// What a new length keeps in place: the connection point, as
+/// `edit_symbol_pin` does, or the end at the body (#868).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Keep {
+    ConnectionPoint,
+    Body,
+}
+
+pub(crate) fn batch_tool() -> ToolDef {
+    let mut entry = pin_properties();
+    entry.insert(
+        "keep".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["connection_point", "body"],
+            "default": "connection_point",
+            "description": "What a new length keeps in place: the connection point, as edit_symbol_pin does, or the end at the body, moving the connection point along the pin by the difference (out for a longer pin, in for a shorter one). body goes with length, and not with x, y or angle"
+        }),
+    );
+    tool!(
+        "edit_symbol_pins",
+        "Change several pins of one existing library symbol in one write: each entry of pins \
+         chooses a pin and sets its parts as edit_symbol_pin does. Every entry is checked \
+         before anything is written, and one refused entry writes nothing. Entries choose \
+         pins as the library reads before the call, so two pins can swap numbers; a new \
+         number is refused when another pin stands for it once the whole call is applied. \
+         With keep: body, a new length keeps the pin's end at the body where it is. Reports \
+         each pin's changed parts with their previous and current values, in entry order.",
+        json!({
+            "type": "object",
+            "properties": {
+                "library_path": { "type": "string", "description": "Path to an existing .kicad_sym library file" },
+                "symbol_name": { "type": "string", "description": "Name of the symbol to change" },
+                "pins": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "The pins to change, one entry each: its selectors and new values as edit_symbol_pin takes them, and keep",
+                    "items": {
+                        "type": "object",
+                        "properties": entry,
+                        "required": ["pin_number"],
+                        "additionalProperties": false
+                    }
+                }
             },
-            "required": ["library_path", "symbol_name", "pin_number"],
+            "required": ["library_path", "symbol_name", "pins"],
             "additionalProperties": false
         }),
-        |args, ctx| async move { handle_edit_symbol_pin(args, ctx).await }
+        |args, ctx| async move { handle_edit_symbol_pins(args, ctx).await }
     )
 }
 
@@ -110,6 +184,7 @@ const UNITS_LIMIT: f64 = i32::MAX as f64 * 7071.0 / 1e4;
 
 /// Which pin a call names, and what it asks to set; a `None` value leaves
 /// that part of the pin alone.
+#[derive(Clone)]
 struct Request<'a> {
     symbol: &'a str,
     /// As KiCad reads a pin number, a space as '_'.
@@ -130,6 +205,9 @@ struct Request<'a> {
     angle: Option<u32>,
     length: Option<i64>,
     hidden: Option<bool>,
+    /// What `length` keeps in place; only `edit_symbol_pins` takes
+    /// [`Keep::Body`], and [`keeping_the_body`] turns it into `x` and `y`.
+    keep: Keep,
 }
 
 /// One `(pin TYPE STYLE (at X Y ANGLE) (length L) (name "N" …) (number "NUM" …))`
@@ -370,6 +448,16 @@ fn pin_at_arg(args: &serde_json::Value) -> Result<Option<(i64, i64)>, CallToolRe
 }
 
 fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult> {
+    let symbol = super::require_str(args, "symbol_name")?;
+    parse_change(args, symbol)
+}
+
+/// The pin `args` chooses in `symbol` and what it sets there: the arguments
+/// of `edit_symbol_pin`, or one entry of `edit_symbol_pins`.
+fn parse_change<'a>(
+    args: &'a serde_json::Value,
+    symbol: &'a str,
+) -> Result<Request<'a>, CallToolResult> {
     let angle = super::opt_u32(args, "angle")?;
     if angle.is_some_and(|angle| !PIN_ANGLES.contains(&angle)) {
         return Err(invalid_arg(
@@ -379,7 +467,7 @@ fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult
     }
     let pin_at = pin_at_arg(args)?;
     let request = Request {
-        symbol: super::require_str(args, "symbol_name")?,
+        symbol,
         number: super::require_str(args, "pin_number")?.replace(' ', "_"),
         unit: super::opt_u32(args, "unit")?,
         body_style: super::opt_u32(args, "body_style")?,
@@ -401,6 +489,7 @@ fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult
             Some(serde_json::Value::Bool(hidden)) => Some(*hidden),
             Some(_) => return Err(invalid_arg("hidden", "must be true or false")),
         },
+        keep: Keep::ConnectionPoint,
     };
     if request.pin_type.is_none()
         && request.style.is_none()
@@ -448,7 +537,8 @@ async fn handle_edit_symbol_pin(
     };
 
     if replacement != source {
-        let check = |text: &str| readback_mismatch(text, &source, &request, &target);
+        let check =
+            |text: &str| readback_mismatch(text, &source, request.symbol, &[(&target, &request)]);
         if let Some(refusal) = write_checked(&path, &source, replacement, "edit_symbol_pin", check)?
         {
             return Ok(refusal);
@@ -465,24 +555,297 @@ async fn handle_edit_symbol_pin(
         "body_style": target.body_style,
         "changes": changes
     });
-    if request.x.is_some() || request.y.is_some() {
-        let final_x = request
-            .x
-            .map(|u| u as f64 / UNITS_PER_MM)
-            .or_else(|| target.x.parse::<f64>().ok());
-        let final_y = request
-            .y
-            .map(|u| u as f64 / UNITS_PER_MM)
-            .or_else(|| target.y.parse::<f64>().ok());
-        let final_number = request.new_number.as_deref().unwrap_or(&request.number);
-        if let (Some(x), Some(y)) = (final_x, final_y) {
-            if let Some(warning) = off_grid_pin_coordinate_warning(final_number, x, y) {
-                response["warnings"] = json!([warning]);
-            }
-        }
+    if let Some(warning) = off_grid_warning(&target, &request) {
+        response["warnings"] = json!([warning]);
     }
 
     Ok(CallToolResult::json(&response))
+}
+
+/// The off-grid warning for a pin whose `x` or `y` the request sets, at the
+/// connection point the call leaves it at.
+fn off_grid_warning(pin: &Pin, request: &Request) -> Option<String> {
+    if request.x.is_none() && request.y.is_none() {
+        return None;
+    }
+    let at = |asked: Option<i64>, written: &str| {
+        asked
+            .map(|units| units as f64 / UNITS_PER_MM)
+            .or_else(|| written.parse::<f64>().ok())
+    };
+    let number = request.new_number.as_deref().unwrap_or(&request.number);
+    off_grid_pin_coordinate_warning(number, at(request.x, &pin.x)?, at(request.y, &pin.y)?)
+}
+
+/// `edit_symbol_pins`' symbol and entries, each read as `edit_symbol_pin`'s
+/// arguments are, with its `keep`.
+fn parse_batch(args: &serde_json::Value) -> Result<(&str, Vec<Request<'_>>), CallToolResult> {
+    let symbol = super::require_str(args, "symbol_name")?;
+    let entries = match args.get("pins") {
+        Some(serde_json::Value::Array(entries)) if !entries.is_empty() => entries,
+        Some(serde_json::Value::Array(_)) => {
+            return Err(invalid_arg("pins", "give at least one pin to change"))
+        }
+        _ => {
+            return Err(invalid_arg(
+                "pins",
+                "must be a list of pins to change, one entry each",
+            ))
+        }
+    };
+    let mut requests = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        if !entry.is_object() {
+            return Err(invalid_arg(
+                &format!("pins[{index}]"),
+                "must be an object choosing a pin and what to change in it",
+            ));
+        }
+        let mut request = parse_change(entry, symbol).map_err(|error| in_entry(index, error))?;
+        request.keep = keep_arg(entry, &request).map_err(|error| in_entry(index, error))?;
+        requests.push(request);
+    }
+    Ok((symbol, requests))
+}
+
+/// An entry's `keep`: the connection point unless it asks for the body,
+/// which needs a new length and leaves the connection point to the call.
+fn keep_arg(entry: &serde_json::Value, request: &Request) -> Result<Keep, CallToolResult> {
+    match enum_arg(entry, "keep", &["connection_point", "body"])?.as_deref() {
+        None | Some("connection_point") => Ok(Keep::ConnectionPoint),
+        _ if request.length.is_none() => Err(invalid_arg(
+            "keep",
+            "body goes with length: it says what a new length keeps in place",
+        )),
+        _ if request.x.is_some() || request.y.is_some() || request.angle.is_some() => {
+            Err(invalid_arg(
+                "keep",
+                "body sets the connection point from the length, so it cannot go with x, y or \
+                 angle",
+            ))
+        }
+        _ => Ok(Keep::Body),
+    }
+}
+
+/// `error`, a refusal of entry `index` of `pins`, naming that entry: a field
+/// becomes `pins[index].field`, and the message starts with `pins[index]: `.
+fn in_entry(index: usize, error: CallToolResult) -> CallToolResult {
+    let CallToolResult {
+        mut content,
+        is_error,
+    } = error;
+    if let Some(crate::mcp::protocol::ToolContent::Text { text }) = content.first_mut() {
+        if let Ok(mut body) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(field) = body.pointer_mut("/error/field") {
+                if let Some(name) = field.as_str() {
+                    *field = json!(format!("pins[{index}].{name}"));
+                }
+            }
+            if let Some(message) = body.get_mut("message") {
+                if let Some(text) = message.as_str() {
+                    *message = json!(format!("pins[{index}]: {text}"));
+                }
+            }
+            *text = body.to_string();
+        }
+    }
+    CallToolResult { content, is_error }
+}
+
+async fn handle_edit_symbol_pins(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = super::get_path(args, "library_path")?;
+    if path.extension().and_then(|extension| extension.to_str()) != Some("kicad_sym") {
+        return Ok(unusable(&path, "it does not end in .kicad_sym"));
+    }
+    let (symbol, requests) = match parse_batch(args) {
+        Ok(batch) => batch,
+        Err(error) => return Ok(error),
+    };
+    let source = match read_consistent(&path) {
+        Ok(source) => source,
+        Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::file_not_found(&path),
+                format!("Symbol library not found: {}", path.display()),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (edited, replacement) = match prepare_batch(&path, &source, symbol, &requests) {
+        Ok(batch) => batch,
+        Err(error) => return Ok(error),
+    };
+
+    if replacement != source {
+        let pairs: Vec<(&Pin, &Request)> = edited
+            .iter()
+            .map(|edit| (&edit.pin, &edit.request))
+            .collect();
+        let check = |text: &str| readback_mismatch(text, &source, symbol, &pairs);
+        if let Some(refusal) =
+            write_checked(&path, &source, replacement, "edit_symbol_pins", check)?
+        {
+            return Ok(refusal);
+        }
+    }
+
+    let warnings: Vec<String> = edited
+        .iter()
+        .filter_map(|edit| off_grid_warning(&edit.pin, &edit.request))
+        .collect();
+    let mut response = json!({
+        "success": true,
+        "library_path": path.display().to_string(),
+        "symbol": symbol,
+        "pins": edited.iter().map(|edit| json!({
+            "pin_number": edit.request.number,
+            "pin_name": edit.pin.name,
+            "unit": edit.pin.unit,
+            "body_style": edit.pin.body_style,
+            "changes": edit.changes
+        })).collect::<Vec<_>>()
+    });
+    if !warnings.is_empty() {
+        response["warnings"] = json!(warnings);
+    }
+    Ok(CallToolResult::json(&response))
+}
+
+/// One entry of `edit_symbol_pins` as planned: the pin it chose, the request
+/// with `keep: "body"` turned into a connection point, and what changes.
+struct PinEdit<'a> {
+    pin: Pin,
+    request: Request<'a>,
+    changes: serde_json::Value,
+}
+
+/// Each entry's pin and changes, and the library with all of them: every
+/// entry chosen and checked against the library as read, then one plan.
+fn prepare_batch<'a>(
+    path: &Path,
+    source: &str,
+    symbol: &str,
+    requests: &[Request<'a>],
+) -> Result<(Vec<PinEdit<'a>>, String), CallToolResult> {
+    let pins = editable_pins(path, source, symbol, "edit")?;
+    let mut chosen: Vec<usize> = Vec::with_capacity(requests.len());
+    let mut resolved = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        let entry = |error| in_entry(index, error);
+        refuse_tilde_names(source, request).map_err(entry)?;
+        let pin = choose_pin(path, &pins, request, "edit_symbol_pins").map_err(entry)?;
+        let at = index_of(&pins, pin);
+        if let Some(earlier) = chosen.iter().position(|&other| other == at) {
+            return Err(invalid_arg(
+                &format!("pins[{index}]"),
+                &format!(
+                    "chooses pin '{}' in {}, as pins[{earlier}] does; give each pin one entry",
+                    pin.number,
+                    pin.place()
+                ),
+            ));
+        }
+        chosen.push(at);
+        resolved.push(keeping_the_body(pin, request).map_err(entry)?);
+    }
+    let renumbered: Vec<(usize, &str)> = chosen
+        .iter()
+        .zip(&resolved)
+        .filter_map(|(&at, request)| request.new_number.as_deref().map(|new| (at, new)))
+        .collect();
+    if let Some((entry, refusal)) = renumber_collision(symbol, &pins, &renumbered) {
+        let index = chosen
+            .iter()
+            .position(|&at| at == renumbered[entry].0)
+            .unwrap_or_default();
+        return Err(in_entry(index, refusal));
+    }
+    let mut edits = Vec::new();
+    let mut edited = Vec::with_capacity(requests.len());
+    for (index, (&at, request)) in chosen.iter().zip(resolved).enumerate() {
+        let pin = pins[at].clone();
+        let (pin_edits, changes) =
+            pin_edits(source, &pin, &request).map_err(|error| in_entry(index, error))?;
+        edits.extend(pin_edits);
+        edited.push(PinEdit {
+            pin,
+            request,
+            changes,
+        });
+    }
+    Ok((edited, apply_edits(source.to_string(), edits)))
+}
+
+/// Where `pin`, one of `pins`, stands among them.
+fn index_of(pins: &[Pin], pin: &Pin) -> usize {
+    pins.iter()
+        .position(|other| std::ptr::eq(other, pin))
+        .expect("a pin chosen from these pins")
+}
+
+/// `request` with `keep: "body"` turned into the connection point that keeps
+/// the pin's end at the body where it is. KiCad puts that end at the
+/// connection point plus the length along the pin's direction
+/// (`SCH_PIN::GetPinRoot`, `eeschema/sch_pin.cpp`, 10.0.8); the file's y is up
+/// (`parseXY( true )` in `parseSymbolPin`), so angles 0, 90, 180 and 270 point
+/// to +x, +y, -x and -y, and the connection point moves by the old length less
+/// the new one, along the pin.
+fn keeping_the_body<'a>(pin: &Pin, request: &Request<'a>) -> Result<Request<'a>, CallToolResult> {
+    let mut resolved = request.clone();
+    let (Keep::Body, Some(length)) = (request.keep, request.length) else {
+        return Ok(resolved);
+    };
+    let written = |what: &str, value: Option<i64>| {
+        value.ok_or_else(|| {
+            invalid_arg(
+                "keep",
+                &format!(
+                    "pin '{}' in {} writes no {what}, which KiCad then defaults; add it in KiCad \
+                     before keeping the body",
+                    pin.number,
+                    pin.place()
+                ),
+            )
+        })
+    };
+    let x = written("(at …)", pin.spans[4].and(units_of(&pin.x)))?;
+    let y = written("(at …)", pin.spans[5].and(units_of(&pin.y)))?;
+    let old = written("(length …)", pin.spans[7].and(units_of(&pin.length)))?;
+    let (dx, dy) = match leading_integer(&pin.angle) {
+        Some(0) => (1, 0),
+        Some(90) => (0, 1),
+        Some(180) => (-1, 0),
+        Some(270) => (0, -1),
+        _ => {
+            return Err(invalid_arg(
+                "keep",
+                &format!(
+                    "pin '{}' in {} points at angle '{}', not one of the directions KiCad reads",
+                    pin.number,
+                    pin.place(),
+                    pin.angle
+                ),
+            ))
+        }
+    };
+    let shift = old - length;
+    if shift == 0 {
+        return Ok(resolved);
+    }
+    let (x, y) = (x + shift * dx, y + shift * dy);
+    if (x as f64).abs() > UNITS_LIMIT || (y as f64).abs() > UNITS_LIMIT {
+        return Err(invalid_arg(
+            "keep",
+            "the connection point would move beyond the 151848 mm KiCad reads",
+        ));
+    }
+    resolved.x = Some(x);
+    resolved.y = Some(y);
+    Ok(resolved)
 }
 
 /// The library's `(version N)`.
@@ -832,20 +1195,50 @@ fn prepare_edit(
     source: &str,
     request: &Request,
 ) -> Result<(Pin, String, serde_json::Value), CallToolResult> {
+    let pins = editable_pins(path, source, request.symbol, "edit")?;
+    refuse_tilde_names(source, request)?;
+    let pin = choose_pin(path, &pins, request, "edit_symbol_pin")?;
+    let renumbered: Vec<(usize, &str)> = request
+        .new_number
+        .as_deref()
+        .map(|new| (index_of(&pins, pin), new))
+        .into_iter()
+        .collect();
+    if let Some((_, refusal)) = renumber_collision(request.symbol, &pins, &renumbered) {
+        return Err(refusal);
+    }
+    let pin = pin.clone();
+    let (edits, changes) = pin_edits(source, &pin, request)?;
+    Ok((pin, apply_edits(source.to_string(), edits), changes))
+}
+
+/// The pins of `symbol`, a root symbol of the library `source`, which a call
+/// may change: a derived symbol is refused, naming the root whose pins it
+/// uses, for the caller to `action` there.
+fn editable_pins(
+    path: &Path,
+    source: &str,
+    symbol: &str,
+    action: &str,
+) -> Result<Vec<Pin>, CallToolResult> {
     let root = source.len() - source.trim_start().len();
     if header(source, root).map(|(head, _)| head) != Some("kicad_symbol_lib") {
         return Err(unusable(path, "it is not a (kicad_symbol_lib ...) file"));
     }
-    let (start, end) = symbol_block(source, request.symbol)?;
+    let (start, end) = symbol_block(source, symbol)?;
     if let Some(parent) = extends(source, start, end) {
         return Err(invalid_arg(
             "symbol_name",
             &format!(
-                "symbol '{}' extends '{parent}', whose pins it uses; edit '{parent}'",
-                request.symbol
+                "symbol '{symbol}' extends '{parent}', whose pins it uses; {action} '{parent}'"
             ),
         ));
     }
+    symbol_pins(source, start, end).map_err(|reason| unusable(path, &reason))
+}
+
+/// A `~` asked as a name or number of a library KiCad reads it in as empty.
+fn refuse_tilde_names(source: &str, request: &Request) -> Result<(), CallToolResult> {
     let tilde_is_empty = library_version(source).is_some_and(|version| version < TILDE_IS_TEXT);
     for (key, value) in [("name", &request.name), ("new_number", &request.new_number)] {
         if tilde_is_empty && value.as_deref() == Some("~") {
@@ -856,38 +1249,75 @@ fn prepare_edit(
             ));
         }
     }
-    let pins = symbol_pins(source, start, end).map_err(|reason| unusable(path, &reason))?;
-    let pin = choose_pin(path, &pins, request, "edit_symbol_pin")?.clone();
+    Ok(())
+}
 
-    if let Some(new) = request
-        .new_number
-        .as_ref()
-        .filter(|new| **new != pin.number)
-    {
-        let wanted = stacked(new);
-        let taken = pins
+/// The first of `renumbered`, each a pin of `pins` by index and its new
+/// number, whose new number another pin stands for once every renumbering is
+/// applied, with its refusal on `new_number`; `None` when there is none. Pins
+/// in different body styles may share a number, as KiCad's symbol checker
+/// allows.
+fn renumber_collision(
+    symbol: &str,
+    pins: &[Pin],
+    renumbered: &[(usize, &str)],
+) -> Option<(usize, CallToolResult)> {
+    let after = |index: usize| {
+        renumbered
             .iter()
-            .filter(|other| **other != pin && pin.shares_a_body_style(other))
-            .find_map(|other| {
-                shared_number(&wanted, &stacked(&other.number)).map(|shared| (other, shared))
-            });
-        if let Some((other, shared)) = taken {
-            return Err(invalid_arg(
-                "new_number",
-                &format!(
-                    "pin '{}' in {} of symbol '{}' already stands for number '{shared}', so \
-                     KiCad's symbol checker would report the two as duplicates",
-                    other.number,
-                    other.place(),
-                    request.symbol
+            .find(|(at, _)| *at == index)
+            .map_or(pins[index].number.as_str(), |(_, new)| *new)
+    };
+    renumbered
+        .iter()
+        .enumerate()
+        .filter(|(_, (at, new))| *new != pins[*at].number)
+        .find_map(|(entry, &(at, new))| {
+            let wanted = stacked(new);
+            let pin = &pins[at];
+            let (other, shared) = (0..pins.len())
+                .filter(|&other| other != at && pin.shares_a_body_style(&pins[other]))
+                .find_map(|other| {
+                    shared_number(&wanted, &stacked(after(other))).map(|shared| (other, shared))
+                })?;
+            let other_pin = &pins[other];
+            let holder = if after(other) == other_pin.number {
+                format!(
+                    "pin '{}' in {} of symbol '{symbol}' already stands",
+                    other_pin.number,
+                    other_pin.place()
+                )
+            } else {
+                format!(
+                    "pin '{}' in {} of symbol '{symbol}', which this call renumbers to '{}', \
+                     would stand",
+                    other_pin.number,
+                    other_pin.place(),
+                    after(other)
+                )
+            };
+            Some((
+                entry,
+                invalid_arg(
+                    "new_number",
+                    &format!(
+                        "{holder} for number '{shared}', so KiCad's symbol checker would report \
+                         the two as duplicates"
+                    ),
                 ),
-            ));
-        }
-    }
+            ))
+        })
+}
 
+/// The edits that set `pin`'s parts as `request` asks, and what changes.
+fn pin_edits(
+    source: &str,
+    pin: &Pin,
+    request: &Request,
+) -> Result<(Vec<SexpEdit>, serde_json::Value), CallToolResult> {
     let mut edits = Vec::new();
     let mut changes = serde_json::Map::new();
-    let asked = parts_as_asked(&pin, request);
+    let asked = parts_as_asked(pin, request);
     for (index, (old, new)) in pin.parts().into_iter().zip(&asked).enumerate() {
         if old == new {
             continue;
@@ -955,23 +1385,18 @@ fn prepare_edit(
             json!({"previous": pin.hidden, "current": hidden}),
         );
     }
-    Ok((
-        pin,
-        apply_edits(source.to_string(), edits),
-        serde_json::Value::Object(changes),
-    ))
+    Ok((edits, serde_json::Value::Object(changes)))
 }
 
-/// Why `written` is not `before` with only the chosen pin changed as asked,
-/// or `None` when it is. Each pin's unit, body style and every part a call can
-/// set are compared, in file order.
+/// Why `written` is not `before` with only the `edited` pins changed, each as
+/// its request asks, or `None` when it is. Each pin's unit, body style and
+/// every part a call can set are compared, in file order.
 fn readback_mismatch(
     written: &str,
     before: &str,
-    request: &Request,
-    target: &Pin,
+    symbol: &str,
+    edited: &[(&Pin, &Request)],
 ) -> Option<String> {
-    let symbol = request.symbol;
     let pins_of = |text: &str| {
         let (start, end) = symbol_block(text, symbol).ok()?;
         symbol_pins(text, start, end).ok()
@@ -986,13 +1411,12 @@ fn readback_mismatch(
         return Some("the pin count changed".to_string());
     }
     for (was, now) in original.iter().zip(&after) {
-        let (expected, hidden) = if was == target {
-            (
+        let (expected, hidden) = match edited.iter().find(|(target, _)| *target == was) {
+            Some((_, request)) => (
                 parts_as_asked(was, request),
                 request.hidden.unwrap_or(was.hidden),
-            )
-        } else {
-            (was.parts().map(str::to_string), was.hidden)
+            ),
+            None => (was.parts().map(str::to_string), was.hidden),
         };
         if now.unit != was.unit
             || now.body_style != was.body_style
@@ -1057,6 +1481,7 @@ fn parse_selection(args: &serde_json::Value) -> Result<Request<'_>, CallToolResu
         angle: None,
         length: None,
         hidden: None,
+        keep: Keep::ConnectionPoint,
     })
 }
 
@@ -2658,5 +3083,412 @@ mod tests {
             ]
         );
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    // kicad-cli 10.0.8 saved each from symbols drawn for these tests (no stock
+    // symbol); provenance in tests/fixtures/edit_symbol_pins_kicad10.README.md.
+    const PINS_SOURCE: &str =
+        include_str!("../../tests/fixtures/edit_symbol_pins_source_kicad10.kicad_sym");
+    const PINS_KEPT: &str =
+        include_str!("../../tests/fixtures/edit_symbol_pins_kept_kicad10.kicad_sym");
+    const PINS_SWAPPED: &str =
+        include_str!("../../tests/fixtures/edit_symbol_pins_swapped_kicad10.kicad_sym");
+
+    /// `edit_symbol_pins` on a copy of `library`: its result and the file after.
+    async fn edit_pins(library: &str, arguments: serde_json::Value) -> (CallToolResult, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.kicad_sym");
+        std::fs::write(&path, library).unwrap();
+        let mut arguments = arguments;
+        arguments["library_path"] = json!(path);
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_edit_symbol_pins(&arguments, &ctx).await.unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    /// One entry per pin of BOX, each `length` with `keep: "body"`.
+    fn every_box_pin(length: f64) -> serde_json::Value {
+        let pins: Vec<serde_json::Value> = (1..=6)
+            .map(|number| json!({"pin_number": number.to_string(), "length": length, "keep": "body"}))
+            .collect();
+        json!({ "symbol_name": "BOX", "pins": pins })
+    }
+
+    /// All six pins of BOX, one on each side of the body at each of KiCad's
+    /// four angles, to 3.81 mm with their ends at the body kept: byte for byte
+    /// KiCad's save of BOX drawn so, and back to 2.54 mm gives the source.
+    #[tokio::test]
+    async fn keeping_the_body_writes_what_kicad_saves() {
+        let (result, written) = edit_pins(PINS_SOURCE, every_box_pin(3.81)).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written, PINS_KEPT);
+        let body = body_of(&result);
+        assert_eq!(body["pins"].as_array().unwrap().len(), 6, "{body}");
+        assert_eq!(
+            body["pins"][0],
+            json!({
+                "pin_number": "1", "pin_name": "IN1", "unit": 1, "body_style": 1,
+                "changes": {
+                    "x": {"previous": -10.16, "current": -11.43},
+                    "length": {"previous": 2.54, "current": 3.81}
+                }
+            })
+        );
+        assert_eq!(
+            body["pins"][4]["changes"]["y"],
+            json!({"previous": 6.35, "current": 7.62})
+        );
+        assert!(body.get("warnings").is_none(), "{body}");
+
+        let (result, written) = edit_pins(PINS_KEPT, every_box_pin(2.54)).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written, PINS_SOURCE);
+    }
+
+    /// The ends at the body, as KiCad places them (`SCH_PIN::GetPinRoot`), are
+    /// on the edges of BOX's rectangle both before and after: read from the
+    /// fixtures, apart from the tool's arithmetic.
+    #[test]
+    fn the_kept_ends_are_on_the_body() {
+        for library in [PINS_SOURCE, PINS_KEPT] {
+            let (start, end) = symbol_block(library, "BOX").unwrap();
+            for pin in symbol_pins(library, start, end).unwrap() {
+                let (x, y) = (units_of(&pin.x).unwrap(), units_of(&pin.y).unwrap());
+                let length = units_of(&pin.length).unwrap();
+                let root = match pin.angle.as_str() {
+                    "0" => (x + length, y),
+                    "90" => (x, y + length),
+                    "180" => (x - length, y),
+                    "270" => (x, y - length),
+                    other => panic!("angle {other}"),
+                };
+                let on_edge = (root.0.abs() == 76200 && root.1.abs() <= 38100)
+                    || (root.1.abs() == 38100 && root.0.abs() <= 76200);
+                assert!(on_edge, "pin {} ends at {root:?}", pin.number);
+            }
+        }
+    }
+
+    /// `text` with the blocks of its first two pins of `symbol` exchanged.
+    fn first_two_pins_exchanged(text: &str, symbol: &str) -> String {
+        let (start, end) = symbol_block(text, symbol).unwrap();
+        let pins = symbol_pins(text, start, end).unwrap();
+        let ((a, b), (c, d)) = (pins[0].block, pins[1].block);
+        format!(
+            "{}{}{}{}{}",
+            &text[..a],
+            &text[c..d],
+            &text[b..c],
+            &text[a..b],
+            &text[d..]
+        )
+    }
+
+    /// Pins 1 and 2 swap numbers, chosen as the library reads before the call,
+    /// and three other pins change one part each, in one write. The result is
+    /// KiCad's save of BOX drawn so, but for the order of pins 1 and 2: KiCad
+    /// keeps a unit's pins sorted by number (`SCH_PIN::compare`,
+    /// `eeschema/sch_pin.cpp`), and a renumbered pin keeps its line, as with
+    /// `edit_symbol_pin`.
+    #[tokio::test]
+    async fn two_pins_swap_numbers_in_one_write() {
+        let (result, written) = edit_pins(
+            PINS_SOURCE,
+            json!({ "symbol_name": "BOX", "pins": [
+                {"pin_number": "1", "new_number": "2"},
+                {"pin_number": "2", "new_number": "1"},
+                {"pin_number": "3", "name": "Q"},
+                {"pin_number": "4", "type": "tri_state"},
+                {"pin_number": "6", "hidden": true}
+            ]}),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written, first_two_pins_exchanged(PINS_SWAPPED, "BOX"));
+        let body = body_of(&result);
+        assert_eq!(
+            body["pins"][1]["changes"],
+            json!({"number": {"previous": "2", "current": "1"}})
+        );
+        assert_eq!(body["pins"][1]["pin_name"], "IN2");
+        assert_eq!(
+            body["pins"][4]["changes"],
+            json!({"hidden": {"previous": false, "current": true}})
+        );
+    }
+
+    /// Each refusal names its entry and leaves the file as it was, even when
+    /// the entries before it were fine.
+    #[tokio::test]
+    async fn one_refused_entry_writes_nothing() {
+        let fine = json!({"pin_number": "1", "length": 3.81, "keep": "body"});
+        for (library, symbol, entries, kind, field) in [
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "9", "name": "X"}]),
+                "invalid_argument",
+                "pins[1].pin_number",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "1", "name": "X"}]),
+                "invalid_argument",
+                "pins[1]",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "3", "new_number": "4"}]),
+                "invalid_argument",
+                "pins[1].new_number",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "3", "new_number": "7"}, {"pin_number": "4", "new_number": "7"}]),
+                "invalid_argument",
+                "pins[1].new_number",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "2", "keep": "body"}]),
+                "invalid_argument",
+                "pins[1].pin_change",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "2", "name": "X", "keep": "body"}]),
+                "invalid_argument",
+                "pins[1].keep",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "2", "length": 5.08, "x": 1, "keep": "body"}]),
+                "invalid_argument",
+                "pins[1].keep",
+            ),
+            (
+                PINS_SOURCE,
+                "BOX",
+                json!([fine, {"pin_number": "2", "length": 5.08, "angle": 90, "keep": "body"}]),
+                "invalid_argument",
+                "pins[1].keep",
+            ),
+            (PINS_SOURCE, "BOX", json!([]), "invalid_argument", "pins"),
+            (
+                DELETE_SOURCE,
+                "DUP",
+                json!([{"pin_number": "1", "name": "X"}, {"pin_number": "2", "name": "Y"}]),
+                "ambiguous_target",
+                "",
+            ),
+            (
+                DELETE_SOURCE,
+                "GATE_ALT",
+                json!([{"pin_number": "1", "body_style": 1, "name": "X"}]),
+                "invalid_argument",
+                "symbol_name",
+            ),
+        ] {
+            let (result, written) =
+                edit_pins(library, json!({"symbol_name": symbol, "pins": entries})).await;
+            assert!(result.is_error, "{entries}");
+            let body = body_of(&result);
+            assert_eq!(body["error"]["kind"], kind, "{entries}: {body}");
+            if field.is_empty() {
+                let message = body["message"].as_str().unwrap();
+                assert!(message.starts_with("pins[1]: "), "{entries}: {message}");
+            } else {
+                assert_eq!(body["error"]["field"], field, "{entries}: {body}");
+            }
+            assert_eq!(written, library, "{entries}");
+        }
+    }
+
+    /// A renumber collides with what the other pins are numbered once the
+    /// whole call is applied, and the refusal says which.
+    #[tokio::test]
+    async fn a_renumber_collides_with_the_numbers_after_the_call() {
+        let (result, _) = edit_pins(
+            PINS_SOURCE,
+            json!({ "symbol_name": "BOX", "pins": [
+                {"pin_number": "3", "new_number": "7"},
+                {"pin_number": "4", "new_number": "7"}
+            ]}),
+        )
+        .await;
+        let message = body_of(&result)["message"].as_str().unwrap().to_string();
+        assert!(
+            message.starts_with("pins[0]: ")
+                && message.contains(
+                    "pin '4' in unit 1 body style 1 of symbol 'BOX', which this call renumbers \
+                     to '7', would stand for number '7'"
+                ),
+            "{message}"
+        );
+        // Away from a number another entry leaves, onto it: fine.
+        let (result, written) = edit_pins(
+            PINS_SOURCE,
+            json!({ "symbol_name": "BOX", "pins": [
+                {"pin_number": "3", "new_number": "4"},
+                {"pin_number": "4", "new_number": "8"}
+            ]}),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written.matches("(number \"4\"").count(), 1);
+        assert_eq!(written.matches("(number \"8\"").count(), 1);
+    }
+
+    /// The handler checks what the schema checks, for a call that reaches it
+    /// directly.
+    #[test]
+    fn batch_arguments_are_checked_without_the_schema() {
+        let field_of = |error: CallToolResult| body_of(&error)["error"]["field"].clone();
+        for (pins, field) in [
+            (json!(null), "pins"),
+            (json!({"pin_number": "1"}), "pins"),
+            (json!([]), "pins"),
+            (json!(["1"]), "pins[0]"),
+            (json!([{"length": 1}]), "pins[0].pin_number"),
+            (
+                json!([{"pin_number": "1", "length": 1}, {"pin_number": "2", "angle": 45}]),
+                "pins[1].angle",
+            ),
+            (
+                json!([{"pin_number": "1", "length": 1, "keep": "pin"}]),
+                "pins[0].keep",
+            ),
+            (
+                json!([{"pin_number": "1", "hidden": true, "keep": "body"}]),
+                "pins[0].keep",
+            ),
+        ] {
+            let mut arguments = json!({"symbol_name": "S"});
+            if !pins.is_null() {
+                arguments["pins"] = pins.clone();
+            }
+            let Err(error) = parse_batch(&arguments) else {
+                panic!("{pins} was taken");
+            };
+            assert_eq!(field_of(error), field, "{pins}");
+        }
+        let arguments = json!({"symbol_name": "S", "pins": [
+            {"pin_number": "1", "length": 1, "keep": "connection_point"},
+            {"pin_number": "2", "length": 1, "keep": "body"}
+        ]});
+        let (_, requests) = parse_batch(&arguments).unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.keep)
+                .collect::<Vec<_>>(),
+            [Keep::ConnectionPoint, Keep::Body]
+        );
+    }
+
+    /// The check before writing wants every edited pin as its request asks,
+    /// and the others as they were.
+    #[test]
+    fn the_check_wants_every_entry_as_asked() {
+        let (start, end) = symbol_block(PINS_SOURCE, "BOX").unwrap();
+        let pins = symbol_pins(PINS_SOURCE, start, end).unwrap();
+        let arguments = every_box_pin(3.81);
+        let (_, requests) = parse_batch(&arguments).unwrap();
+        let resolved: Vec<Request> = pins
+            .iter()
+            .zip(&requests)
+            .map(|(pin, request)| keeping_the_body(pin, request).unwrap())
+            .collect();
+        let pairs: Vec<(&Pin, &Request)> = pins.iter().zip(&resolved).collect();
+        assert_eq!(
+            readback_mismatch(PINS_KEPT, PINS_SOURCE, "BOX", &pairs),
+            None
+        );
+        // One pin left as it was.
+        assert!(readback_mismatch(PINS_KEPT, PINS_SOURCE, "BOX", &pairs[1..]).is_some());
+        let unchanged = PINS_KEPT.replacen("(at -11.43 2.54 0)", "(at -10.16 2.54 0)", 1);
+        let reason = readback_mismatch(&unchanged, PINS_SOURCE, "BOX", &pairs).unwrap();
+        assert!(reason.contains("pin '1'"), "{reason}");
+    }
+
+    /// Through `tools/call`, once `library_maintenance` is loaded, with an
+    /// entry the schema refuses named by its path.
+    #[tokio::test]
+    async fn edit_symbol_pins_is_called_through_library_maintenance() {
+        let (_dir, path) = library_with(PINS_SOURCE);
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut answers = Vec::new();
+        for pins in [
+            json!([{"pin_number": "5", "length": 3.81, "keep": "body"}]),
+            json!([{"pin_number": "5", "lenght": 3.81}]),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 868, "method": "tools/call",
+                    "params": {"name": "edit_symbol_pins", "arguments": {
+                        "library_path": path, "symbol_name": "BOX", "pins": pins
+                    }}
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            answers.push(response);
+        }
+        assert_eq!(answers[0]["isError"], false, "{}", answers[0]);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("(at 0 7.62 270)"));
+        assert_eq!(answers[1]["isError"], true, "{}", answers[1]);
+        let refusal: serde_json::Value =
+            serde_json::from_str(answers[1]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(
+            refusal["error"]["field"]
+                .as_str()
+                .unwrap()
+                .starts_with("pins[0]"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn each_entry_takes_edit_symbol_pins_arguments_and_keep() {
+        let single = tool().input_schema;
+        let mut expected: Vec<String> = single["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !["library_path", "symbol_name"].contains(&key.as_str()))
+            .cloned()
+            .collect();
+        expected.push("keep".to_string());
+        expected.sort();
+        let batch = batch_tool().input_schema;
+        let entry = &batch["properties"]["pins"]["items"];
+        let mut keys: Vec<String> = entry["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, expected);
+        assert_eq!(entry["required"], json!(["pin_number"]));
+        assert_eq!(entry["additionalProperties"], false);
+        assert_eq!(batch["additionalProperties"], false);
     }
 }

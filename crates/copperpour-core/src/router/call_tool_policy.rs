@@ -257,6 +257,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "edit_sheet",
     "edit_sheet_pin",
     "edit_symbol_pin",
+    "edit_symbol_pins",
     "enrich_datasheets",
     "export_3d",
     "export_bom",
