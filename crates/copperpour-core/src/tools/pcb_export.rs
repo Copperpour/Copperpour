@@ -159,9 +159,10 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_gerber",
-            "Export Gerber production files using kicad-cli. By default Copperpour selects all \
-             enabled copper layers, masks, silkscreens, and Edge.Cuts while excluding \
-             documentation-only layers.",
+            "Export Gerber production files from the saved .kicad_pcb file on disk (unsaved KiCad \
+             editor changes are excluded) using kicad-cli and report provenance. By default \
+             Copperpour selects all enabled copper layers, masks, silkscreens, and Edge.Cuts \
+             while excluding documentation-only layers.",
             json!({
                 "type": "object",
                 "properties": {
@@ -181,7 +182,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_pdf",
-            "Export the PCB layout to a PDF file using kicad-cli.",
+            "Export the saved .kicad_pcb layout on disk (unsaved KiCad editor changes are excluded) \
+             to a PDF file using kicad-cli and report provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -201,7 +203,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_svg",
-            "Export the PCB layout to an SVG file using kicad-cli.",
+            "Export the saved .kicad_pcb layout on disk (unsaved KiCad editor changes are excluded) \
+             to an SVG file using kicad-cli and report provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -221,7 +224,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_3d",
-            "Export the PCB as a 3D model (STEP or VRML) using kicad-cli.",
+            "Export the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) \
+             as a 3D model (STEP or VRML) using kicad-cli and report provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -296,8 +300,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_netlist",
-            "Export a netlist file. format 'ipc' writes the board's IPC-D-356 netlist \
-             (kicad-cli `pcb export ipcd356`). format 'kicad' writes a KiCad netlist, which \
+            "Export a netlist file from the saved board or schematic on disk (unsaved KiCad editor \
+             changes are excluded) and report provenance. format 'ipc' writes the board's IPC-D-356 \
+             netlist (kicad-cli `pcb export ipcd356`). format 'kicad' writes a KiCad netlist, which \
              kicad-cli can only produce from the schematic: given a .kicad_pcb it is exported \
              from the root schematic of the same name beside the board (reported as \
              `source_schematic`), and refused when that schematic does not exist.",
@@ -364,8 +369,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "export_position_file",
-            "Generate a component placement (pick-and-place) position file for SMT assembly. \
-             KiCad automatically omits footprints marked exclude_from_pos_files.",
+            "Generate a component placement (pick-and-place) position file for SMT assembly from \
+             the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) and \
+             report provenance. KiCad automatically omits footprints marked exclude_from_pos_files.",
             json!({
                 "type": "object",
                 "properties": {
@@ -397,7 +403,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_dxf",
-            "Export the PCB to DXF using kicad-cli, one file per requested layer. \
+            "Export the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) \
+             to DXF using kicad-cli, one file per requested layer, and report provenance. \
              Useful for mechanical CAD interchange (enclosures, panelization, laser cutting).",
             json!({
                 "type": "object",
@@ -417,7 +424,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_gencad",
-            "Export the PCB in GenCAD format using kicad-cli. GenCAD is accepted by some \
+            "Export the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) \
+             in GenCAD format using kicad-cli and report provenance. GenCAD is accepted by some \
              CAM and test-fixture tooling as an alternative to a raw Gerber bundle.",
             json!({
                 "type": "object",
@@ -432,7 +440,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_ipc2581",
-            "Export the PCB in IPC-2581 format using kicad-cli. IPC-2581 is a unified \
+            "Export the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) \
+             in IPC-2581 format using kicad-cli and report provenance. IPC-2581 is a unified \
              fabrication/assembly/test data format accepted by many contract manufacturers \
              as an alternative to a Gerber + drill + BOM + pick-and-place bundle.",
             json!({
@@ -450,7 +459,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_odb",
-            "Export the PCB in ODB++ format using kicad-cli. ODB++ is a unified fabrication \
+            "Export the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) \
+             in ODB++ format using kicad-cli and report provenance. ODB++ is a unified fabrication \
              data format accepted by many fab houses as an alternative to a Gerber + drill bundle.",
             json!({
                 "type": "object",
@@ -521,6 +531,7 @@ async fn handle_export_gerber(
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
+    let explicit_layers = !layers.is_empty();
     if layers.is_empty() {
         layers = default_layers(&board, standard_gerber_layers).await?;
     }
@@ -551,15 +562,30 @@ async fn handle_export_gerber(
         .collect::<Vec<_>>();
     files.sort();
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "output_dir": output_dir.to_str().unwrap_or(""),
-            "layers": layers,
-            "files": files
-        }))
-        .unwrap(),
-    ))
+    let mut sources = json!({
+        "board": super::board_source::FROM_SAVED_BOARD,
+        "layers": if explicit_layers {
+            super::board_source::FROM_ARGUMENT
+        } else {
+            super::board_source::FROM_SAVED_BOARD
+        },
+        "gerbers": super::board_source::FROM_KICAD_CLI,
+    });
+    if drill {
+        sources["drill"] = json!(super::board_source::FROM_KICAD_CLI);
+    }
+    let mut body = json!({
+        "success": true,
+        "output_dir": output_dir.to_str().unwrap_or(""),
+        "layers": layers,
+        "files": files
+    });
+    super::board_source::provenance(
+        &mut body,
+        sources,
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_pdf(
@@ -573,6 +599,7 @@ async fn handle_export_pdf(
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
+    let explicit_layers = !layers.is_empty();
     if layers.is_empty() {
         layers = default_layers(&board, front_view_layers).await?;
     }
@@ -582,15 +609,26 @@ async fn handle_export_pdf(
     let cli = &ctx.config.kicad_cli;
     cli::export_pdf(cli, &board, &output, &layer_refs, black_and_white).await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "output": output.to_str().unwrap_or(""),
-            "layers": layers,
-            "black_and_white": black_and_white
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "output": output.to_str().unwrap_or(""),
+        "layers": layers,
+        "black_and_white": black_and_white
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "layers": if explicit_layers {
+                super::board_source::FROM_ARGUMENT
+            } else {
+                super::board_source::FROM_SAVED_BOARD
+            },
+            "pdf": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_svg(
@@ -604,6 +642,7 @@ async fn handle_export_svg(
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
+    let explicit_layers = !layers.is_empty();
     if layers.is_empty() {
         layers = default_layers(&board, front_view_layers).await?;
     }
@@ -613,15 +652,26 @@ async fn handle_export_svg(
     let cli = &ctx.config.kicad_cli;
     cli::export_svg_pcb(cli, &board, &output, &layer_refs, black_and_white).await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "output": output.to_str().unwrap_or(""),
-            "layers": layers,
-            "black_and_white": black_and_white
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "output": output.to_str().unwrap_or(""),
+        "layers": layers,
+        "black_and_white": black_and_white
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "layers": if explicit_layers {
+                super::board_source::FROM_ARGUMENT
+            } else {
+                super::board_source::FROM_SAVED_BOARD
+            },
+            "svg": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_3d(
@@ -636,15 +686,21 @@ async fn handle_export_3d(
     let cli = &ctx.config.kicad_cli;
     cli::export_3d(cli, &board, &output, format, include_unspecified).await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "format": format,
-            "include_unspecified": include_unspecified,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "format": format,
+        "include_unspecified": include_unspecified,
+        "output": output.to_str().unwrap_or("")
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "model_3d": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 fn footprint_reference(fp: &copperpour_sexp::SexpNode) -> String {
@@ -874,16 +930,32 @@ async fn handle_export_netlist(
         "output": output.to_str().unwrap_or("")
     });
     match &source {
-        NetlistSource::Board(board) => cli::export_ipcd356(cli, board, &output).await?,
+        NetlistSource::Board(board) => {
+            cli::export_ipcd356(cli, board, &output).await?;
+            super::board_source::provenance(
+                &mut response,
+                json!({
+                    "board": super::board_source::FROM_SAVED_BOARD,
+                    "netlist": super::board_source::FROM_KICAD_CLI,
+                }),
+                super::board_source::saved_snapshot_evidence(ctx, board),
+            );
+        }
         NetlistSource::Schematic(schematic) => {
             cli::export_netlist(cli, schematic, &output, format).await?;
             response["source_schematic"] = json!(schematic.to_str().unwrap_or(""));
+            super::board_source::provenance(
+                &mut response,
+                json!({
+                    "schematic": super::board_source::FROM_SAVED_SCHEMATIC,
+                    "netlist": super::board_source::FROM_KICAD_CLI,
+                }),
+                super::board_source::saved_schematic_evidence(schematic),
+            );
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&response).unwrap(),
-    ))
+    Ok(CallToolResult::json(&response))
 }
 
 /// The file `export_netlist` hands to kicad-cli.
@@ -1298,9 +1370,15 @@ async fn handle_export_position_file(
     if format != "gerber" {
         result["units"] = json!(units);
     }
-    Ok(CallToolResult::text(
-        serde_json::to_string(&result).unwrap(),
-    ))
+    super::board_source::provenance(
+        &mut result,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "positions": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&result))
 }
 
 async fn handle_export_dxf(
@@ -1337,14 +1415,20 @@ async fn handle_export_dxf(
     }
     files.sort();
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "output_dir": output_dir.to_str().unwrap_or(""),
-            "files": files
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "output_dir": output_dir.to_str().unwrap_or(""),
+        "files": files
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "dxf": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_gencad(
@@ -1357,13 +1441,19 @@ async fn handle_export_gencad(
     let cli = &ctx.config.kicad_cli;
     cli::export_gencad(cli, &board, &output).await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "output": output.to_str().unwrap_or("")
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "gencad": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_ipc2581(
@@ -1378,15 +1468,21 @@ async fn handle_export_ipc2581(
     let cli = &ctx.config.kicad_cli;
     cli::export_ipc2581(cli, &board, &output, units, compress).await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "units": units,
-            "compressed": compress,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "units": units,
+        "compressed": compress,
+        "output": output.to_str().unwrap_or("")
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "ipc2581": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_export_odb(
@@ -1401,15 +1497,21 @@ async fn handle_export_odb(
     let cli = &ctx.config.kicad_cli;
     cli::export_odb(cli, &board, &output, units, compression).await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "units": units,
-            "compression": compression,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "success": true,
+        "units": units,
+        "compression": compression,
+        "output": output.to_str().unwrap_or("")
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "odb": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_refill_zones(

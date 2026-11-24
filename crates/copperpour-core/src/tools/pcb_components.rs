@@ -2714,7 +2714,10 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_board_2d_view",
-            "Render the board with kicad-cli and return it as a base64 PNG. Note this is              kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is              no layer selection. Use export_svg for layer-aware 2-D output.",
+            "Render the saved .kicad_pcb file on disk (unsaved KiCad editor changes are excluded) \
+             with kicad-cli and return provenance metadata alongside a base64 PNG. Note this is \
+             kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is \
+             no layer selection. Use export_svg for layer-aware 2-D output.",
             json!({
                 "type": "object",
                 "properties": {
@@ -5148,7 +5151,24 @@ async fn handle_get_board_2d_view(
     let _ = tokio::fs::remove_file(&tmp).await;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(CallToolResult::image(b64, "image/png"))
+    let mut metadata = json!({
+        "board": board_path.to_string_lossy(),
+        "width": width,
+        "height": height,
+    });
+    super::board_source::provenance(
+        &mut metadata,
+        json!({
+            "board": super::board_source::FROM_SAVED_BOARD,
+            "render": super::board_source::FROM_KICAD_CLI,
+        }),
+        super::board_source::saved_snapshot_evidence(ctx, &board_path),
+    );
+    let mut result = CallToolResult::json(&metadata);
+    result
+        .content
+        .extend(CallToolResult::image(b64, "image/png").content);
+    Ok(result)
 }
 
 #[cfg(test)]

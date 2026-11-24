@@ -21,7 +21,7 @@ pub fn tools() -> Vec<ToolDef> {
             "export_manufacturing_package",
             "Generate ALL files needed for PCB fabrication and assembly in one call: \
              Gerbers, drill files, BOM (fab-house format), and pick-and-place positions. \
-             Targets a specific fab house (JLCPCB, PCBWay, etc.). JLCPCB assembly requires the exact board open in KiCad with IPC enabled; native pad midpoints and board exports use one stable live snapshot. \
+             Targets a specific fab house (JLCPCB, PCBWay, etc.). JLCPCB assembly requires the exact board open in KiCad with IPC enabled; native pad midpoints and board exports use one stable live snapshot, while non-JLCPCB or fabrication-only exports read the saved .kicad_pcb on disk (unsaved KiCad editor changes are excluded). Schematic BOM and sibling .kicad_pro settings always come from saved files on disk; every response reports per-domain provenance (`sources` and `source_evidence`). \
              The JLCPCB placement evidence is written whole beside the CPL, at `placement_orientation.evidence_path`; the response counts its lists and shows the first `limit` applied corrections. \
              For JLCPCB, a part fitted by hand (footprint attribute exclude_from_pos_files, not DNP) leaves the BOM as it leaves the CPL, and is listed in BOM-hand-fitted-<board>.csv for purchase.",
             json!({
@@ -150,8 +150,10 @@ pub fn tools() -> Vec<ToolDef> {
              with them loaded. This sends the design files to JLCPCB; it places no order and pays \
              nothing. DRC runs first on the exported board and any error refuses the upload \
              (skip_drc bypasses it). The files are export_manufacturing_package's for JLCPCB: \
-             assembly needs the exact board open in KiCad with IPC enabled, and the schematic \
-             for the BOM, whose LCSC, MPN and Manufacturer fields are sent.",
+             assembly needs the exact board open in KiCad with IPC enabled, and the saved schematic \
+             for the BOM, whose LCSC, MPN and Manufacturer fields are sent; PCB-only orders read the \
+             saved .kicad_pcb on disk (unsaved editor changes are excluded). Reports per-domain \
+             provenance (`sources` and `source_evidence`).",
             json!({
                 "type": "object",
                 "properties": {
@@ -238,6 +240,8 @@ struct PackageResponse<'a> {
     position_side: Option<&'a str>,
     board_source: &'static str,
     project_settings_source: &'static str,
+    sources: serde_json::Value,
+    source_evidence: serde_json::Value,
     placement_orientation: Option<crate::fab::jlcpcb::JlcpcbOrientationSummary<'a>>,
 }
 
@@ -294,6 +298,7 @@ pub(crate) async fn build_package(
         }
         Err(error) => return Ok(Err(midpoint_failure(error))),
     };
+    let explicit_gerber_layers = !requested_gerber_layers.is_empty();
     let gerber_layers = if requested_gerber_layers.is_empty() {
         let board_source = match &snapshot {
             Some(snapshot) => snapshot.contents.clone(),
@@ -303,6 +308,8 @@ pub(crate) async fn build_package(
     } else {
         requested_gerber_layers
     };
+    let project_file = board.with_extension("kicad_pro");
+    let project_pro_present = project_file.try_exists()?;
     let snapshot_directory = if snapshot.is_some() {
         Some(tempfile::tempdir()?)
     } else {
@@ -313,9 +320,8 @@ pub(crate) async fn build_package(
             .path()
             .join(board.file_name().context("board missing filename")?);
         tokio::fs::write(&staged, &snapshot.contents).await?;
-        let project = board.with_extension("kicad_pro");
-        if project.try_exists()? {
-            tokio::fs::copy(project, staged.with_extension("kicad_pro")).await?;
+        if project_pro_present {
+            tokio::fs::copy(&project_file, staged.with_extension("kicad_pro")).await?;
         }
         staged
     } else {
@@ -342,6 +348,9 @@ pub(crate) async fn build_package(
     let mut orientation_evidence_path = None;
     let mut cpl_export = None;
     let mut bom_written = None;
+    let mut gerbers_ok = false;
+    let mut drill_ok = false;
+    let mut positions_ok = false;
 
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
@@ -350,6 +359,7 @@ pub(crate) async fn build_package(
     let mut board_files = Vec::new();
     match cli::export_gerber(cli_path, &export_board, &gerber_dir, &gerber_layer_refs).await {
         Ok(gerber_files) => {
+            gerbers_ok = true;
             board_files.extend(gerber_files.iter().cloned());
             info!(files = gerber_files.len(), "[BETA] Gerber export succeeded");
             verified_paths.extend(gerber_files.iter().cloned());
@@ -374,6 +384,7 @@ pub(crate) async fn build_package(
     //    the real Excellon output never appeared in the file list at all.
     match cli::export_drill(cli_path, &export_board, &gerber_dir).await {
         Ok(drill_files) => {
+            drill_ok = true;
             info!(files = drill_files.len(), "[BETA] Drill export succeeded");
             board_files.extend(drill_files.iter().cloned());
             verified_paths.extend(drill_files.iter().cloned());
@@ -414,6 +425,7 @@ pub(crate) async fn build_package(
             .await;
         match position_result {
             Ok(export) => {
+                positions_ok = true;
                 info!("[BETA] Position file export succeeded");
                 if let Some(export) = export {
                     cpl_designators = Some(export.designators.clone());
@@ -610,6 +622,60 @@ pub(crate) async fn build_package(
     } else {
         "Do not upload this package. Resolve every warning and export again.".to_string()
     };
+    let board_domain_source = if snapshot.is_some() {
+        super::board_source::FROM_IPC
+    } else {
+        super::board_source::FROM_SAVED_BOARD
+    };
+    let mut sources = json!({
+        "board": board_domain_source,
+        "project_settings": if project_pro_present {
+            super::board_source::FROM_PROJECT_FILE
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        },
+        "gerber_layers": if explicit_gerber_layers {
+            super::board_source::FROM_ARGUMENT
+        } else {
+            board_domain_source
+        },
+        "gerbers": if gerbers_ok {
+            super::board_source::FROM_KICAD_CLI
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        },
+        "drill": if drill_ok {
+            super::board_source::FROM_KICAD_CLI
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        },
+    });
+    if include_assembly {
+        sources["positions"] = json!(if positions_ok {
+            if snapshot.is_some() {
+                super::board_source::FROM_DERIVED
+            } else {
+                super::board_source::FROM_KICAD_CLI
+            }
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        });
+        sources["schematic"] = json!(if schematic.is_some() {
+            super::board_source::FROM_SAVED_SCHEMATIC
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        });
+        sources["bom"] = json!(if bom_written.is_some() {
+            super::board_source::FROM_KICAD_CLI
+        } else {
+            super::board_source::FROM_UNAVAILABLE
+        });
+    }
+    let source_evidence = if snapshot.is_some() {
+        super::board_source::live_evidence()
+    } else {
+        super::board_source::saved_snapshot_evidence(ctx, &board)
+    };
     let evidence_path = orientation_evidence_path
         .as_deref()
         .and_then(std::path::Path::to_str);
@@ -631,6 +697,8 @@ pub(crate) async fn build_package(
             "saved_file"
         },
         project_settings_source: "saved_kicad_pro_if_present",
+        sources,
+        source_evidence,
         placement_orientation: cpl_orientation_evidence
             .as_ref()
             .map(|evidence| evidence.summary(evidence_path, limit)),
@@ -898,34 +966,63 @@ async fn upload_order_package(
             ))
         }
     };
-    Ok(CallToolResult::text(
-        json!({
-            "uploaded": true,
-            "upload_outcome": "sent",
-            "order_url": link.url,
-            "upload_id": link.id,
-            "order_id": order_id,
-            "sent_to": format!("{base}/api/pcb_order/{order_id}/save"),
-            "sent": {
-                "gerber_files": package.board_files.len(),
-                "bom": include_assembly,
-                "cpl": include_assembly,
-            },
-            "board": { "width_mm": width_mm, "length_mm": length_mm, "copper_layers": layers },
-            "order": {
-                "quantity": options.quantity,
-                "thickness_mm": options.thickness_mm,
-                "color": options.color,
-                "surface_finish": options.surface_finish,
-                "copper_weight_oz": options.copper_weight,
-            },
-            "drc": drc,
-            "board_source": package_body["board_source"],
-            "placement_orientation": without_evidence_path(&package_body["placement_orientation"]),
-            "next_steps": "Open order_url and sign in to JLCPCB. Check the board in JLCPCB's viewer and its size, layers and options; with assembly, check every part in the PCBA step's Component Placements before ordering. Nothing has been ordered or paid.",
-        })
-        .to_string(),
-    ))
+    let mut order_sources = json!({
+        "board": if package.snapshot.is_some() {
+            super::board_source::FROM_IPC
+        } else {
+            super::board_source::FROM_SAVED_BOARD
+        },
+        "drc": if skip_drc {
+            super::board_source::FROM_UNAVAILABLE
+        } else {
+            super::board_source::FROM_KICAD_CLI
+        },
+    });
+    // The other domains are what the package observed, not a fresh look at disk.
+    for domain in [
+        "project_settings",
+        "gerbers",
+        "drill",
+        "schematic",
+        "bom",
+        "positions",
+    ] {
+        if let Some(source) = package_body["sources"].get(domain) {
+            order_sources[domain] = source.clone();
+        }
+    }
+    let source_evidence = if package.snapshot.is_some() {
+        super::board_source::live_evidence()
+    } else {
+        super::board_source::saved_snapshot_evidence(ctx, board)
+    };
+    let mut response = json!({
+        "uploaded": true,
+        "upload_outcome": "sent",
+        "order_url": link.url,
+        "upload_id": link.id,
+        "order_id": order_id,
+        "sent_to": format!("{base}/api/pcb_order/{order_id}/save"),
+        "sent": {
+            "gerber_files": package.board_files.len(),
+            "bom": include_assembly,
+            "cpl": include_assembly,
+        },
+        "board": { "width_mm": width_mm, "length_mm": length_mm, "copper_layers": layers },
+        "order": {
+            "quantity": options.quantity,
+            "thickness_mm": options.thickness_mm,
+            "color": options.color,
+            "surface_finish": options.surface_finish,
+            "copper_weight_oz": options.copper_weight,
+        },
+        "drc": drc,
+        "board_source": package_body["board_source"],
+        "placement_orientation": without_evidence_path(&package_body["placement_orientation"]),
+        "next_steps": "Open order_url and sign in to JLCPCB. Check the board in JLCPCB's viewer and its size, layers and options; with assembly, check every part in the PCBA step's Component Placements before ordering. Nothing has been ordered or paid.",
+    });
+    super::board_source::provenance(&mut response, order_sources, source_evidence);
+    Ok(CallToolResult::json(&response))
 }
 
 /// The package's placement summary without its `evidence_path`: the order
@@ -1643,7 +1740,17 @@ mod order_link_tests {
 
     fn prepared_package(complete: bool) -> PackageBuild {
         PackageBuild {
-            body: json!({ "warnings": if complete { vec![] } else { vec!["Gerber export failed"] }, "board_source": "saved_file" }).to_string(),
+            body: json!({
+                "warnings": if complete { vec![] } else { vec!["Gerber export failed"] },
+                "board_source": "saved_file",
+                "sources": {
+                    "board": "saved_board",
+                    "project_settings": "project_file",
+                    "gerbers": "kicad_cli",
+                    "drill": "kicad_cli",
+                },
+            })
+            .to_string(),
             complete,
             board_files: Vec::new(),
             bom: None,
@@ -1685,6 +1792,249 @@ mod order_link_tests {
         );
         assert_eq!(refusal["warnings"], json!(["Gerber export failed"]));
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn order_link_reports_saved_snapshot_provenance() {
+        let (base, count, _) = endpoint().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("order.kicad_pcb");
+        std::fs::write(&board, ORDER_BOARD).unwrap();
+        // No .kicad_pro on disk: `project_settings` is what the package observed.
+        let lock = copperpour_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock, "locked").unwrap();
+
+        let result = upload_order_package(
+            &json!({ "_order_base_url": base }),
+            &ctx(),
+            &board,
+            false,
+            true,
+            prepared_package(true),
+        )
+        .await
+        .unwrap();
+        let answer = body(&result);
+        assert!(!result.is_error, "{answer}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(answer["board_source"], "saved_file", "{answer}");
+        assert_eq!(
+            answer["sources"],
+            json!({
+                "board": "saved_board",
+                "project_settings": "project_file",
+                "gerbers": "kicad_cli",
+                "drill": "kicad_cli",
+                "drc": "unavailable",
+            }),
+            "{answer}"
+        );
+        assert_eq!(answer["source_evidence"]["board_state"], "saved_board");
+        assert_eq!(
+            answer["source_evidence"]["excludes_unsaved_editor_state"],
+            true
+        );
+        assert_eq!(
+            answer["source_evidence"]["reason"],
+            "saved_snapshot_only_with_editor_lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn order_link_reports_live_ipc_snapshot_provenance() {
+        let (base, count, _) = endpoint().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("order.kicad_pcb");
+        std::fs::write(&board, ORDER_BOARD).unwrap();
+
+        let live_package = PackageBuild {
+            body: json!({
+                "warnings": [],
+                "board_source": "stable_live_ipc_snapshot",
+                "sources": {
+                    "board": "ipc",
+                    "project_settings": "unavailable",
+                    "gerbers": "kicad_cli",
+                    "drill": "kicad_cli",
+                },
+            })
+            .to_string(),
+            complete: true,
+            board_files: Vec::new(),
+            bom: None,
+            cpl: None,
+            snapshot: Some(crate::fab::jlcpcb::midpoints::Snapshot {
+                contents: ORDER_BOARD.to_owned(),
+                midpoints: std::collections::BTreeMap::new(),
+                hand_fitted: std::collections::BTreeSet::new(),
+            }),
+            _staging: None,
+        };
+
+        let result = upload_order_package(
+            &json!({ "_order_base_url": base }),
+            &ctx(),
+            &board,
+            false,
+            true,
+            live_package,
+        )
+        .await
+        .unwrap();
+        let answer = body(&result);
+        assert!(!result.is_error, "{answer}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            answer["board_source"], "stable_live_ipc_snapshot",
+            "{answer}"
+        );
+        assert_eq!(
+            answer["sources"],
+            json!({
+                "board": "ipc",
+                "project_settings": "unavailable",
+                "gerbers": "kicad_cli",
+                "drill": "kicad_cli",
+                "drc": "unavailable",
+            }),
+            "{answer}"
+        );
+        assert_eq!(answer["source_evidence"]["board_state"], "ipc");
+        assert_eq!(
+            answer["source_evidence"]["excludes_unsaved_editor_state"],
+            false
+        );
+        assert_eq!(answer["source_evidence"]["reason"], serde_json::Value::Null);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn order_link_with_assembly_and_drc_reports_all_domain_sources() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, count, _) = endpoint().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("order.kicad_pcb");
+        std::fs::write(&board, ORDER_BOARD).unwrap();
+
+        let bom_path = dir.path().join("BOM-order.csv");
+        std::fs::write(
+            &bom_path,
+            "Designator,Value,Footprint,MPN,Manufacturer,LCSC,Quantity\nR1,10k,R_0402,RC0402,Yageo,C25744,1\n",
+        )
+        .unwrap();
+
+        let fake_cli = dir.path().join("fake-drc-cli.sh");
+        std::fs::write(
+            &fake_cli,
+            "#!/bin/sh\n\
+             sub2=\"${2:-}\"\n\
+             out=\"\"\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+               if [ \"$1\" = \"--output\" ] || [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; else shift; fi\n\
+             done\n\
+             if [ \"$sub2\" = \"drc\" ]; then\n\
+               printf '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}\\n' > \"$out\"\n\
+             else\n\
+               printf 'Ref,Val,Package,PosX,PosY,Rot,Side\\nR1,10k,R_0402,100.0,-50.0,0.0,top\\n' > \"$out\"\n\
+             fi\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_cli).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_cli, perms).unwrap();
+
+        let mut midpoints = std::collections::BTreeMap::new();
+        midpoints.insert(
+            "R1".to_string(),
+            crate::fab::jlcpcb::midpoints::Midpoint {
+                designator: "R1".to_string(),
+                anchor_x_mm: 100.0,
+                anchor_y_mm: 50.0,
+                midpoint_x_mm: 100.0,
+                midpoint_y_mm: 50.0,
+                algorithm: "kicad_ipc_pad_bbox_union",
+                pad_count: 2,
+                pin1_mm: Some((99.5, 50.0)),
+                smd: true,
+            },
+        );
+        let cpl_path = dir.path().join("CPL-order.csv");
+        let cpl = crate::fab::jlcpcb::export_jlcpcb_cpl(
+            fake_cli.to_str().unwrap(),
+            &board,
+            &cpl_path,
+            "both",
+            None,
+            &midpoints,
+        )
+        .await
+        .unwrap();
+        let live_package = PackageBuild {
+            body: json!({
+                "warnings": [],
+                "board_source": "stable_live_ipc_snapshot",
+                "sources": {
+                    "board": "ipc",
+                    "project_settings": "unavailable",
+                    "gerbers": "kicad_cli",
+                    "drill": "kicad_cli",
+                    "schematic": "saved_schematic",
+                    "bom": "kicad_cli",
+                    "positions": "derived",
+                },
+            })
+            .to_string(),
+            complete: true,
+            board_files: Vec::new(),
+            bom: Some(bom_path),
+            cpl: Some(cpl),
+            snapshot: Some(crate::fab::jlcpcb::midpoints::Snapshot {
+                contents: ORDER_BOARD.to_owned(),
+                midpoints,
+                hand_fitted: std::collections::BTreeSet::new(),
+            }),
+            _staging: None,
+        };
+
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: fake_cli.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = upload_order_package(
+            &json!({ "_order_base_url": base }),
+            &ctx,
+            &board,
+            true,
+            false,
+            live_package,
+        )
+        .await
+        .unwrap();
+        let answer = body(&result);
+        assert!(!result.is_error, "{answer}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            answer["sources"],
+            json!({
+                "board": "ipc",
+                "project_settings": "unavailable",
+                "gerbers": "kicad_cli",
+                "drill": "kicad_cli",
+                "drc": "kicad_cli",
+                "schematic": "saved_schematic",
+                "bom": "kicad_cli",
+                "positions": "derived",
+            }),
+            "{answer}"
+        );
+        assert_eq!(answer["source_evidence"]["board_state"], "ipc");
+        assert_eq!(
+            answer["source_evidence"]["excludes_unsaved_editor_state"],
+            false
+        );
     }
 
     #[tokio::test]

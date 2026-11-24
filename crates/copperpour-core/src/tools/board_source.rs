@@ -175,6 +175,15 @@ pub(crate) fn saved_board_unavailable_evidence(ctx: &ToolContext, board_path: &P
     )
 }
 
+/// Observed provenance for a saved-snapshot tool that reads only a saved
+/// `.kicad_sch` schematic file without consulting KiCad IPC.
+pub(crate) fn saved_schematic_evidence(schematic_path: &Path) -> Value {
+    saved_lock_evidence(
+        FROM_SAVED_SCHEMATIC,
+        live_board::editor_lock(schematic_path),
+    )
+}
+
 /// Observed provenance for a mixed review run when no board path was supplied.
 pub(crate) fn schematic_only_evidence() -> Value {
     json!({
@@ -195,40 +204,44 @@ fn saved_file_evidence(
     board_state: &'static str,
     lock: live_board::EditorLock,
 ) -> Value {
-    let (reason, detail) = if ctx.board_session.was_observed_live(board_path) {
-        (
-            "saved_snapshot_only_after_live_observation",
-            "This tool inspects the saved files on disk without consulting KiCad IPC. Copperpour \
-             observed this board live in KiCad during this server session, so unsaved editor \
-             changes are excluded."
+    if ctx.board_session.was_observed_live(board_path) {
+        return json!({
+            "board_state": board_state,
+            "excludes_unsaved_editor_state": true,
+            "reason": "saved_snapshot_only_after_live_observation",
+            "detail": "This tool inspects the saved files on disk without consulting KiCad IPC. Copperpour \
+                       observed this board live in KiCad during this server session, so unsaved editor \
+                       changes are excluded.",
+        });
+    }
+    saved_lock_evidence(board_state, lock)
+}
+
+fn saved_lock_evidence(board_state: &'static str, lock: live_board::EditorLock) -> Value {
+    let (reason, detail) = match lock {
+        live_board::EditorLock::Absent => (
+            "saved_snapshot_only",
+            "This tool inspects the saved files on disk without consulting KiCad IPC; any \
+             unsaved editor changes are excluded."
                 .to_string(),
-        )
-    } else {
-        match lock {
-            live_board::EditorLock::Absent => (
-                "saved_snapshot_only",
-                "This tool inspects the saved files on disk without consulting KiCad IPC; any \
-                 unsaved editor changes are excluded."
-                    .to_string(),
+        ),
+        live_board::EditorLock::Present(path) => (
+            "saved_snapshot_only_with_editor_lock",
+            format!(
+                "This tool inspects the saved files on disk without consulting KiCad IPC, and \
+                 the sibling lock '{}' is present; any unsaved editor changes are excluded.",
+                display_path(&path)
             ),
-            live_board::EditorLock::Present(path) => (
-                "saved_snapshot_only_with_editor_lock",
-                format!(
-                    "This tool inspects the saved files on disk without consulting KiCad IPC, and \
-                     the sibling lock '{}' is present; any unsaved editor changes are excluded.",
-                    display_path(&path)
-                ),
+        ),
+        live_board::EditorLock::Unreadable(path, error) => (
+            "saved_snapshot_only_with_uninspectable_lock",
+            format!(
+                "This tool inspects the saved files on disk without consulting KiCad IPC, and \
+                 the sibling lock '{}' could not be inspected ({error}); any unsaved editor \
+                 changes are excluded.",
+                display_path(&path)
             ),
-            live_board::EditorLock::Unreadable(path, error) => (
-                "saved_snapshot_only_with_uninspectable_lock",
-                format!(
-                    "This tool inspects the saved files on disk without consulting KiCad IPC, and \
-                     the sibling lock '{}' could not be inspected ({error}); any unsaved editor \
-                     changes are excluded.",
-                    display_path(&path)
-                ),
-            ),
-        }
+        ),
     };
     json!({
         "board_state": board_state,
