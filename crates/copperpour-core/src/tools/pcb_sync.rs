@@ -218,7 +218,22 @@ struct SyncCounts {
     /// built or updated; listed in `skipped_footprints`, never fatal to the
     /// rest (`skip_parts`).
     skipped_footprint: CountPair,
+    /// Footprints with no symbol deleted on request
+    /// (`delete_footprints_without_symbols`, #861).
+    deleted: CountPair,
     conflicts: CountPair,
+}
+
+/// A board footprint no schematic symbol matched, without the board-only
+/// attribute, that the plan keeps (#861). KiCad's Update PCB deletes such a
+/// footprint with **Delete footprints with no symbols**; a footprint with the
+/// board-only attribute (a logo, a mounting hole) is never listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FootprintWithoutSymbol {
+    reference: String,
+    kiid: String,
+    footprint_id: String,
+    locked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -268,6 +283,13 @@ enum PlannedChange {
         /// from it in place (`pcb_footprint_update::replace_footprint`).
         #[serde(skip_serializing_if = "Option::is_none")]
         replace_footprint: Option<ReplacedFootprint>,
+    },
+    /// A footprint no symbol matched, deleted on request
+    /// (`delete_footprints_without_symbols`, #861).
+    Delete {
+        kiid: String,
+        reference: String,
+        footprint_id: String,
     },
 }
 
@@ -348,6 +370,10 @@ struct SyncPlan {
     /// the preflight's own diagnostic. Part of the plan's identity: what was
     /// left out is part of what was reviewed.
     skipped: Vec<SyncDiagnostic>,
+    /// The footprints no symbol matched that the plan keeps, apart from those
+    /// with the board-only attribute (#861). Those it deletes are `Delete`
+    /// changes instead.
+    without_symbols: Vec<FootprintWithoutSymbol>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -463,6 +489,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    let delete_without_symbols = args["delete_footprints_without_symbols"]
+        .as_bool()
+        .unwrap_or(false);
     let options = ResponseOptions::from_args(args);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -576,8 +605,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan =
-                plan_sync_acknowledging(&netlist_source, &design, &snapshot.state, &acknowledged);
+            let mut plan = plan_sync_acknowledging(
+                &netlist_source,
+                &design,
+                &snapshot.state,
+                &acknowledged,
+                delete_without_symbols,
+            );
             plan.staging = Some(snapshot.staging.clone());
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
@@ -701,7 +735,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                         .to_string(),
                     None,
                 ));
-                plan.changes.clear();
+                clear_changes(&mut plan);
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
             }
             if plan.status == PlanStatus::Noop {
@@ -716,11 +750,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 &snapshot,
                 carried,
             )?;
+            let deletions = planned_deletions(&plan);
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             let commit = client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
+                // In the same commit, after the updates, as KiCad's Update PCB
+                // removes unused footprints last (#861).
+                client.delete_items_in(
+                    snapshot.document.clone(),
+                    deletions.iter().map(|footprint| footprint.kiid.clone()).collect(),
+                )?;
                 Ok(())
             });
             if let Err(error) = commit {
@@ -731,17 +772,28 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 }
                 return Err(error);
             }
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
-            {
-                plan.diagnostics.push(conflict(
-                    "board_readback_differs",
-                    format!(
-                        "the board KiCad wrote differs from what was sent — {detail}. \
-                         No pad was invented, so this is reported rather than \
-                         refused; check the footprint before relying on it."
-                    ),
-                    None,
-                ));
+            // The commit stands whatever a readback finds, so one that cannot
+            // finish is reported on the applied response with `is_error`, never
+            // as a refusal, as `acknowledged_apply_unchecked` is.
+            let mut unchecked = false;
+            match verify_board_matches_what_was_sent(client, &snapshot.document, &expected) {
+                Ok(details) => {
+                    for detail in details {
+                        plan.diagnostics.push(conflict(
+                            "board_readback_differs",
+                            format!(
+                                "the board KiCad wrote differs from what was sent — {detail}. \
+                                 No pad was invented, so this is reported rather than \
+                                 refused; check the footprint before relying on it."
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    unchecked = true;
+                    plan.diagnostics.push(readback_unchecked("the footprints it sent", &error));
+                }
             }
             plan.counts.added.applied = plan.counts.added.planned;
             plan.counts.updated.applied = plan.counts.updated.planned;
@@ -751,6 +803,36 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
             plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
             plan.counts.skipped_footprint.applied = plan.counts.skipped_footprint.planned;
+            plan.counts.deleted.applied = plan.counts.deleted.planned;
+            // KiCad before 10.0.7 answers a delete without per-item results
+            // (10.0.7 added them, KiCad 77e2d53da2, and `delete_items_in`
+            // checks them), so the board is read back to show each footprint
+            // is gone. One KiCad still lists is counted and listed as kept.
+            match footprints_still_on_board(client, &snapshot.document, &deletions) {
+                Ok(kept) => {
+                    for footprint in kept {
+                        plan.diagnostics.push(conflict(
+                            "board_readback_differs",
+                            format!(
+                                "{} ({}) is still on the board after the sync asked KiCad to \
+                                 delete it; it is counted and listed as kept.",
+                                footprint.reference, footprint.kiid
+                            ),
+                            Some(&footprint.reference),
+                        ));
+                        plan.counts.deleted.applied -= 1;
+                        plan.counts.board_only_preserved.applied += 1;
+                        plan.without_symbols.push(footprint);
+                    }
+                }
+                Err(error) => {
+                    unchecked = true;
+                    plan.diagnostics.push(readback_unchecked(
+                        "the footprints it deleted (KiCad accepted each deletion)",
+                        &error,
+                    ));
+                }
+            }
             // Checked only when an acknowledged change is still planned: one
             // whose part was skipped went with the part, so nothing was made
             // that this would report on.
@@ -759,7 +841,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .iter()
                 .any(|note| note.code == "routed_pad_net_change_acknowledged")
             {
-                return Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options));
+                return Ok(applied_response(&plan, hierarchy.len(), &options, unchecked));
             }
             // The commit stands whatever this finds, so a check that cannot
             // finish is reported on the applied response, never as a refusal.
@@ -767,7 +849,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             {
                 Ok(evidence) => {
                     plan.acknowledged_apply = Some(evidence);
-                    Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options))
+                    Ok(applied_response(&plan, hierarchy.len(), &options, unchecked))
                 }
                 Err(error) => {
                     plan.diagnostics.push(conflict(
@@ -887,6 +969,11 @@ struct SyncResponse<'a> {
     /// Parts the preflight left out, each with the diagnostic that says why;
     /// every other part is synced. Counted in `coverage.skipped_footprint`.
     skipped_footprints: &'a [SyncDiagnostic],
+    /// Board footprints no symbol matched, without the board-only attribute,
+    /// that the plan keeps (#861); counted in `coverage.board_only_preserved`
+    /// with the board-only ones. `delete_footprints_without_symbols` plans
+    /// the unlocked ones as `delete` changes instead.
+    footprints_without_symbols: &'a [FootprintWithoutSymbol],
     /// Bounded as rendered only: `plan.changes` stays whole, since the plan
     /// revision hashes it and the apply sends it.
     changes: &'a [PlannedChange],
@@ -920,6 +1007,7 @@ impl<'a> SyncResponse<'a> {
                 "skipped_by_flag": plan.counts.skipped_by_flag,
                 "unassigned_footprint": plan.counts.unassigned_footprint,
                 "skipped_footprint": plan.counts.skipped_footprint,
+                "footprints_deleted": plan.counts.deleted,
                 "conflicts": plan.counts.conflicts
             }),
             staging: plan.staging.as_ref().map(StagingEvidence::json),
@@ -932,6 +1020,7 @@ impl<'a> SyncResponse<'a> {
             diagnostics: Cow::Borrowed(&plan.diagnostics),
             unassigned_footprints: &plan.unassigned,
             skipped_footprints: &plan.skipped,
+            footprints_without_symbols: &plan.without_symbols,
         }
     }
 }
@@ -993,6 +1082,7 @@ fn conflict_result(message: String) -> CallToolResult {
             "skipped_by_flag": CountPair::default(),
             "unassigned_footprint": CountPair::default(),
             "skipped_footprint": CountPair::default(),
+            "footprints_deleted": CountPair::default(),
             "conflicts": CountPair { planned: 1, applied: 0 }
         },
         "diagnostics": [conflict("preflight_conflict", message, None)]
@@ -1038,19 +1128,22 @@ fn normalize_symbol_path<'a>(path: &'a str, root_sheet_uuid: Option<&str>) -> &'
 /// [`plan_sync_acknowledging`] with no routed pad net change acknowledged.
 #[cfg(test)]
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
-    plan_sync_acknowledging(netlist_source, design, board, &BTreeSet::new())
+    plan_sync_acknowledging(netlist_source, design, board, &BTreeSet::new(), false)
 }
 
 /// The plan. A pad net change on a net that routed copper uses is a
 /// `routed_pad_net_change` conflict unless `acknowledged` names it exactly;
 /// then it is planned as KiCad's Update PCB makes it, with no copper sent,
 /// and noted. An acknowledgement the plan has no such change for is a
-/// conflict, so a stale or widened one refuses (#38).
+/// conflict, so a stale or widened one refuses (#38). With
+/// `delete_without_symbols`, a plan with no conflict deletes each unlocked
+/// footprint no symbol matched that lacks the board-only attribute (#861).
 fn plan_sync_acknowledging(
     netlist_source: &str,
     design: &ExportedDesign,
     board: &BoardState,
     acknowledged: &BTreeSet<AcknowledgedNetChange>,
+    delete_without_symbols: bool,
 ) -> SyncPlan {
     let mut diagnostics = Vec::new();
     let mut acknowledgements_used = BTreeSet::new();
@@ -1470,7 +1563,6 @@ fn plan_sync_acknowledging(
         ));
     }
 
-    counts.board_only_preserved.planned = board.footprints.len() - matched.len();
     counts.conflicts.planned = diagnostics.len();
     if !diagnostics.is_empty() {
         changes.clear();
@@ -1478,6 +1570,51 @@ fn plan_sync_acknowledging(
         counts.updated.planned = 0;
         counts.pads_reassigned.planned = 0;
     }
+    // The footprints no symbol matched. KiCad's Update PCB with "Delete
+    // footprints with no symbols" removes each of them in the same commit,
+    // never one with the board-only attribute (`FP_BOARD_ONLY`), and a locked
+    // one only when locks are overridden, which the sync does not offer: it
+    // keeps it with a warning (`BOARD_NETLIST_UPDATER::UpdateNetlist`, KiCad
+    // 10.0.8). A plan with a conflict deletes nothing (#861).
+    let deleting = delete_without_symbols && diagnostics.is_empty();
+    let mut without_symbols = Vec::new();
+    let mut unmatched = 0usize;
+    for (index, footprint) in board.footprints.iter().enumerate() {
+        if matched.contains(&index) {
+            continue;
+        }
+        unmatched += 1;
+        if footprint.not_in_schematic {
+            continue;
+        }
+        if deleting && !footprint.locked {
+            changes.push(PlannedChange::Delete {
+                kiid: footprint.kiid.clone(),
+                reference: footprint.reference.clone(),
+                footprint_id: footprint.footprint_id.clone(),
+            });
+            counts.deleted.planned += 1;
+            continue;
+        }
+        if deleting {
+            notes.push(conflict(
+                "footprint_locked_not_deleted",
+                format!(
+                    "{} has no symbol in the schematic, but it is locked, so it is kept; unlock \
+                     it and sync again to delete it",
+                    footprint.reference
+                ),
+                Some(&footprint.reference),
+            ));
+        }
+        without_symbols.push(FootprintWithoutSymbol {
+            reference: footprint.reference.clone(),
+            kiid: footprint.kiid.clone(),
+            footprint_id: footprint.footprint_id.clone(),
+            locked: footprint.locked,
+        });
+    }
+    counts.board_only_preserved.planned = unmatched - counts.deleted.planned;
     let status = if !diagnostics.is_empty() {
         PlanStatus::Conflict
     } else if changes.is_empty() {
@@ -1496,6 +1633,7 @@ fn plan_sync_acknowledging(
         unassigned,
         // Set by the handler's preflight, which reads the library.
         skipped: Vec::new(),
+        without_symbols,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
         acknowledged_apply: None,
@@ -3904,6 +4042,8 @@ fn skip_parts(
         PlannedChange::Update {
             kiid, reference, ..
         } => !skipped.contains(reference) && !left_out.contains(kiid.as_str()),
+        // A footprint with no symbol is no part the preflight skips (#861).
+        PlannedChange::Delete { .. } => true,
     });
     let names_its_parts = diagnostics
         .iter()
@@ -3912,8 +4052,12 @@ fn skip_parts(
         refuse_plan(plan, diagnostics);
         return false;
     }
-    plan.changes
-        .retain(|change| !skipped.contains(change_reference(change)));
+    plan.changes.retain(|change| match change {
+        PlannedChange::Add { reference, .. } | PlannedChange::Update { reference, .. } => {
+            !skipped.contains(reference)
+        }
+        PlannedChange::Delete { .. } => true,
+    });
     // A note about a skipped part (a locked footprint kept, say) no longer
     // describes anything this sync does.
     plan.diagnostics.retain(|note| {
@@ -3939,17 +4083,12 @@ fn skip_parts(
                         changed_pad_count(pad_nets, &footprint.pad_nets)
                     });
             }
+            PlannedChange::Delete { .. } => {}
         }
     }
     plan.counts.skipped_footprint.planned += skipped.len();
     plan.skipped.extend(diagnostics);
     true
-}
-
-fn change_reference(change: &PlannedChange) -> &str {
-    match change {
-        PlannedChange::Add { reference, .. } | PlannedChange::Update { reference, .. } => reference,
-    }
 }
 
 /// How many pads change net, as `plan_sync` counts them for an update,
@@ -3975,7 +4114,107 @@ fn refuse_plan(plan: &mut SyncPlan, diagnostics: Vec<SyncDiagnostic>) {
     plan.counts.pads_reassigned.planned = 0;
     plan.counts.conflicts.planned += diagnostics.len();
     plan.diagnostics.extend(diagnostics);
-    plan.changes.clear();
+    clear_changes(plan);
+}
+
+/// Take every change off a refused plan. A footprint it would have deleted
+/// stays on the board, so it is listed and counted with those kept (#861).
+fn clear_changes(plan: &mut SyncPlan) {
+    for change in plan.changes.drain(..) {
+        if let PlannedChange::Delete {
+            kiid,
+            reference,
+            footprint_id,
+        } = change
+        {
+            plan.without_symbols.push(FootprintWithoutSymbol {
+                reference,
+                kiid,
+                footprint_id,
+                // Only an unlocked footprint is planned for deletion.
+                locked: false,
+            });
+            plan.counts.board_only_preserved.planned += 1;
+        }
+    }
+    plan.counts.deleted.planned = 0;
+}
+
+/// The applied response, an error when a readback after the commit could not
+/// finish.
+fn applied_response(
+    plan: &SyncPlan,
+    hierarchy_files: usize,
+    options: &ResponseOptions,
+    unchecked: bool,
+) -> CallToolResult {
+    let mut result = sync_response(plan, "applied", hierarchy_files, true, options);
+    result.is_error |= unchecked;
+    result
+}
+
+/// The note for a readback after the commit that failed: the commit stands.
+fn readback_unchecked(what: &str, error: &anyhow::Error) -> SyncDiagnostic {
+    conflict(
+        "apply_readback_unchecked",
+        format!(
+            "the commit was applied, but reading back {what} failed: {error:#}. Do not apply \
+             this plan again; check the board with sync_live_board."
+        ),
+        None,
+    )
+}
+
+/// The footprints the plan deletes, as the list of kept footprints would name
+/// them: only an unlocked footprint is planned for deletion.
+fn planned_deletions(plan: &SyncPlan) -> Vec<FootprintWithoutSymbol> {
+    plan.changes
+        .iter()
+        .filter_map(|change| match change {
+            PlannedChange::Delete {
+                kiid,
+                reference,
+                footprint_id,
+            } => Some(FootprintWithoutSymbol {
+                reference: reference.clone(),
+                kiid: kiid.clone(),
+                footprint_id: footprint_id.clone(),
+                locked: false,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each of `deletions` KiCad still lists after the commit.
+fn footprints_still_on_board(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    deletions: &[FootprintWithoutSymbol],
+) -> Result<Vec<FootprintWithoutSymbol>> {
+    use copperpour_ipc::gen::kiapi;
+
+    if deletions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let listed = client
+        .get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?
+        .iter()
+        .filter_map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .ok()
+                .and_then(|footprint| footprint.id)
+                .map(|id| id.value)
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(deletions
+        .iter()
+        .filter(|footprint| listed.contains(&footprint.kiid))
+        .cloned()
+        .collect())
 }
 
 fn footprint_dimensions(
@@ -4200,6 +4439,8 @@ fn build_mutation_items(
                 };
                 updates.push(update_footprint_item(item, change, &snapshot.net_codes)?);
             }
+            // Sent by the handler, in the same commit (`planned_deletions`).
+            PlannedChange::Delete { .. } => {}
         }
     }
     Ok((creates, updates))
@@ -5054,7 +5295,15 @@ mod tests {
     }
 
     fn planned_references(plan: &SyncPlan) -> Vec<&str> {
-        let mut references: Vec<&str> = plan.changes.iter().map(change_reference).collect();
+        let mut references: Vec<&str> = plan
+            .changes
+            .iter()
+            .map(|change| match change {
+                PlannedChange::Add { reference, .. }
+                | PlannedChange::Update { reference, .. }
+                | PlannedChange::Delete { reference, .. } => reference.as_str(),
+            })
+            .collect();
         references.sort_unstable();
         references
     }
@@ -5145,7 +5394,7 @@ mod tests {
             acknowledging("R1", "1", "VCC", "VCC_A"),
             acknowledging("R1", "2", "GND", "GND_A"),
         ]);
-        let mut plan = plan_sync_acknowledging("netlist", &design, &board, &acknowledged);
+        let mut plan = plan_sync_acknowledging("netlist", &design, &board, &acknowledged, false);
         assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
         assert_eq!(plan.counts.pads_reassigned.planned, 2);
         let skipped = vec![cannot_build("unsupported_library_footprint", &["R1"])];
@@ -6344,7 +6593,7 @@ mod tests {
             })
             .collect();
 
-        let plan = plan_sync_acknowledging("netlist", &design, &board, &acknowledged);
+        let plan = plan_sync_acknowledging("netlist", &design, &board, &acknowledged, false);
 
         assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
         assert_eq!(refusing_codes(&plan), Vec::<&str>::new());
@@ -6417,6 +6666,7 @@ mod tests {
                 &design,
                 &board,
                 &acknowledged.iter().cloned().collect(),
+                false,
             );
             assert_eq!(plan.status, PlanStatus::Conflict, "{acknowledged:?}");
             assert!(plan.changes.is_empty(), "{acknowledged:?}");
@@ -6431,6 +6681,7 @@ mod tests {
             &design,
             &unrouted,
             &BTreeSet::from([pad_1.clone(), pad_2.clone()]),
+            false,
         );
         assert_eq!(plan.status, PlanStatus::Conflict);
         assert_eq!(refusing_codes(&plan), vec![unmatched, unmatched]);
@@ -6443,6 +6694,7 @@ mod tests {
             &design,
             &duplicated,
             &BTreeSet::from([pad_1, pad_2]),
+            false,
         );
         assert_eq!(plan.status, PlanStatus::Conflict);
         assert_eq!(refusing_codes(&plan), vec!["duplicate_board_reference"]);
@@ -7165,6 +7417,153 @@ mod tests {
         );
     }
 
+    /// R1 linked to its symbol, R3 whose symbol left the schematic, and MH1,
+    /// which has no symbol and the board-only attribute (#861).
+    fn footprints_without_symbols() -> (ExportedDesign, BoardState) {
+        let mut mounting_hole = board_resistor("MH1", None);
+        mounting_hole.not_in_schematic = true;
+        let board = board_with(vec![
+            board_resistor("R1", Some("/sheet/existing")),
+            board_resistor("R3", Some("/sheet/removed")),
+            mounting_hole,
+        ]);
+        let design = ExportedDesign {
+            root_sheet_uuid: None,
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        (design, board)
+    }
+
+    fn r3_without_a_symbol(locked: bool) -> FootprintWithoutSymbol {
+        FootprintWithoutSymbol {
+            reference: "R3".to_string(),
+            kiid: "R3-kiid".to_string(),
+            footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+            locked,
+        }
+    }
+
+    fn r3_deleted() -> PlannedChange {
+        PlannedChange::Delete {
+            kiid: "R3-kiid".to_string(),
+            reference: "R3".to_string(),
+            footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+        }
+    }
+
+    /// Without `delete_footprints_without_symbols`, R3 is kept and named, and
+    /// MH1 is kept and not named; both are counted as preserved.
+    #[test]
+    fn a_footprint_without_a_symbol_is_named_and_kept() {
+        let (design, board) = footprints_without_symbols();
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.without_symbols, vec![r3_without_a_symbol(false)]);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+        assert_eq!(plan.counts.deleted.planned, 0);
+        assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
+    }
+
+    /// With it, R3 is deleted, and that alone makes the plan ready. MH1 has
+    /// the board-only attribute, so it stays, as KiCad keeps it.
+    #[test]
+    fn a_footprint_without_a_symbol_is_deleted_on_request() {
+        let (design, board) = footprints_without_symbols();
+
+        let plan = plan_sync_acknowledging("netlist", &design, &board, &BTreeSet::new(), true);
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.changes, vec![r3_deleted()]);
+        assert_eq!(plan.counts.deleted.planned, 1);
+        assert_eq!(plan.counts.board_only_preserved.planned, 1);
+        assert!(
+            plan.without_symbols.is_empty(),
+            "{:?}",
+            plan.without_symbols
+        );
+        assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
+    }
+
+    /// A locked R3 is kept with a note that refuses nothing, as KiCad keeps it
+    /// with a warning when locks are not overridden.
+    #[test]
+    fn a_locked_footprint_without_a_symbol_is_kept_with_a_note() {
+        let (design, mut board) = footprints_without_symbols();
+        board.footprints[1].locked = true;
+
+        let plan = plan_sync_acknowledging("netlist", &design, &board, &BTreeSet::new(), true);
+
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.without_symbols, vec![r3_without_a_symbol(true)]);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+        assert_eq!(plan.counts.conflicts.planned, 0);
+        assert_eq!(plan.diagnostics.len(), 1, "{:?}", plan.diagnostics);
+        assert_eq!(plan.diagnostics[0].code, "footprint_locked_not_deleted");
+        assert_eq!(plan.diagnostics[0].reference.as_deref(), Some("R3"));
+    }
+
+    /// A plan with a conflict deletes nothing: R3 is named as kept.
+    #[test]
+    fn a_plan_with_a_conflict_deletes_no_footprint() {
+        let (mut design, board) = footprints_without_symbols();
+        design.components.push(resistor("R1", "/sheet/other"));
+
+        let plan = plan_sync_acknowledging("netlist", &design, &board, &BTreeSet::new(), true);
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.counts.deleted.planned, 0);
+        assert_eq!(plan.without_symbols, vec![r3_without_a_symbol(false)]);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+    }
+
+    /// A plan the handler refuses later, as a stale revision or a preflight
+    /// refusal, keeps the footprints it would have deleted, and says so.
+    #[test]
+    fn a_refused_plan_lists_the_footprints_it_would_have_deleted() {
+        let (design, board) = footprints_without_symbols();
+        let mut plan = plan_sync_acknowledging("netlist", &design, &board, &BTreeSet::new(), true);
+
+        refuse_plan(
+            &mut plan,
+            vec![conflict("preflight_conflict", "refused".to_string(), None)],
+        );
+
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.counts.deleted.planned, 0);
+        assert_eq!(plan.without_symbols, vec![r3_without_a_symbol(false)]);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+    }
+
+    /// A part the preflight skips takes no deletion with it, and a plan left
+    /// with only the deletion still applies it.
+    #[test]
+    fn a_skipped_part_leaves_the_deletions_planned() {
+        let (mut design, board) = footprints_without_symbols();
+        design.components.push(resistor("R2", "/sheet/new"));
+        let mut plan = plan_sync_acknowledging("netlist", &design, &board, &BTreeSet::new(), true);
+        assert_eq!(plan.counts.added.planned, 1, "{:?}", plan.changes);
+
+        let applies = skip_parts(
+            &mut plan,
+            vec![cannot_build("unsupported_library_footprint", &["R2"])],
+            &board,
+            &BTreeSet::new(),
+        );
+
+        assert!(applies);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.changes, vec![r3_deleted()]);
+        assert_eq!(plan.counts.added.planned, 0);
+        assert_eq!(plan.counts.deleted.planned, 1);
+    }
+
     /// KiCad's own `R1` (`issue_474_r1.ipc.bin`: pad 1 on `VCC`, pad 2 on
     /// `GND`), bound to the `/Power/` symbol that [`ONE_RESISTOR`] exports.
     fn schematic_backed_resistor() -> prost_types::Any {
@@ -7648,6 +8047,7 @@ mod tests {
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
             skipped: Vec::new(),
+            without_symbols: Vec::new(),
             staging: None,
             acknowledged_apply: None,
         }
@@ -7943,6 +8343,15 @@ mod tests {
         commands: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         /// What `GetVersion` answers: `(major, minor, patch)`.
         kicad_version: std::sync::Arc<std::sync::Mutex<(u32, u32, u32)>>,
+        /// When set, `DeleteItems` answers OK and deletes nothing.
+        keeps_deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// When set, `DeleteItems` reports each requested item, as KiCad
+        /// 10.0.7+ does (KiCad `77e2d53da2`); unset, it answers as KiCad
+        /// before 10.0.7, with no per-item results.
+        reports_deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Listing the footprints after a commit fails from this listing on,
+        /// counted from 0; `usize::MAX` (the default) never fails.
+        fails_readback: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// A listed footprint's KIID.
@@ -8081,6 +8490,14 @@ mod tests {
             let seen = commands.clone();
             let kicad_version = std::sync::Arc::new(std::sync::Mutex::new((10, 0, 8)));
             let version = kicad_version.clone();
+            let keeps_deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ignores_deletes = keeps_deleted.clone();
+            let reports_deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reports_each_deletion = reports_deleted.clone();
+            let fails_readback =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+            let readback_fails = fails_readback.clone();
+            let listed_after_commit = std::sync::atomic::AtomicUsize::new(0);
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -8140,6 +8557,22 @@ mod tests {
                                     kiapi::common::types::KiCadObjectType::KotPcbShape,
                                     "outline",
                                 )]
+                            }
+                            _ if request.types.contains(&footprints)
+                                && committed.load(std::sync::atomic::Ordering::SeqCst)
+                                && listed_after_commit
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                    >= readback_fails.load(std::sync::atomic::Ordering::SeqCst) =>
+                            {
+                                return Some(copperpour_ipc::builders::pack_any(
+                                    &kiapi::common::commands::GetItemsResponse {
+                                        header: None,
+                                        status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound
+                                            as i32,
+                                        items: Vec::new(),
+                                    },
+                                    "kiapi.common.commands.GetItemsResponse",
+                                ));
                             }
                             _ if request.types.contains(&footprints) => board_held
                                 .lock()
@@ -8330,6 +8763,53 @@ mod tests {
                             "kiapi.common.commands.UpdateItemsResponse",
                         ));
                     }
+                    if command.type_url.ends_with("DeleteItems") {
+                        // OK, with no per-item results as KiCad before 10.0.7
+                        // answers, or one per item as 10.0.7+ does.
+                        use kiapi::common::commands::{ItemDeletionResult, ItemDeletionStatus};
+                        let request =
+                            kiapi::common::commands::DeleteItems::decode(command.value.as_slice())
+                                .expect("DeleteItems request");
+                        let held = board_held
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(footprint_kiid)
+                            .collect::<BTreeSet<_>>();
+                        if !ignores_deletes.load(std::sync::atomic::Ordering::SeqCst) {
+                            board_held.lock().unwrap().retain(|footprint| {
+                                !request
+                                    .item_ids
+                                    .iter()
+                                    .any(|id| id.value == footprint_kiid(footprint))
+                            });
+                        }
+                        let deleted_items =
+                            if reports_each_deletion.load(std::sync::atomic::Ordering::SeqCst) {
+                                request
+                                    .item_ids
+                                    .iter()
+                                    .map(|id| ItemDeletionResult {
+                                        id: Some(id.clone()),
+                                        status: if held.contains(&id.value) {
+                                            ItemDeletionStatus::IdsOk
+                                        } else {
+                                            ItemDeletionStatus::IdsNonexistent
+                                        } as i32,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                        return Some(copperpour_ipc::builders::pack_any(
+                            &kiapi::common::commands::DeleteItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                deleted_items,
+                            },
+                            "kiapi.common.commands.DeleteItemsResponse",
+                        ));
+                    }
                     if command.type_url.ends_with("EndCommit") {
                         if matches!(readback, Readback::RefuseCreation) {
                             let request = kiapi::common::commands::EndCommit::decode(
@@ -8375,6 +8855,9 @@ mod tests {
                 board_text,
                 commands,
                 kicad_version,
+                keeps_deleted,
+                reports_deleted,
+                fails_readback,
             }
         }
 
@@ -10215,6 +10698,360 @@ mod tests {
         let id = held.definition.as_ref().unwrap().id.clone().unwrap();
         assert_eq!(id.entry_name, "R_0402");
         assert_eq!(field_text(&held.value_field), "10k");
+    }
+
+    /// KiCad's own R1 linked to its symbol, R3 with no symbol, and MH1 with
+    /// none and the board-only attribute, as the mock's board holds them
+    /// (#861). R3 and MH1 are the captured board-only footprint, which KiCad
+    /// sent locked and without the attribute; MH1 is given it, and R3 the
+    /// lock the test asks for.
+    fn held_with_footprints_without_symbols(r3_locked: bool) -> HeldBoard {
+        use copperpour_ipc::gen::kiapi::common::types::LockedState;
+        let mut r3 = board_only_instance("r3-kiid", "R3");
+        r3.locked = if r3_locked {
+            LockedState::LsLocked
+        } else {
+            LockedState::LsUnlocked
+        } as i32;
+        let mut mounting_hole = board_only_instance("mh1-kiid", "MH1");
+        mounting_hole
+            .attributes
+            .get_or_insert_with(Default::default)
+            .not_in_schematic = true;
+        HeldBoard {
+            footprints: vec![
+                schematic_backed_resistor(),
+                copperpour_ipc::builders::pack_any(&r3, "kiapi.board.types.FootprintInstance"),
+                copperpour_ipc::builders::pack_any(
+                    &mounting_hole,
+                    "kiapi.board.types.FootprintInstance",
+                ),
+            ],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        }
+    }
+
+    /// The references of the footprints the mock's board now holds.
+    fn held_references(served: &ServedSync) -> Vec<String> {
+        served
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                let footprint =
+                    copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .unwrap();
+                field_text(&footprint.reference_field)
+            })
+            .collect()
+    }
+
+    /// The footprints a response names as kept without a symbol, as
+    /// `(reference, kiid, locked)`.
+    fn named_without_symbols(response: &serde_json::Value) -> Vec<(String, String, bool)> {
+        response["footprints_without_symbols"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no footprints_without_symbols: {response:#}"))
+            .iter()
+            .map(|footprint| {
+                (
+                    footprint["reference"].as_str().unwrap().to_string(),
+                    footprint["kiid"].as_str().unwrap().to_string(),
+                    footprint["locked"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn r3_named(locked: bool) -> Vec<(String, String, bool)> {
+        vec![("R3".to_string(), "r3-kiid".to_string(), locked)]
+    }
+
+    /// Without the option, the dry run and the apply name R3, the footprint
+    /// that lost its symbol, and not MH1, which is board-only; both stay.
+    #[tokio::test]
+    async fn footprints_without_symbols_are_named_in_the_dry_run_and_the_apply() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        let netlist = r1_on(STOCK_0603);
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(named_without_symbols(&plan), r3_named(false), "{plan:#}");
+        assert_eq!(plan["coverage"]["board_only_preserved"]["planned"], 2);
+        assert_eq!(plan["coverage"]["footprints_deleted"]["planned"], 0);
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(named_without_symbols(&applied), r3_named(false));
+        assert_eq!(served.sent("DeleteItems"), 0);
+        assert_eq!(held_references(&served), ["R1", "R3", "MH1"]);
+    }
+
+    /// With `delete_footprints_without_symbols`, R3 is a planned `delete`
+    /// change, and the apply deletes it in the sync's one commit. MH1 stays.
+    #[tokio::test]
+    async fn footprints_without_symbols_are_deleted_in_the_same_commit_on_request() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        let netlist = r1_on(STOCK_0603);
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+
+        let (_, plan) = served.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let deletions = plan["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|change| change["kind"] == "delete")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(deletions.len(), 1, "{plan:#}");
+        assert_eq!(deletions[0]["kiid"], "r3-kiid");
+        assert_eq!(deletions[0]["reference"], "R3");
+        assert_eq!(plan["coverage"]["footprints_deleted"]["planned"], 1);
+        assert_eq!(plan["coverage"]["board_only_preserved"]["planned"], 1);
+        assert_eq!(named_without_symbols(&plan), []);
+
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (is_error, applied) = served.sync(&netlist, apply).await;
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_deleted"]["applied"], 1);
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        assert_eq!(served.sent("BeginCommit"), 1);
+        assert_eq!(served.sent("DeleteItems"), 1);
+        assert_eq!(held_references(&served), ["R1", "MH1"]);
+    }
+
+    /// A dry run without the option plans no deletion, so its revision does
+    /// not apply with the option: the apply is stale, deletes nothing, and
+    /// names R3 as kept.
+    #[tokio::test]
+    async fn a_plan_made_without_the_option_deletes_nothing() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        let netlist = r1_on(STOCK_0603);
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        let (_, refused) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                    "delete_footprints_without_symbols": true,
+                }),
+            )
+            .await;
+
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert_eq!(refused["diagnostics"][0]["code"], "stale_plan_revision");
+        assert_eq!(refused["coverage"]["footprints_deleted"]["planned"], 0);
+        assert_eq!(named_without_symbols(&refused), r3_named(false));
+        assert_eq!(served.sent("DeleteItems"), 0);
+        assert_eq!(held_references(&served), ["R1", "R3", "MH1"]);
+    }
+
+    /// A locked R3 is kept with a `footprint_locked_not_deleted` note that
+    /// refuses nothing; the rest of the plan applies.
+    #[tokio::test]
+    async fn a_locked_footprint_without_a_symbol_is_kept_and_noted() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(true)).await;
+        let netlist = r1_on(STOCK_0603);
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+
+        let (_, plan) = served.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_deleted"]["planned"], 0);
+        assert_eq!(named_without_symbols(&plan), r3_named(true));
+        let notes = plan["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|note| note["code"] == "footprint_locked_not_deleted")
+            .collect::<Vec<_>>();
+        assert_eq!(notes.len(), 1, "{plan:#}");
+        assert_eq!(notes[0]["reference"], "R3");
+        assert_eq!(plan["coverage"]["conflicts"]["planned"], 0);
+
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (is_error, applied) = served.sync(&netlist, apply).await;
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(served.sent("DeleteItems"), 0);
+        assert_eq!(held_references(&served), ["R1", "R3", "MH1"]);
+    }
+
+    /// KiCad before 10.0.7 answers a delete with no per-item results, so a
+    /// footprint it kept would pass unnoticed. The board is read back after
+    /// the commit: R3 still on it is reported, counted as kept rather than
+    /// deleted, and listed with the kept footprints.
+    #[tokio::test]
+    async fn a_footprint_kicad_kept_after_its_deletion_is_reported() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        served
+            .keeps_deleted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let netlist = r1_on(STOCK_0603);
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+        let (_, plan) = served.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (_, applied) = served.sync(&netlist, apply).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(served.sent("DeleteItems"), 1);
+        let differs = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|note| note["code"] == "board_readback_differs")
+            .collect::<Vec<_>>();
+        assert_eq!(differs.len(), 1, "{applied:#}");
+        assert_eq!(differs[0]["reference"], "R3");
+        assert_eq!(applied["coverage"]["footprints_deleted"]["applied"], 0);
+        assert_eq!(applied["coverage"]["footprints_deleted"]["planned"], 1);
+        assert_eq!(applied["coverage"]["board_only_preserved"]["applied"], 2);
+        assert_eq!(named_without_symbols(&applied), r3_named(false));
+    }
+
+    /// KiCad 10.0.7+ reports each deleted item, and `delete_items_in` holds
+    /// the answer to the request: the deletion goes through on that path too.
+    #[tokio::test]
+    async fn a_deletion_kicad_reports_item_by_item_is_applied() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        served
+            .reports_deleted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let netlist = r1_on(STOCK_0603);
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+        let (_, plan) = served.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (is_error, applied) = served.sync(&netlist, apply).await;
+
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_deleted"]["applied"], 1);
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        assert_eq!(held_references(&served), ["R1", "MH1"]);
+    }
+
+    /// A readback that fails after the commit refuses nothing: the commit
+    /// stands, so the apply answers `applied` with a note for each readback
+    /// it could not finish, as an error so it is not taken for a clean one.
+    #[tokio::test]
+    async fn a_readback_that_fails_after_the_commit_is_reported_on_the_applied_response() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        served
+            .fails_readback
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let netlist = r1_on(STOCK_0603);
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+        let (_, plan) = served.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (is_error, applied) = served.sync(&netlist, apply).await;
+
+        assert!(is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let unchecked = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|note| note["code"] == "apply_readback_unchecked")
+            .count();
+        // R1's replacement and R3's deletion are each read back.
+        assert_eq!(unchecked, 2, "{applied:#}");
+        assert_eq!(held_references(&served), ["R1", "MH1"]);
+    }
+
+    /// Each readback after the commit flags the response on its own: with
+    /// no deletion, the footprints KiCad was sent; with the first readback
+    /// answered, the footprints it deleted.
+    #[tokio::test]
+    async fn each_readback_that_fails_after_the_commit_flags_the_response() {
+        let unchecked = |applied: &serde_json::Value| {
+            applied["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|note| note["code"] == "apply_readback_unchecked")
+                .count()
+        };
+
+        let sent = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        sent.fails_readback
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let netlist = r1_on(STOCK_0603);
+        let plan = sent.dry_run(&netlist).await;
+        let (is_error, applied) = sent
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                }),
+            )
+            .await;
+        assert!(is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(unchecked(&applied), 1, "{applied:#}");
+
+        // The readback of R1's replacement is answered; R3's deletion's fails.
+        let deleted = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        deleted
+            .fails_readback
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+        let (_, plan) = deleted.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (is_error, applied) = deleted.sync(&netlist, apply).await;
+        assert!(is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(unchecked(&applied), 1, "{applied:#}");
+    }
+
+    /// An explicit `false` is the default: nothing is deleted, R3 is named.
+    #[tokio::test]
+    async fn delete_footprints_without_symbols_false_deletes_nothing() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        let (_, plan) = served
+            .sync(
+                &r1_on(STOCK_0603),
+                serde_json::json!({ "delete_footprints_without_symbols": false }),
+            )
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert!(
+            !plan["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["kind"] == "delete"),
+            "{plan:#}"
+        );
+        assert_eq!(plan["coverage"]["footprints_deleted"]["planned"], 0);
+        assert_eq!(named_without_symbols(&plan), r3_named(false));
     }
 
     /// The preflight checks a replacement's pads against the new footprint:
