@@ -995,6 +995,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // `update_pcb_from_schematic`'s response list of the footprints no
         // symbol matched, not a callable tool (#861).
         "footprints_without_symbols",
+        // The values of that list's `reason` field, not callable tools (#870).
+        "symbol_removed",
+        "excluded_from_board",
     ];
 
     let mut phantom = Vec::new();

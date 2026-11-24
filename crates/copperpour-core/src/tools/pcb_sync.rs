@@ -234,6 +234,26 @@ struct FootprintWithoutSymbol {
     kiid: String,
     footprint_id: String,
     locked: bool,
+    reason: WithoutSymbolReason,
+}
+
+/// Why no symbol matched a board footprint (#870).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WithoutSymbolReason {
+    /// No symbol in the schematic has the footprint's identity.
+    SymbolRemoved,
+    /// Its symbol is marked Exclude from board (`on_board no`).
+    ExcludedFromBoard,
+}
+
+impl WithoutSymbolReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::SymbolRemoved => "has no symbol in the schematic",
+            Self::ExcludedFromBoard => "has its symbol excluded from the board",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -290,6 +310,7 @@ enum PlannedChange {
         kiid: String,
         reference: String,
         footprint_id: String,
+        reason: WithoutSymbolReason,
     },
 }
 
@@ -1137,7 +1158,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
 /// and noted. An acknowledgement the plan has no such change for is a
 /// conflict, so a stale or widened one refuses (#38). With
 /// `delete_without_symbols`, a plan with no conflict deletes each unlocked
-/// footprint no symbol matched that lacks the board-only attribute (#861).
+/// footprint no symbol matched that lacks the board-only attribute (#861);
+/// the footprint of a symbol marked Exclude from board is one of them (#870).
 fn plan_sync_acknowledging(
     netlist_source: &str,
     design: &ExportedDesign,
@@ -1216,6 +1238,15 @@ fn plan_sync_acknowledging(
 
     let mut skipped_references = HashSet::new();
     let mut skipped_paths = HashSet::new();
+    // The footprints of `on_board=no` instances. KiCad's Update PCB skips a
+    // symbol marked Exclude from board, and its pass over unmatched
+    // footprints counts no match for that symbol's footprint, so it is one
+    // with no symbol: kept, or deleted with "Delete footprints with no
+    // symbols" (`BOARD_NETLIST_UPDATER::UpdateNetlist`,
+    // board_netlist_updater.cpp:2092 and :2350, KiCad 10.0.8; #870). They
+    // stay out of `matched` for that pass below, and out of the rename
+    // candidates, since their symbol still claims them.
+    let mut excluded = HashSet::new();
     for skipped in &design.skipped {
         let skipped_path = normalize_symbol_path(&skipped.symbol_path, root_uuid);
         if !skipped_references.insert(skipped.reference.as_str())
@@ -1232,20 +1263,16 @@ fn plan_sync_acknowledging(
             continue;
         }
         counts.skipped_by_flag.planned += 1;
-        let existing = board_by_path
-            .get(skipped_path)
-            .copied()
-            .or_else(|| board_by_reference.get(skipped.reference.as_str()).copied());
+        // Matched as a component is: by identity, or by reference when the
+        // footprint has none.
+        let existing = board_by_path.get(skipped_path).copied().or_else(|| {
+            board_by_reference
+                .get(skipped.reference.as_str())
+                .copied()
+                .filter(|index| board.footprints[*index].symbol_path.is_none())
+        });
         if let Some(index) = existing {
-            matched.insert(index);
-            diagnostics.push(conflict(
-                "on_board_exclusion_conflict",
-                format!(
-                    "{} is marked on_board=no but already exists on the board",
-                    skipped.reference
-                ),
-                Some(&skipped.reference),
-            ));
+            excluded.insert(index);
         }
     }
 
@@ -1333,6 +1360,7 @@ fn plan_sync_acknowledging(
                 .enumerate()
                 .filter(|(index, footprint)| {
                     !matched.contains(index)
+                        && !excluded.contains(index)
                         && footprint.symbol_path.is_none()
                         && !footprint.not_in_schematic
                         && footprint.footprint_id == component.footprint_id
@@ -1575,7 +1603,8 @@ fn plan_sync_acknowledging(
     // never one with the board-only attribute (`FP_BOARD_ONLY`), and a locked
     // one only when locks are overridden, which the sync does not offer: it
     // keeps it with a warning (`BOARD_NETLIST_UPDATER::UpdateNetlist`, KiCad
-    // 10.0.8). A plan with a conflict deletes nothing (#861).
+    // 10.0.8). A plan with a conflict deletes nothing (#861). The footprint of
+    // a symbol marked Exclude from board is handled the same way (#870).
     let deleting = delete_without_symbols && diagnostics.is_empty();
     let mut without_symbols = Vec::new();
     let mut unmatched = 0usize;
@@ -1587,11 +1616,17 @@ fn plan_sync_acknowledging(
         if footprint.not_in_schematic {
             continue;
         }
+        let reason = if excluded.contains(&index) {
+            WithoutSymbolReason::ExcludedFromBoard
+        } else {
+            WithoutSymbolReason::SymbolRemoved
+        };
         if deleting && !footprint.locked {
             changes.push(PlannedChange::Delete {
                 kiid: footprint.kiid.clone(),
                 reference: footprint.reference.clone(),
                 footprint_id: footprint.footprint_id.clone(),
+                reason,
             });
             counts.deleted.planned += 1;
             continue;
@@ -1600,9 +1635,10 @@ fn plan_sync_acknowledging(
             notes.push(conflict(
                 "footprint_locked_not_deleted",
                 format!(
-                    "{} has no symbol in the schematic, but it is locked, so it is kept; unlock \
-                     it and sync again to delete it",
-                    footprint.reference
+                    "{} {}, but it is locked, so it is kept; unlock it and sync again to \
+                     delete it",
+                    footprint.reference,
+                    reason.describe()
                 ),
                 Some(&footprint.reference),
             ));
@@ -1612,6 +1648,7 @@ fn plan_sync_acknowledging(
             kiid: footprint.kiid.clone(),
             footprint_id: footprint.footprint_id.clone(),
             locked: footprint.locked,
+            reason,
         });
     }
     counts.board_only_preserved.planned = unmatched - counts.deleted.planned;
@@ -4125,6 +4162,7 @@ fn clear_changes(plan: &mut SyncPlan) {
             kiid,
             reference,
             footprint_id,
+            reason,
         } = change
         {
             plan.without_symbols.push(FootprintWithoutSymbol {
@@ -4133,6 +4171,7 @@ fn clear_changes(plan: &mut SyncPlan) {
                 footprint_id,
                 // Only an unlocked footprint is planned for deletion.
                 locked: false,
+                reason,
             });
             plan.counts.board_only_preserved.planned += 1;
         }
@@ -4159,7 +4198,8 @@ fn readback_unchecked(what: &str, error: &anyhow::Error) -> SyncDiagnostic {
         "apply_readback_unchecked",
         format!(
             "the commit was applied, but reading back {what} failed: {error:#}. Do not apply \
-             this plan again; check the board with sync_live_board."
+             this plan again; check the board with a new dry run, or run_drc with \
+             sync_live_board."
         ),
         None,
     )
@@ -4175,11 +4215,13 @@ fn planned_deletions(plan: &SyncPlan) -> Vec<FootprintWithoutSymbol> {
                 kiid,
                 reference,
                 footprint_id,
+                reason,
             } => Some(FootprintWithoutSymbol {
                 reference: reference.clone(),
                 kiid: kiid.clone(),
                 footprint_id: footprint_id.clone(),
                 locked: false,
+                reason: *reason,
             }),
             _ => None,
         })
@@ -6776,9 +6818,9 @@ mod tests {
         assert_eq!(net_change.counts.pads_reassigned.planned, 1);
     }
 
-    #[test]
-    fn on_board_no_skips_absent_but_conflicts_when_present() {
-        let design = ExportedDesign {
+    /// R1 marked Exclude from board, with `symbol_path` as its identity.
+    fn r1_excluded() -> ExportedDesign {
+        ExportedDesign {
             root_sheet_uuid: None,
             components: Vec::new(),
             skipped: vec![SkippedComponent {
@@ -6786,21 +6828,235 @@ mod tests {
                 symbol_path: "/sheet/existing".to_string(),
             }],
             unassigned: Vec::new(),
-        };
+        }
+    }
+
+    fn r1_without_a_symbol(reason: WithoutSymbolReason, locked: bool) -> FootprintWithoutSymbol {
+        FootprintWithoutSymbol {
+            reference: "R1".to_string(),
+            kiid: "R1-kiid".to_string(),
+            footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+            locked,
+            reason,
+        }
+    }
+
+    /// KiCad's Update PCB skips a symbol marked Exclude from board and treats
+    /// its footprint as one with no symbol (#870): the footprint is kept and
+    /// named, and nothing else is refused.
+    #[test]
+    fn on_board_no_skips_absent_and_names_its_footprint_when_present() {
+        let design = r1_excluded();
         let absent = plan_sync("netlist", &design, &board_with(Vec::new()));
         assert_eq!(absent.status, PlanStatus::Noop);
         assert_eq!(absent.counts.skipped_by_flag.planned, 1);
+        assert!(absent.without_symbols.is_empty());
 
         let present = plan_sync(
             "netlist",
             &design,
             &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
         );
-        assert_eq!(present.status, PlanStatus::Conflict);
-        assert!(present
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "on_board_exclusion_conflict"));
+        assert_eq!(
+            present.status,
+            PlanStatus::Noop,
+            "{:?}",
+            present.diagnostics
+        );
+        assert!(present.diagnostics.is_empty(), "{:?}", present.diagnostics);
+        assert_eq!(present.counts.skipped_by_flag.planned, 1);
+        assert_eq!(present.counts.board_only_preserved.planned, 1);
+        assert_eq!(
+            present.without_symbols,
+            vec![r1_without_a_symbol(
+                WithoutSymbolReason::ExcludedFromBoard,
+                false
+            )]
+        );
+    }
+
+    /// The rest of the schematic syncs beside it: R2 is added.
+    #[test]
+    fn an_excluded_part_on_the_board_leaves_the_rest_to_sync() {
+        let mut design = r1_excluded();
+        design.components.push(resistor("R2", "/sheet/new"));
+
+        let plan = plan_sync(
+            "netlist",
+            &design,
+            &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.added.planned, 1);
+        assert_eq!(plan.without_symbols.len(), 1, "{:?}", plan.without_symbols);
+        assert_eq!(
+            plan.without_symbols[0].reason,
+            WithoutSymbolReason::ExcludedFromBoard
+        );
+    }
+
+    /// With `delete_footprints_without_symbols`, it is deleted, as KiCad
+    /// deletes it with "Delete footprints with no symbols"; the change says
+    /// why.
+    #[test]
+    fn an_excluded_part_s_footprint_is_deleted_on_request() {
+        let plan = plan_sync_acknowledging(
+            "netlist",
+            &r1_excluded(),
+            &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+            &BTreeSet::new(),
+            true,
+        );
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(
+            plan.changes,
+            vec![PlannedChange::Delete {
+                kiid: "R1-kiid".to_string(),
+                reference: "R1".to_string(),
+                footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+                reason: WithoutSymbolReason::ExcludedFromBoard,
+            }]
+        );
+        assert_eq!(plan.counts.deleted.planned, 1);
+        assert_eq!(plan.counts.board_only_preserved.planned, 0);
+        assert!(plan.without_symbols.is_empty());
+    }
+
+    /// A planned deletion keeps its reason when the plan is refused, and in
+    /// the list the apply reads back against.
+    #[test]
+    fn an_excluded_part_s_deletion_keeps_its_reason_when_refused_or_read_back() {
+        let mut plan = plan_sync_acknowledging(
+            "netlist",
+            &r1_excluded(),
+            &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+            &BTreeSet::new(),
+            true,
+        );
+        let excluded = vec![r1_without_a_symbol(
+            WithoutSymbolReason::ExcludedFromBoard,
+            false,
+        )];
+        assert_eq!(planned_deletions(&plan), excluded);
+
+        refuse_plan(
+            &mut plan,
+            vec![conflict("preflight_conflict", "refused".to_string(), None)],
+        );
+
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.without_symbols, excluded);
+    }
+
+    /// Locked, it is kept with a note that names the reason; with the
+    /// board-only attribute, it is neither deleted nor named.
+    #[test]
+    fn a_locked_or_board_only_excluded_footprint_is_kept() {
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.locked = true;
+        let locked = plan_sync_acknowledging(
+            "netlist",
+            &r1_excluded(),
+            &board_with(vec![footprint]),
+            &BTreeSet::new(),
+            true,
+        );
+        assert_eq!(locked.status, PlanStatus::Noop);
+        assert_eq!(
+            locked.without_symbols,
+            vec![r1_without_a_symbol(
+                WithoutSymbolReason::ExcludedFromBoard,
+                true
+            )]
+        );
+        assert_eq!(locked.diagnostics.len(), 1, "{:?}", locked.diagnostics);
+        assert_eq!(locked.diagnostics[0].code, "footprint_locked_not_deleted");
+        assert!(
+            locked.diagnostics[0]
+                .message
+                .contains("has its symbol excluded from the board"),
+            "{}",
+            locked.diagnostics[0].message
+        );
+
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.not_in_schematic = true;
+        let board_only = plan_sync_acknowledging(
+            "netlist",
+            &r1_excluded(),
+            &board_with(vec![footprint]),
+            &BTreeSet::new(),
+            true,
+        );
+        assert_eq!(board_only.status, PlanStatus::Noop);
+        assert!(board_only.changes.is_empty(), "{:?}", board_only.changes);
+        assert!(board_only.without_symbols.is_empty());
+        assert_eq!(board_only.counts.board_only_preserved.planned, 1);
+    }
+
+    /// The excluded symbol claims a footprint as a component does: by
+    /// identity, or by reference only when the footprint has no identity. A
+    /// footprint with its reference but another symbol's identity lost that
+    /// symbol, and is named for that reason.
+    #[test]
+    fn an_excluded_symbol_claims_a_footprint_by_reference_only_without_an_identity() {
+        let unlinked = plan_sync(
+            "netlist",
+            &r1_excluded(),
+            &board_with(vec![board_resistor("R1", None)]),
+        );
+        assert_eq!(
+            unlinked.without_symbols,
+            vec![r1_without_a_symbol(
+                WithoutSymbolReason::ExcludedFromBoard,
+                false
+            )]
+        );
+
+        let another = plan_sync(
+            "netlist",
+            &r1_excluded(),
+            &board_with(vec![board_resistor("R1", Some("/sheet/gone"))]),
+        );
+        assert_eq!(
+            another.status,
+            PlanStatus::Noop,
+            "{:?}",
+            another.diagnostics
+        );
+        assert_eq!(
+            another.without_symbols,
+            vec![r1_without_a_symbol(
+                WithoutSymbolReason::SymbolRemoved,
+                false
+            )]
+        );
+    }
+
+    /// The footprint an excluded symbol claims is no rename candidate for a
+    /// new part, as it was not while the sync refused it.
+    #[test]
+    fn an_excluded_part_s_footprint_is_no_rename_candidate() {
+        let mut design = r1_excluded();
+        design.components.push(resistor("R2", "/sheet/new"));
+
+        let plan = plan_sync(
+            "netlist",
+            &design,
+            &board_with(vec![board_resistor("R1", None)]),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.added.planned, 1);
+        assert_eq!(
+            plan.without_symbols,
+            vec![r1_without_a_symbol(
+                WithoutSymbolReason::ExcludedFromBoard,
+                false
+            )]
+        );
     }
 
     #[test]
@@ -7442,6 +7698,7 @@ mod tests {
             kiid: "R3-kiid".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             locked,
+            reason: WithoutSymbolReason::SymbolRemoved,
         }
     }
 
@@ -7450,6 +7707,7 @@ mod tests {
             kiid: "R3-kiid".to_string(),
             reference: "R3".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+            reason: WithoutSymbolReason::SymbolRemoved,
         }
     }
 
@@ -10780,6 +11038,10 @@ mod tests {
 
         let plan = served.dry_run(&netlist).await;
         assert_eq!(named_without_symbols(&plan), r3_named(false), "{plan:#}");
+        assert_eq!(
+            plan["footprints_without_symbols"][0]["reason"],
+            "symbol_removed"
+        );
         assert_eq!(plan["coverage"]["board_only_preserved"]["planned"], 2);
         assert_eq!(plan["coverage"]["footprints_deleted"]["planned"], 0);
 
@@ -10788,6 +11050,82 @@ mod tests {
         assert_eq!(named_without_symbols(&applied), r3_named(false));
         assert_eq!(served.sent("DeleteItems"), 0);
         assert_eq!(held_references(&served), ["R1", "R3", "MH1"]);
+    }
+
+    /// [`r1_on`] with R3 beside it, and the served schematic's R3 (KiCad's
+    /// own `structural_scans_kicad10.kicad_sch`) marked Exclude from board,
+    /// as `edit_schematic_component` with `on_board: false` writes it.
+    fn excluding_r3(served: &ServedSync) -> String {
+        let schematic = std::fs::read_to_string(&served.schematic).unwrap();
+        let r3 = schematic
+            .find("(reference \"R3\")")
+            .expect("the fixture places R3");
+        let flag = schematic[..r3]
+            .rfind("(on_board yes)")
+            .expect("R3 is on the board in the fixture");
+        let mut excluded = schematic;
+        excluded.replace_range(flag..flag + "(on_board yes)".len(), "(on_board no)");
+        std::fs::write(&served.schematic, excluded).unwrap();
+
+        let netlist = r1_on(STOCK_0603);
+        let closing = "(pin (num \"2\")))))))\n  (nets";
+        assert!(netlist.contains(closing), "ONE_RESISTOR changed shape");
+        netlist.replace(
+            closing,
+            &format!(
+                "(pin (num \"2\"))))))\n    (comp\n      (ref \"R3\")\n      (value \"10k\")\n      \
+                 (footprint \"{STOCK_0603}\")\n      (sheetpath (names \"/\") (tstamps \"/\"))\n      \
+                 (tstamps \"R3-uuid\")\n      (units (unit (name \"A\") (pins (pin (num \"1\")) \
+                 (pin (num \"2\")))))))\n  (nets"
+            ),
+        )
+    }
+
+    /// R3 marked Exclude from board while its footprint is on the board: the
+    /// sync no longer refuses, and treats the footprint as KiCad's Update PCB
+    /// does, as one with no symbol (#870). The dry run names it with
+    /// `excluded_from_board`; with `delete_footprints_without_symbols` it is
+    /// deleted in the sync's commit.
+    #[tokio::test]
+    async fn an_excluded_part_s_footprint_is_named_and_deleted_on_request() {
+        let served = ServedSync::holding(held_with_footprints_without_symbols(false)).await;
+        let netlist = excluding_r3(&served);
+
+        let plan = served.dry_run(&netlist).await;
+        assert_ne!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(
+            plan["coverage"]["skipped_by_flag"]["planned"], 1,
+            "{plan:#}"
+        );
+        assert_eq!(named_without_symbols(&plan), r3_named(false), "{plan:#}");
+        assert_eq!(
+            plan["footprints_without_symbols"][0]["reason"],
+            "excluded_from_board"
+        );
+
+        let deleting = serde_json::json!({ "delete_footprints_without_symbols": true });
+        let (_, plan) = served.sync(&netlist, deleting.clone()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let deletions = plan["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|change| change["kind"] == "delete")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(deletions.len(), 1, "{plan:#}");
+        assert_eq!(deletions[0]["reference"], "R3");
+        assert_eq!(deletions[0]["reason"], "excluded_from_board");
+
+        let mut apply = deleting;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let (is_error, applied) = served.sync(&netlist, apply).await;
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_deleted"]["applied"], 1);
+        assert_eq!(served.sent("DeleteItems"), 1);
+        assert_eq!(held_references(&served), ["R1", "MH1"]);
     }
 
     /// With `delete_footprints_without_symbols`, R3 is a planned `delete`
@@ -10810,6 +11148,7 @@ mod tests {
         assert_eq!(deletions.len(), 1, "{plan:#}");
         assert_eq!(deletions[0]["kiid"], "r3-kiid");
         assert_eq!(deletions[0]["reference"], "R3");
+        assert_eq!(deletions[0]["reason"], "symbol_removed");
         assert_eq!(plan["coverage"]["footprints_deleted"]["planned"], 1);
         assert_eq!(plan["coverage"]["board_only_preserved"]["planned"], 1);
         assert_eq!(named_without_symbols(&plan), []);
@@ -13578,12 +13917,17 @@ mod tests {
             board_resistor("R2_OLD", Some("/root-uuid/r2-sym")),
         ]);
         let plan = plan_sync("netlist", &design, &board);
-        assert_eq!(plan.status, PlanStatus::Conflict);
-        assert!(plan.diagnostics.iter().any(
-            |d| d.code == "on_board_exclusion_conflict" && d.reference.as_deref() == Some("H1")
-        ));
+        assert_eq!(plan.status, PlanStatus::Noop, "{:?}", plan.diagnostics);
+        // H1_OLD is claimed by the excluded H1 only through the normalized
+        // path: its reference differs (#870).
+        assert_eq!(plan.without_symbols.len(), 1, "{:?}", plan.without_symbols);
+        assert_eq!(plan.without_symbols[0].reference, "H1_OLD");
+        assert_eq!(
+            plan.without_symbols[0].reason,
+            WithoutSymbolReason::ExcludedFromBoard
+        );
         assert_eq!(plan.unassigned.len(), 1);
         assert_eq!(plan.unassigned[0].board_state, UnassignedBoardState::Kept);
-        assert_eq!(plan.counts.board_only_preserved.planned, 0);
+        assert_eq!(plan.counts.board_only_preserved.planned, 1);
     }
 }
