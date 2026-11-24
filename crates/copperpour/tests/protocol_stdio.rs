@@ -201,6 +201,35 @@ impl Drop for McpProcess {
 }
 
 #[test]
+fn layout_comparison_does_not_create_a_document_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let schematic = tmp.path().join("layout.kicad_sch");
+    let source = copperpour_sexp::schematic::format_blank_schematic();
+    std::fs::write(&schematic, &source).unwrap();
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        "auto_load_toolsets = true\n",
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        true,
+        &[("COPPERPOUR_STATE_DIR", state.to_str().unwrap())],
+    );
+    let locks = state.join("locks");
+    assert!(!locks.exists());
+    let result = server.call_tool(
+        "compare_schematic_layout",
+        json!({"schematic": schematic, "baseline": schematic}),
+    );
+    assert!(!locks.exists(), "the comparison created a document lock");
+    assert_eq!(std::fs::read(&schematic).unwrap(), source.as_bytes());
+    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(McpProcess::tool_body(&result)["verdict"], "unchanged");
+}
+
+#[test]
 fn handshake_baseline_and_full_registry_loads() {
     let mut p = McpProcess::spawn();
 
