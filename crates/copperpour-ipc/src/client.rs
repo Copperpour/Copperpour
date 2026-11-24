@@ -3256,15 +3256,16 @@ impl KiCadIpcClient {
         let response =
             unpack_required::<kiapi::common::commands::DeleteItemsResponse>(reply, "DeleteItems")?;
         ensure_item_request_ok(response.status, "item deletion")?;
-        // KiCad 10 builds per-item results in
+        // KiCad before 10.0.7 builds per-item results in
         // API_HANDLER_EDITOR::handleDeleteItems and then never attaches them
         // to the response, so `deleted_items` comes back empty on every
         // successful delete. Treating that as failure made delete_component
         // report "0 deletion results" for deletions that had in fact happened
         // (#116). An empty list carries no information either way, so callers
-        // that need certainty verify the item is gone; a NON-empty list is
-        // still validated strictly, so this stays correct if KiCad starts
-        // populating it.
+        // that need certainty verify the item is gone. KiCad 10.0.7 and later
+        // return one result per requested item (KiCad 77e2d53da2;
+        // common/api/api_handler_editor.cpp at 10.0.8), and a non-empty list
+        // is validated strictly below.
         if response.deleted_items.is_empty() {
             return Ok(());
         }
@@ -4033,9 +4034,10 @@ impl KiCadIpcClient {
     /// Delete one observed trace segment from the requested board.
     ///
     /// `DeleteItems` accepts any board-item KIID, so the item must first be
-    /// proven to belong to the requested board's trace set. KiCad 10 commonly
-    /// omits per-item deletion results; a second trace query therefore proves
-    /// the observed segment is gone before this reports success.
+    /// proven to belong to the requested board's trace set. KiCad before 10.0.7
+    /// omits per-item deletion results (10.0.7 added them, KiCad 77e2d53da2); a
+    /// second trace query therefore proves the observed segment is gone before
+    /// this reports success.
     pub fn delete_trace_segment_verified(
         &self,
         requested: &Path,
