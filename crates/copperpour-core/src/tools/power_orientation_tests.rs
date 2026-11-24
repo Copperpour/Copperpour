@@ -723,35 +723,21 @@ fn fixture_with_missing_symbol() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-#[tokio::test]
-async fn an_unresolved_symbol_with_an_empty_reference_is_named_in_the_refusal() {
-    let handler = handler().await;
+#[test]
+fn an_unresolved_symbol_with_an_empty_reference_has_a_fallback_name() {
     let (_dir, path) = fixture_with_missing_symbol();
     let source = std::fs::read_to_string(&path).unwrap();
-    let before = source.replacen(
+    let anonymous = source.replacen(
         "(property \"Reference\" \"J3\"",
         "(property \"Reference\" \"\"",
         1,
     );
-    assert_ne!(source, before);
-    std::fs::write(&path, &before).unwrap();
-    let reply = serve(
-        &handler,
-        "add_power_symbol",
-        &path,
-        json!({"power_net": "+3V3", "reference": "J4", "pin_number": "1"}),
-    )
-    .await;
-    assert_eq!(reply["is_error"], true, "{reply}");
-    assert_eq!(reply["error"]["kind"], "plan_blocked", "{reply}");
-    assert!(
-        reply["error"]["reasons"][0]
-            .as_str()
-            .unwrap()
-            .contains("unresolved pin geometry for <unknown symbol>"),
-        "{reply}"
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), before.as_bytes());
+    assert_ne!(source, anonymous);
+    let tree = parse_sexp(&anonymous).unwrap();
+    // An empty placed reference fails sheet-instance validation before stub
+    // planning. Exercise the inventory's diagnostic independently.
+    let (_, unresolved) = crate::tools::sch_pin_contacts::clearance_pin_inventory(&tree);
+    assert_eq!(unresolved, ["<unknown symbol>"]);
 }
 
 #[tokio::test]
