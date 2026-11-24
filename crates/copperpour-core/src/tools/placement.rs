@@ -853,7 +853,7 @@ fn apply_placements_to_content(
     if let Err(error) = super::pcb_components::update_closed_board_footprints(&path, placements) {
         anyhow::bail!(
             "planned placement does not apply: {:?}",
-            error.into_result()
+            error.into_result(&path)
         );
     }
     Ok(std::fs::read_to_string(&path)?)
@@ -1116,7 +1116,7 @@ async fn handle_place_decoupling(
     }
     let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
         Ok(applied) => applied,
-        Err(error) => return error.into_result(),
+        Err(error) => return error.into_result(&board),
     };
     let written = copperpour_sexp::writer::read_consistent(&board)?;
     let score_written = score_of_content(ctx, &written).await?;
@@ -2014,7 +2014,7 @@ async fn handle_force_directed(
     }
     let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
         Ok(applied) => applied,
-        Err(error) => return error.into_result(),
+        Err(error) => return error.into_result(&board),
     };
     let written = copperpour_sexp::writer::read_consistent(&board)?;
     let score_written = score_of_content(ctx, &written).await?;

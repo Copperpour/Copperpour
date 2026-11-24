@@ -1787,7 +1787,7 @@ fn repeat_in_file(
     dry_run: bool,
 ) -> Result<Value, anyhow::Result<CallToolResult>> {
     use crate::tools::pcb_components::ClosedBoardError;
-    let refuse = |error: ClosedBoardError| Err(error.into_result());
+    let refuse = |error: ClosedBoardError| Err(error.into_result(board));
     let content = match read_consistent(board) {
         Ok(content) => content,
         Err(error) => return refuse(ClosedBoardError::Io(error.into())),
