@@ -1,17 +1,7 @@
 # Testing And Release
 
-The pull-request baseline is defined in `CONTRIBUTING.md`. Run the same commands
-locally when the required platform dependencies are available:
-
-```bash
-cargo test --workspace --locked --lib --tests
-cargo test --workspace --locked --doc
-cargo clippy --workspace --locked --all-targets -- -D warnings
-cargo fmt --all -- --check
-```
-
-`protoc` and its well-known type includes are required by
-`crates/copperpour-ipc/build.rs`.
+Run the [Rust baseline and applicable CI jobs](../AGENTS.md#before-you-push).
+See [build requirements](../DEV.md#build-requirements) for Protobuf setup.
 
 ## Coverage Map
 
@@ -39,7 +29,7 @@ smoke tests are separate evidence; HTTP header tests do not substitute for them.
 ## Evidence-Focused Regression Tests
 
 When a tool returns a count, success state, or verdict, test the evidence behind
-that field. The v0.7 reference cases include:
+that field. Reference cases include:
 
 - complete DRC category parsing in `tools/cli.rs`;
 - DRC-backed review/readiness decisions in `tools/design_review.rs` and
@@ -60,9 +50,8 @@ test. Do not discover a free TCP port by binding it, dropping the listener, and
 then asking NNG to bind the same port: another process can claim the port in
 between, making otherwise deterministic tests fail with `AddressInUse`.
 
-`copperpour-ipc`'s integration tests cannot reach that type; they use
-`tests/mock_kicad`, the same guard. Neither has a receive timeout, so a double
-keeps answering however long a loaded runner idles before its first request.
+Use the equivalent `tests/mock_kicad` guard in `copperpour-ipc` integration
+tests. Both guards keep listening until dropped.
 
 The Specctra import undo boundary has a manual live gate because KiCad IPC can
 create a named commit but cannot invoke the editor's Undo action. Open a
@@ -93,10 +82,8 @@ This deletes one observed zone, waits through KiCad's asynchronous refill, and
 requires stable live readback with the target absent, other zones preserved,
 and remaining copper reported filled. It does not invoke Undo. On KiCad 10.0.5,
 refill and deletion produce separate undo entries: undo the refill, then the
-deletion. Verify that the pre-delete board state returns, save the disposable
-board, and check native readback. The Windows acceptance run also compared the
-complete pre-delete and post-Undo IPC snapshot hashes and independently checked
-saved zones, footprints/pads, tracks/vias, and drawing identities with pcbnew.
+deletion. Compare the restored IPC snapshot with the pre-delete state, then
+save and independently check the board with pcbnew.
 
 ## CI And Live Validation
 
@@ -106,10 +93,8 @@ documentation tests, plugin, Nix, licenses, PCM validation and the offline
 build; `windows.yml` and `macos.yml` run Check & Test on those systems. The
 release build and the real-KiCad job run on a maintainer's machine (local CI).
 The real-KiCad job runs `e2e-kicad.yml`'s steps against KiCad 10.0.8 in a
-Windows VM. It is not a per-PR
-check, because it takes over half an hour. Ask a maintainer to run it on a pull
-request when KiCad-facing behavior needs that evidence. The `run:e2e-kicad`
-label no longer triggers anything.
+Windows VM. Ask a maintainer to run it on a pull request when KiCad-facing
+behavior needs that evidence.
 
 Before creating a release tag, run `cargo xtask collect-api-migrations
 <version>` and `cargo xtask fix-doc-counts`, and commit the result. The first
@@ -133,8 +118,7 @@ them, the three `.mcpb` files included, in one release. A failure in any build, 
 real-KiCad job means the release is not cut, so no partial set of assets is
 published. To check the macOS build before tagging, run `gh workflow run
 macos.yml --ref <candidate>` beside local CI's dry run. PRs and `main` run
-only its Check & Test job, as an optional check. Linux aarch64, which `release.yml` built on
-GitHub, is not built.
+only its Check & Test job, as an optional check.
 
 In the PR description, list every command run and explicitly name checks skipped
 because they require KiCad, another operating system, credentials, or release
@@ -156,8 +140,8 @@ current capability.
 
 ## Packaging And Release
 
-Build the server with `cargo build --release -p copperpour`. Build the viewer
-separately when it is in scope. Changes to plugin files, binary layout, metadata,
+Build the server and embedded viewer with `cargo build --release -p copperpour`.
+Changes to plugin files, binary layout, metadata,
 icons, or release scripts require PCM assembly and
 `packaging/validate-pcm.py` validation, which also applies KiCad's addon
 guidelines; its tests run with `python -m unittest discover -s packaging/tests`.
@@ -182,19 +166,15 @@ repository also checks against the v1 schema, which has no AGPL entry. To list a
 release, copy its `versions` entries into `packages/<identifier>/metadata.json`
 in a merge request to <https://gitlab.com/kicad/addons/metadata>.
 
-## Browser viewer and standalone retirement
+## Browser viewer
 
-`open_schematic_viewer` now uses the browser service. Core tests exercise its served
-MCP schema, canonical-root reuse, saved-data HTTP response and context teardown,
+Core tests for `open_schematic_viewer` exercise its served MCP schema,
+canonical-root reuse, saved-data HTTP response and context teardown,
 plus opener success/failure/timeout and startup recovery. Run
 `cargo test -p copperpour-core --locked tools::viewer` and the workspace gates.
 Also check `--no-default-features`: this loopback service is available offline.
 
-The standalone `schematic-viewer` command, Tauri crate, packaging and separate
-CI job have been removed with the owner’s explicit waiver of the planned grace
-period; see [the migration](api-migrations/retire-standalone-viewer.md). The
-workspace build embeds the browser viewer in the server. Linux interactive feedback is available;
-Windows/macOS browser launch and interactive behavior need platform verification.
+Check browser launch and interaction on the affected desktop platforms.
 
 ## Server guidance delivery
 
@@ -207,7 +187,7 @@ Resource-not-found and malformed-parameter errors remain JSON-RPC errors; bad
 `get_guidance` inputs remain structured tool errors. Local profile edits are not
 served as resources. The normal workspace gates cover catalog/installer sharing.
 
-## Native/Rust Specctra selection (#72)
+## Native/Rust Specctra selection
 
 `cargo test -p copperpour-core --locked --lib specctra` covers the shared model,
 existing parser/adoption corpus and exporter selection. The native-profile mode
@@ -215,7 +195,7 @@ matrix uses a child process with an isolated bridge directory, an authenticated
 HTTP bridge double serving KiCad-authored DSNs and a bound IPC double. It checks
 all modes, unavailable/invalid native exports, Rust fallback, shared safety
 refusals and post-export source changes. Model identities are compared against
-the historical Rust-DSN-derived identities on existing fixtures.
+identities derived from Rust DSNs in the fixture corpus.
 
 The circular-cutout fixture is generated/exported by KiCad and routed by
 Freerouting. Its manifest-bound SES apply is served with an IPC double and a

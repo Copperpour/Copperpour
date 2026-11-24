@@ -1,8 +1,6 @@
 # Architecture
 
-Copperpour separates process concerns, MCP/tool behavior, and KiCad data access.
-This page describes both those static boundaries and the runtime flows through
-them. `DEV.md` remains the deeper implementation reference.
+See [DEV.md](../DEV.md) for implementation details and build requirements.
 
 ## Static Boundaries
 
@@ -21,8 +19,8 @@ inspection and recovery commands are owned by `transaction_cli.rs`.
 
 ### MCP and domain logic: `crates/copperpour-core`
 
-`crates/copperpour-core/src/mcp/handler.rs` handles MCP methods, enforces required
-argument presence, dispatches tool calls, emits tool-list notifications, and
+`crates/copperpour-core/src/mcp/handler.rs` handles MCP methods, validates advertised
+input schemas, dispatches tool calls, emits tool-list notifications, and
 records calls through `observability.rs`.
 
 `crates/copperpour-core/src/router/registry.rs` declares toolsets and resolves each
@@ -35,9 +33,8 @@ installation, KiCad, and IPC evidence returned by `get_installation_info`.
 `ServerConfig`, the `tool!` macro, required-argument helpers, and shared path and
 library helpers. Domain handlers live in the other files under `src/tools`.
 
-Code that serves a vendor or an external program, rather than KiCad data,
-lives in domain modules (#209). The toolset's handler stays in its `src/tools`
-file and calls into them:
+Tool handlers in `src/tools` delegate vendor and external program logic to
+domain modules.
 
 - `autorouting/freerouting`: Freerouting discovery, the Java checks and the
   headless routing session, for the `integration` toolset's
@@ -55,10 +52,10 @@ file and calls into them:
 
 `sourcing/catalog`, `sourcing/lcsc_api` and `sourcing/easyeda` need the
 `jlcpcb` Cargo feature, and `autorouting` needs `freerouting`.
-`native_specctra_bridge.rs` reaches the KiCad plugin only with `native-bridge`
-(#210). All three features are on by default. `fab` and `sourcing`'s
+`native_specctra_bridge.rs` reaches the KiCad plugin only with `native-bridge`.
+All three features are on by default. `fab` and `sourcing`'s
 `LcscCatalog` are in every build: fabrication and assembly output need no
-network. See DEV.md's Build Features.
+network. See [Build Features](../DEV.md#build-features).
 
 ### KiCad data layers
 
@@ -74,6 +71,7 @@ sheets, and related schematic concepts.
 request/reply transport, typed board operations, and the distinction among an
 unreachable transport, a requested board positively absent from KiCad's complete
 open-document set, an ambiguous document set, and a request KiCad rejected.
+Policy for when to use IPC belongs in the calling `copperpour-core` handler.
 
 ### Shared viewer engine
 
@@ -85,8 +83,7 @@ are embedded from `crates/copperpour-viewer/frontend`.
 The MCP launch tool uses the browser service. A `ToolContext` registry serializes
 starts and reuses an instance per canonical root; dropping the context signals
 shutdown of its viewers. Browser-launch status describes the OS opener separately
-from successful service startup. The standalone Tauri application has been retired;
-there is no separate viewer process or GUI build.
+from successful service startup.
 
 ### Non-workspace and non-Rust boundaries
 
@@ -99,9 +96,9 @@ names.
 
 `specctra::RoutingSnapshot` owns the validated live-board model and manifest
 inputs. Rust DSN generation and native DSN adoption consume that same model.
-Native correlation no longer requires generating a Rust DSN first; Rust-only
-Edge.Cuts outline geometry checks run only for the default writer or an
-actual fallback. Source stability, identity correlation and strict SES import
+Native correlation uses the shared snapshot directly. Edge.Cuts outline
+geometry checks run for the Rust writer, including fallback. Source stability,
+identity correlation and strict SES import
 remain shared. The optional native bridge is KiCad-10-only; see
 [selection and safety checks](KICAD_INTEGRATION.md).
 
@@ -152,7 +149,7 @@ tools/call load_toolset
 tools/call domain_tool
   -> McpHandler::execute_tool
   -> meta-tool or loaded domain definition
-  -> required-field gate
+  -> schema validation
   -> handler
   -> CallToolResult and observability record
 ```
@@ -198,9 +195,7 @@ and refuse inputs whose geometry cannot be transformed safely.
 `update_pcb_from_schematic` is a special live-only path in `tools/pcb_sync.rs`.
 It exports the saved schematic hierarchy through the CLI wrapper, creates a dry
 run plan, requires that plan's revision for apply, performs one IPC commit, and
-reads the result back. The read-back check exists because a prior protobuf type
-mistake converted footprint graphics into pads while every layer reported
-success.
+reads the result back, including the footprint child types.
 
 ## Checks, Exports, And Verdicts
 
@@ -213,15 +208,3 @@ Positive review and manufacturing verdicts are evidence-gated. In particular,
 the DRC model in `tools/cli.rs` preserves KiCad's design-rule,
 unconnected-item, and schematic-parity categories; `design_review.rs` and
 `manufacturing.rs` treat unavailable evidence as incomplete rather than clean.
-
-## Ownership Rules
-
-- CLI lifecycle, configuration, installer behavior, and transports belong in
-  `crates/copperpour`.
-- MCP protocol handling, routing, tool responses, and observability belong in
-  `crates/copperpour-core`.
-- Schematic and general KiCad file primitives belong in `copperpour-sexp` or
-  `copperpour-schematic-editor`.
-- Live board IPC behavior and transport classification belong in `copperpour-ipc`;
-  policy for using it belongs in the calling `copperpour-core` handler.
-- KiCad plugin and PCM changes belong in `plugin` and `packaging`.

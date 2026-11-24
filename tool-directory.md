@@ -328,7 +328,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | `flip_component` | Set a placed footprint to F.Cu or B.Cu. On a board open in KiCad 10.0.6+, uses KiCad's native FlipItems IPC command, including the 3D-model transform. Falls back to a revision-aware file edit only when no live KiCad holds the board; an older reachable KiCad returns `unsupported_capability`. The file path refuses unsupported 3D-model geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Change a placed footprint's value, lock, DNP and BOM and position-file exclusions in one KiCad undo step, read back. |
-| `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
+| `repair_corrupted_footprints` | Dry-run and atomically repair anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `update_footprints_from_library` | Plan or atomically apply KiCad's Update Footprints from Library operation to placed footprints on the live board. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves supported placed-instance state and pad nets, except [unit metadata before KiCad 10.0.8](docs/TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit). Field text, fabrication attributes and clearance overrides are kept unless reset_text_content, reset_fabrication_attributes or reset_clearance_overrides is set. Refuses to replace a footprint that owns a group, or whose groups can't be read from the live board. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
@@ -594,30 +594,17 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ---
 
-## Appendix: Structural observations
+## DRC entry points
 
-### Is the structure intelligent?
+Use `run_drc` for an interactive summary and `get_drc_violations` in an export
+workflow. Both use `tools::drc` for synchronization, refill ordering and source
+evidence, and `cli::run_drc` for parsing and item ownership. By default they
+check the saved file. Standalone refill waits for completion and leaves saving
+to the caller. See [DRC synchronization](docs/DRC_SYNCHRONIZATION.md).
 
-**Yes — the split holds up.** A few observations worth tracking as the tool surface grows:
+## Regenerating this doc
 
-1. **Categories mirror the KiCAD editor boundaries** — Schematic (`sch_*`), PCB (`pcb_*`), plus library/integration/verification/review/templates/manufacturing as cross-cutting concerns. A new tool's home is usually obvious.
-
-2. **Batch tools are split across two places**:
-   - `sch_batch` holds top-level batch primitives (`batch_connect_to_net`, `batch_delete`, `bulk_move_schematic_components`, etc.) plus validation
-   - `sch_wiring` / `sch_components` also contain `batch_*` tools (`batch_add_wire`, `batch_delete_no_connect`, `batch_rotate_labels`, `batch_get_schematic_pin_locations`, `batch_delete_schematic_components`, `batch_edit_schematic_components`)
-   The split is defensible (tight-scope batches live with their domain; cross-domain batches live in `sch_batch`) but worth a one-paragraph convention note in DEV.md so future additions land consistently.
-
-3. **Cross-toolset cleanups** (historical notes):
-   - `search_footprints` and `get_symbol_info` were originally in `verification`; moved to `library` where they belong semantically. Users who were loading `verification` for these will be auto-redirected by the smart "tool not loaded" error.
-   - `get_drc_violations` (`pcb_export`) and `run_drc` (`verification`) run the same kicad-cli check. Their tool descriptions now cross-reference each other and steer the LLM toward `run_drc` for interactive use (cleaner summary with error/warning counts) and `get_drc_violations` for bundling into a build package.
-     Both go through `tools::drc` for explicit `sync_live_board` / `refill_zones` ordering and source evidence, then `cli::run_drc` for parsing and item ownership. See [DRC synchronization](docs/DRC_SYNCHRONIZATION.md). Default calls remain saved-file checks; standalone refill waits for completion but does not save.
-
-### Implementation notes
-
-- The `tool!(name, description, input_schema, handler)` macro lives in `crates/copperpour-core/src/tools/mod.rs` and produces a `ToolDef` inserted into each toolset's `tools()` vec.
-- Dispatch: `router::registry::tools_for(name)` maps each toolset string to its `tools::<mod>::tools()` vec; `handler.rs` looks up `tools/call` in the currently-loaded toolsets. If the tool exists but its toolset isn't loaded, the error names the owning toolset for single-hop recovery (`router::ToolRouter::find_toolset_for_tool`).
-- Some schematic handlers are mid-migration from raw `copperpour-sexp` to the typed `copperpour-schematic-editor` model (Phase 2 Waves 1–4). Tool names and semantics are unchanged; only the internal implementation is in flux.
-
-### Regenerating this doc
-
-The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/copperpour-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and leave the counts to `cargo xtask fix-doc-counts`, which runs at release — the row count in each table here must then equal each toolset's `tools()` length.
+Update tool rows from the `tool!(...)` definitions in
+`crates/copperpour-core/src/tools/`. At release, `cargo xtask fix-doc-counts`
+updates the totals from the registry; each table's rows must then match its
+toolset's `tools()` list.

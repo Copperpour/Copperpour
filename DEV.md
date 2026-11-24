@@ -1,103 +1,43 @@
 # Developer Guide — Copperpour
 
-Implementation reference for the Rust port. New to the codebase? Start with
-[docs/DEVELOPER_OVERVIEW.md](docs/DEVELOPER_OVERVIEW.md). Naming, public API, branch
-and PR rules: [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md). Before
-implementing or reviewing a tool, read [the reliability contract](docs/RELIABILITY_CONTRACT.md):
-it sets argument, mutation, result and recovery handling, the evidence a behavior change
-needs, and the planned catalogue-wide checks. Reuse the existing structured errors,
-document-binding, transaction and readback helpers, and document remaining gaps.
+Start with the [developer overview](docs/DEVELOPER_OVERVIEW.md).
+For tool changes, use [Developing Tools](docs/DEVELOPING_TOOLS.md),
+the [reliability contract](docs/RELIABILITY_CONTRACT.md), and the
+[naming conventions](docs/NAMING_CONVENTIONS.md).
 
 ## Quick Start
 
-```bash
-# protoc is required; without PROTOC, protoc on PATH is used (see Build Requirements).
-set PROTOC=C:\path\to\protoc.exe   # or: choco install protoc
+See [build requirements](#build-requirements) for Rust and Protobuf setup.
 
-cargo check                          # ~15s
-cargo test --workspace --lib --tests # all tests
-cargo test -p copperpour-core -p copperpour --no-default-features --lib --tests  # the offline build (#210)
-cargo build --release -p copperpour     # MCP server binary
+```bash
+cargo check --workspace --locked
+cargo test --workspace --locked --lib --tests
+cargo test --locked -p copperpour-core -p copperpour --no-default-features --lib --tests
+cargo build --release --locked -p copperpour
 ```
 
 ### Nix
 
-`flake.nix` gives a reproducible build and dev shell on Linux (`x86_64`/`aarch64`):
-`nix build .#copperpour`, `nix run .#copperpour`, `nix develop` (pinned toolchain,
-protoc, kicad-small). The toolchain comes from `rust-toolchain.toml` and the version from
-the workspace `Cargo.toml`. Not tracked automatically: `cargoBuildFlags`
-(`-p copperpour --bin copperpour`) and `preCheck` (exports `COPPERPOUR_STATE_DIR`).
-**Renaming the binary, adding a workspace member the server depends on, or adding a test
-that needs another env var breaks only the Nix build** — the `Nix flake` CI job catches
-that, so treat its failure as a real break. `dontCargoUseSystemLibs` keeps nixpkgs'
-cargo hook from switching `aws-lc-sys` and `libsqlite3-sys` to system libraries
-([#494](https://github.com/Copperpour/Copperpour/issues/494)); removing it breaks the
-build.
+On Linux, use `nix build .#copperpour`, `nix run .#copperpour`, or `nix develop`.
+Review `cargoBuildFlags` and `preCheck` in `flake.nix` when changing workspace
+dependencies, the server binary, or test environment variables. Keep
+`dontCargoUseSystemLibs` so the build uses vendored AWS-LC and SQLite.
 
 ## Architecture
 
-```
-crates/
-├── copperpour/                  # Binary + cdylib
-│   └── src/  main.rs (CLI: --config, subcommands) · lib.rs/ffi.rs (C ABI:
-│             kicad_plugin_init/version/shutdown) · config.rs (TOML + JSON, socket
-│             auto-detect) · transport/stdio.rs (JSON-RPC lines, default) ·
-│             transport/http.rs (streamable HTTP: POST + GET/SSE on /mcp)
-├── copperpour-core/             # All tool logic
-│   └── src/
-│       ├── mcp/       protocol.rs (JSON-RPC types) · handler.rs (initialize,
-│       │              tools/list, tools/call) · server.rs (session state) · error.rs
-│       ├── router/    mod.rs (ToolRouter load/unload) · registry.rs (toolset
-│       │              metadata, tools_for()) · meta_tools.rs (meta-tools, Unix reload)
-│       └── tools/     one module per toolset (counts: registry.rs, tool-directory.md)
-│           ├── mod.rs              ToolDef, ToolContext, tool!, arg helpers, kicad_config_dir()
-│           ├── board_source.rs     live-vs-saved board reads + provenance
-│           ├── live_board.rs       what KiCad's answer proves about a board (read + write gates)
-│           ├── cli.rs              kicad-cli v10 wrapper (verified against the binary)
-│           ├── svg_import.rs       SVG parse + Bezier flatten (usvg) for import_svg_logo
-│           ├── sch_components.rs   placement with lib_symbols embedding
-│           ├── sch_wiring.rs       incl. connect_pins, power symbol embedding
-│           ├── sch_analysis.rs     union-find net graph; sch_connectivity.rs = NetGraph
-│           ├── sch_batch.rs        single-read/single-write atomic batches
-│           ├── sch_hierarchy.rs    typed Sheet model, sheet CRUD, page/title block, pins
-│           ├── title_block_args.rs title-block args/response/readback (board + sheet)
-│           ├── pcb_sync.rs         update_pcb_from_schematic: pure planner + one-commit IPC apply
-│           ├── pcb_footprint_update.rs  library refresh planner + one-commit IPC apply
-│           ├── pcb_board.rs        S-expr editing, IPC fallback, SVG logo
-│           ├── pcb_components.rs   IPC real-time + safe headless single placement
-│           ├── footprint_{graphics,metadata,models}.rs  validated atomic footprint edits
-│           └── project, sch_bus, sch_export, pcb_routing, pcb_copper, pcb_export, library,
-│               integration, verification, config, design_review, templates,
-│               manufacturing, placement, editor_navigation
-├── copperpour-sexp/             # S-expression engine, no KiCad dependency
-│   └── src/  parser.rs (nom) · writer.rs (SexpEdit, apply_edits, write_atomic) ·
-│             schematic.rs (SymbolInstance, LibPin, pin_endpoint) · geometry.rs
-│             (CANONICAL pin math) · net.rs (KiCad-10 vs legacy net nodes) · layers.rs ·
-│             command.rs (reversible edits) · transaction.rs (multi-file journal) ·
-│             title_block.rs · error.rs (SexpError incl. Conflict)
-├── copperpour-schematic-editor/ # Typed schematic model: parse → mutate → write
-│   └── src/  schematic/ · sexp/ (indent-preserving, mixelpixx/Konnect#210) ·
-│             library.rs · types.rs (fmt_f64, …)
-├── copperpour-ipc/              # KiCad 10 IPC client
-│   └── proto/ (from KiCad v10) · build.rs (prost) · src/ gen.rs · client.rs (NNG
-│       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
-│       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
-└── copperpour-viewer/           # Viewer engine and loopback browser service
-    ├── src/launch.rs           # start KiCad detached; report exit during startup
-    └── frontend/               # Embedded browser page and script
-plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin settings
-             dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json
-packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh (all
-             platforms, #398) · metadata.json · validate-pcm.py · schema/ · resources/
-.github/workflows/  where each runs: GOVERNANCE.md, "Where CI runs"
-    ci.yml        GitHub, per PR: check+test (Linux), clippy, fmt, Python plugin,
-                  Nix, PCM validation, licenses, offline build
-    windows.yml   GitHub, per PR: check+test (Windows)
-    macos.yml     GitHub, per PR: check+test (macOS); macOS release artifacts
-    e2e-kicad.yml local CI: real KiCad 10.0.8: e2e suite, demo-corpus
-                  conformance, PCM; release gate, on request for a PR
-    release.yml   local CI: real-KiCad gate, build, PCM (Linux x86_64, Windows)
-```
+See [Architecture](docs/ARCHITECTURE.md) for crate ownership and runtime flows.
+These modules are common entry points for implementation changes.
+
+| Module | Ownership |
+|---|---|
+| `copperpour-core/src/tools/board_source.rs` and `live_board.rs` | Live and saved board provenance and editor authority |
+| `copperpour-core/src/tools/cli.rs` | KiCad CLI checks and exports |
+| `copperpour-core/src/tools/sch_connectivity.rs` | Schematic net identity |
+| `copperpour-core/src/tools/pcb_sync.rs` and `pcb_footprint_update.rs` | Pure plans and one-commit IPC apply |
+| `copperpour-sexp/src/geometry.rs` | Canonical schematic pin geometry |
+| `copperpour-sexp/src/writer.rs` and `transaction.rs` | Revision-checked writes and multi-file journals |
+| `copperpour-schematic-editor/src/sexp` | Indent-preserving schematic serialization |
+| `copperpour-ipc/src/builders.rs` and `transform.rs` | Protobuf builders, mm-to-nm conversion, and footprint children in absolute board coordinates |
 
 ## KiCad 10 Integration
 
@@ -121,12 +61,17 @@ no item CRUD.
   host, so staleness is unprovable: valid, foreign, empty and malformed locks all fail
   closed. Checked before the journal is created and again at the final write.
 - Multi-file changes use project-local `.copperpour-transaction-*.json` write-ahead
-  journals holding full before/after images — sensitive project data. Unix creates them
-  `0600` regardless of umask; elsewhere keep the project directory private. Journals
-  named `.konnect-transaction-*.json` by earlier releases are still recovered.
-  `FileTransition::guard` locks and checks a file the change depends on without rewriting it. The journal records equal before and after images, so edits to the guard show as divergent and stop recovery. Guarded commits refuse if an older journal is pending; resolve it explicitly, then plan again.
+  journals holding full before/after images. Unix creates them with mode `0600`.
+  On other platforms, keep the project directory private. Recovery also accepts
+  `.konnect-transaction-*.json` journals.
+  `FileTransition::guard` locks and checks a dependency without rewriting it.
+  Equal before and after images let recovery detect divergence and stop.
+  Resolve a pending journal before replanning a guarded commit.
 
-  `FileTransition::guard_absent` protects a path the plan requires not to exist. It writes neither the path nor a placeholder. A journal containing an absence guard uses version 2 so older Copperpour releases cannot recover it without enforcing that check; transactions without absence guards retain version 1. Recover pending version 2 journals with a supporting release before downgrading.
+  `FileTransition::guard_absent` checks that a path stays absent without creating
+  a placeholder. Transactions with absence guards use journal version 2.
+  Other transactions use version 1. Recover pending version 2 journals with
+  a supporting release before downgrading.
 
   Apply and recovery recheck each replacement target against its before image after
   staging the write, just before renaming it into place. A mismatch leaves the target
@@ -134,8 +79,7 @@ no item CRUD.
   locks coordinate Copperpour writers only. An outside writer can still save between
   the final check and rename, or after the final readback and before journal removal.
 - New design files and exports get `0666 & ~umask` on Unix. A replacement keeps the
-  destination's mode, so a project an earlier Konnect created stays `0600` until
-  `chmod`ed.
+  destination's mode.
 
 `copperpour_schematic_editor::Schematic` separates creation from replacement:
 `save(new_path)` is create-only; `save(loaded_path)` and `overwrite()` replace only if
@@ -149,29 +93,23 @@ transaction abandon` ([Troubleshooting](docs/TROUBLESHOOTING.md#transaction-reco
 
 ### Which board a read answers about
 
-A read-only PCB tool answerable by KiCad or the saved file asks `tools/board_source.rs`
-instead of choosing itself. It takes `board_source` = `auto` (default) | `live` |
-`saved`, and reports `sources` (per domain: `ipc`, `saved_board`, `project_file`,
-`derived`, `unavailable`) and `source_evidence` (`board_state`,
-`excludes_unsaved_editor_state`, machine-readable `reason`, prose `detail`).
+PCB tools that can read either source use `tools/board_source.rs` for
+`board_source = auto | live | saved`. The default is `auto`.
+It reports per-domain `sources` and `source_evidence`, including whether the
+result excludes unsaved editor state. Readers and the write gates in
+`tools/pcb_board.rs` share `tools/live_board.rs` for document identity.
+A board this process saw KiCad hold is never treated as safely absent later,
+however KiCad stops answering.
 
-It and the write gates in `pcb_board.rs` both classify KiCad's answer through
-`tools/live_board.rs` — including that a board this process watched KiCad hold is never
-treated as safely absent later, however KiCad stops answering. The policies differ (a
-stale read is disclosable, a stale write destroys work); the evidence reading does not.
-
-The rule: once KiCad positively identified the board as live, a failed query **is
-returned as a failure**, never as an answer read off a possibly older file. A watched
-board whose IPC endpoint disappears is refused under `auto`; explicit `saved` may still
-read the snapshot and says so in `reason`. First consumers: `get_layer_list`,
-`get_netclasses`; inventory in [#58](https://github.com/Copperpour/Copperpour/issues/58).
+Once KiCad positively identifies a board as live, a failed query remains a
+failure. If its endpoint disappears, `auto` refuses. Explicit `saved` can read
+the snapshot and reports that choice in `reason`.
 
 ### kicad-cli v10 (subprocess)
 
-Verified: `sch erc`, `sch export svg/pdf/bom/netlist`, `pcb drc`,
-`pcb export gerbers/drill/pdf/svg/step/vrml/pos/ipcd356`, `pcb render`. Removed in v10:
-`sch annotate` (reimplemented in Rust), `pcb sync`, `pcb export/import specctra`.
-Version format: `20250610`.
+Use `tools/cli.rs` for ERC, DRC, rendering and supported exports.
+Schematic annotation runs in Rust. PCB synchronization and Specctra exchange
+use the PCB editor path.
 
 ### Plugin
 
@@ -231,47 +169,26 @@ if !path.exists() {
 New kind: add the variant in `mcp/error.rs` and its `short_code()` arm;
 `short_code_matches_serialized_kind_field` fails if they drift.
 
-Dispatch errors (not-loaded, unknown, panic) and **every input-schema error** are
-structured, by three mechanisms in call order:
+Dispatch compiles and caches each advertised Draft 2020-12 schema. Missing
+required fields, malformed values, bounds and closed-object violations return
+`invalid_argument` with a field path such as `components[0].unit`. Required
+`null` is treated as absent.
 
-1. **Schema gate.** Every advertised Draft 2020-12 schema is compiled with its tool
-   definition, cached, and reused by `handler.rs::dispatch_tool`. Domain and meta-tool
-   calls are refused before the handler for missing required fields, wrong types,
-   fractional integers, failed bounds, or unknown keys in a closed object, as
-   `invalid_argument` naming nested fields like `components[0].unit`. The legacy
-   presence check runs first so a missing field keeps its schema order and message;
-   explicit `null` counts as absent.
-2. **Typed helpers** in `tools/mod.rs` (`require_str`, `require_f64`, `require_array`,
-   `require_u64`, `opt_u32`, `opt_positive_f64`, domain validators) return
-   `InvalidArgument { field, reason }`, so direct handler calls — most tests — refuse
-   the same way.
-3. **`get_path`** returns `anyhow::Result<PathBuf>` (171 call sites use `?`) with a
-   `MissingArgument` marker that `dispatch_tool` downcasts. Classify by downcasting,
-   never by message text — as with `copperpour_ipc::TransportUnreachable`.
-
-A path that is *present but unusable* (missing on disk, wrong extension) is **not** an
-argument error: it stays `handler_error` or `FileNotFound`, so "forgot an argument" and
-"file is not there" remain distinguishable.
-
-The gate exists because an audit found 25 sites in 18 tools reporting success on
-substituted values, and wrong-typed options, fractional integers, bounds and closed
-nested objects still slipped through. Catalogue tests compile every schema and drive real
-tools through dispatch, including a KiCad footprint fixture that must stay byte-identical
-on refusal. Most in-handler errors still use `CallToolResult::error("…")` or bubble
-`anyhow::Error`; migration is incremental (`project.rs::handle_get_project_info` shows
-the pattern).
+Use checked readers from `tools/mod.rs` in handlers, including direct-call
+paths. `get_path` returns a typed `MissingArgument` marker for dispatch to
+downcast. An argument naming a missing file or unusable path remains a file
+or handler error. Classify errors by typed marker, as with
+`copperpour_ipc::TransportUnreachable`, and use `project.rs::handle_get_project_info`
+as a structured-error example.
 
 ### Unrepresentable layers crash KiCad
 
-`builders::layer_from_name` maps unknown names to `BL_UNDEFINED`. KiCad 10.0.5 does
-**not** validate that field on incoming items; it indexes its layer bitset with it and
-dies with an access violation, losing the unsaved board, while Copperpour sees only an
-NNG timeout. Any path sending a layer to KiCad must use **`builders::try_layer_from_name`**,
-which refuses. `client.rs::build_footprint_item` validates the root, every pad and every
-graphic layer before building a child; KiCad's own `*.Cu`/`*.Mask`/`*.Paste` wildcards
-are expanded, not mapped. The infallible version is only for read paths that filter
-`BL_UNDEFINED`. "No error returned" and "the editor is still alive" are different
-questions.
+Use `builders::try_layer_from_name` on writes. Unknown layers map to
+`BL_UNDEFINED` in the infallible reader, which can crash the editor and lose
+unsaved work if sent over IPC. `client.rs::build_footprint_item` validates
+footprint, pad and graphic layers and expands KiCad's `*.Cu`, `*.Mask` and
+`*.Paste` wildcards. Read paths that use the infallible mapper must filter
+`BL_UNDEFINED`.
 
 ## Observability
 
@@ -293,44 +210,25 @@ meta-tools. JSONL IO failures never fail a call (`tracing::warn!`, dropped). Tes
 
 ## Tool Routing
 
-`tools/list` does not expose all 281 tools (290 tools with the 9 meta-tools, ~23K tokens):
+`router/registry.rs::STARTER_KIT` loads `project` and `config` at startup.
+`auto_load_toolsets` loads a tool's owner on demand when the tool is called.
+`eager_toolsets` exposes the full catalogue on the first
+`tools/list` for clients that cache that response. Both default to `false`.
 
-- **Startup** loads only `registry.rs::STARTER_KIT` (`project`, `config`): with the
-  meta-tools, 21 tools ≈ 2K tokens.
-- **On demand**: `list_toolboxes` → `load_toolset(name)`; `unload_toolset(name)` prunes.
-  Each sends `notifications/tools/list_changed`.
-- **Recovery**: calling an unloaded tool returns an error naming its toolset, so the LLM
-  loads and retries in one hop.
-- **`auto_load_toolsets`** (default `false`): a miss in `dispatch_tool` loads the
-  toolset and runs the call in the same hop. Toolsets then accumulate for the session (a
-  call reloads what `unload_toolset` pruned), so it is off by default. Set in
-  `konnect.toml`/`settings.json` or `ServerConfig`.
-- **`eager_toolsets`** (default `false`): `ToolRouter::load_all` at startup, so the
-  *first* `tools/list` is the full catalogue (~25K tokens). For clients that cache the
-  first list and ignore `list_changed`: they can never call a tool missing from it, since
-  `load_toolset` returns names, not schemas. `auto_load_toolsets` does not help there —
-  it fires on a call, which needs the name already.
-- **`call_tool(name, arguments)`** runs a tool whether or not its toolset is loaded,
-  through `run_tool_definition` like a direct call, and leaves `tools/list` alone. A
-  client approves tools by name, so `router/call_tool_policy.rs` decides by the target's
-  name, before any of it runs, what the gateway may reach: the reviewed `READ_ONLY_TOOLS`
-  and `READ_ONLY_META_TOOLS` always, `call_tool` and `reload_server` never, and
-  everything else only with the next key. A new tool must be put on a list there by
-  hand; a test names the ones that are on none.
-- **`call_tool_allow_writes`** (default `false`): lets `call_tool` run the tools that
-  are not read-only, `load_toolset` and `unload_toolset` included. A client that has
-  allowed `call_tool` then runs mutating tools without their individual approval
-  prompts. It is a server configuration key, set through `McpHandler::allow_call_tool_writes`
-  at startup; no tool argument reaches it.
-
-Router: `crates/copperpour-core/src/router/mod.rs`.
+See [Tool System](docs/TOOL_SYSTEM.md) for dispatch, list-change notifications,
+and [the `call_tool` policy](docs/TOOL_SYSTEM.md#call_tool).
 
 ## Specctra export ownership
 
+`export_specctra_dsn` creates a revision-bound job from the live editor.
+`route_specctra_dsn` delegates to Freerouting's local MCP server.
+`plan_specctra_ses_import` and `apply_specctra_ses` validate and apply the
+result in one KiCad undo transaction.
+
 `specctra::prepare_export` captures the import-owned board model without invoking
 the Rust DSN writer. `RoutingSnapshot::identity` supplies the existing native
-correlator directly; it is checked against the historical DSN-derived identity
-on the fixture corpus. `export_rust` owns Edge.Cuts outline geometry and flattening
+correlator directly and has fixture coverage against the DSN-derived identity.
+`export_rust` owns Edge.Cuts outline geometry and flattening
 checks. `adopt_native` preserves the actual native DSN and rewrites only its
 reverse-manifest identifiers/outline label after validation.
 
@@ -342,7 +240,7 @@ features stay common refusals. See [the mode contract](docs/KICAD_INTEGRATION.md
 
 ## Build Requirements
 
-- Rust pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (1.96.0); CI uses the same.
+- Rust pinned by [`rust-toolchain.toml`](rust-toolchain.toml).
   The pinned version IS the MSRV: bump it deliberately, in its own commit, after the full
   local gate passes on it.
 - `protoc`, from `PROTOC` or PATH
@@ -360,7 +258,7 @@ features stay common refusals. See [the mode contract](docs/KICAD_INTEGRATION.md
 ## Build Features
 
 `copperpour-core` has a feature for each integration that reaches the network or
-an outside program, and `copperpour` forwards them (#210). All are on by default,
+an outside program, and `copperpour` forwards them. All are on by default,
 and release, PCM and Nix builds use the defaults:
 
 | Feature | Adds | Dependencies |
@@ -404,51 +302,26 @@ registry on `ToolContext` until the server context ends. `open_browser: false`
 suppresses the OS opener; successful service starts return a private credential
 URL. See [the viewer README](crates/copperpour-viewer/README.md).
 
-The standalone Tauri crate, binary and separate CI job have been removed under
-[the retirement migration](docs/api-migrations/retire-standalone-viewer.md).
-Build only the MCP server; PCM packaging embeds the browser viewer with it.
-
 ## Server-delivered guidance
 
-Every `initialize` response includes short Copperpour operating rules plus any
-one-time installed-guidance drift notice. The embedded bundle catalog in
-`copperpour-core/src/guidance/bundle.rs` is shared with the native installer’s
-manifest, so serving and installing a file use the same bytes. Asset sources
-remain under `crates/copperpour/assets/skills`; the reliability reference comes
-from `docs/RELIABILITY_CONTRACT.md`.
+See [server guidance architecture](docs/ARCHITECTURE.md#server-guidance) for
+the shared embedded catalogue, initialization rules, and MCP endpoints. Asset
+sources are in `crates/copperpour/assets/skills` and
+`docs/RELIABILITY_CONTRACT.md`.
 
-`get_guidance` is an always-visible meta-tool. Without `path` it lists bundle
-paths; with an exact listed path it returns the same `contents` as
-`resources/read`. The resource namespace is `copperpour://guidance/`, with each
-skill’s `SKILL.md` and `references/` listed separately. Relative Markdown links
-resolve inside that skill’s resource directory; tool callers supply the full
-listed bundle path. Neither endpoint reads local files, downloads content or
-installs guidance. Both stdio and HTTP use the same core handler.
-
-The static catalog advertises `resources: {}`: no subscriptions, list-change
-notifications, templates or pagination. Unknown URIs return JSON-RPC `-32002`;
-malformed requests or continuation cursors return `-32602`. Tool errors retain
-the structured `invalid_argument` contract. `init`, `status`, `uninstall`, local
-drift detection and Claude hooks keep their existing behavior. Custom skill
-roots and setup snippets are later #461 phases.
+`get_guidance` lists bundle paths or reads one exact path. Markdown links
+resolve within the skill's resource directory. The static catalog advertises
+`resources: {}` and uses JSON-RPC `-32002` for unknown resources and `-32602`
+for malformed requests or continuation cursors.
 
 ## Adding a New Tool
 
-`ToolDef::new` closes fixed input records before the schema is advertised and compiled.
-Declare every accepted field in `properties`, including fixed nested records.
-Caller-keyed maps must set `additionalProperties: true` or a value schema, and a new one
-is registered in `fixed_records_are_closed_and_only_reviewed_maps_are_extensible` with a
-compatibility test; a typed map's fixed value records stay closed. Untyped caller data
-(e.g. configuration `value`) stays unrestricted. Meta-tools follow the same policy. Test
-typo/no-write regressions through served dispatch; direct handler calls still need
-checked readers for domain rules.
+Follow the [implementation checklist](docs/DEVELOPING_TOOLS.md#define-and-implement-the-tool).
+Keep batches within their domain toolset when they operate on one domain.
+Use `sch_batch` for cross-domain schematic operations.
 
-1. Add the `tool!(...)` definition to the toolset's `tools()` vec.
-2. Write the `async fn handle_*()` below it.
-3. If it belongs in the default set, add its toolset to `STARTER_KIT`.
-4. `cargo check`, then add its row to `tool-directory.md` (see that file's header).
-   Leave the tool counts in the docs alone: `cargo xtask fix-doc-counts` updates them
-   at release, and `list_toolboxes` counts each toolset's `tools()`.
+Add or remove the affected row in [the tool directory](tool-directory.md).
+`cargo xtask fix-doc-counts` updates totals at release.
 
 ## Current Stats
 
@@ -456,9 +329,3 @@ checked readers for domain rules.
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens. Full catalogue: 290 tools (281 registered + 9 meta) / ~25K tokens.
-- **0 IPC stubs**, **0 unimplemented tools**.
-- **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands:
-  `export_specctra_dsn` makes a revision-bound job from the live editor,
-  `route_specctra_dsn` delegates to Freerouting's local native MCP server, and
-  `plan_specctra_ses_import` / `apply_specctra_ses` validate and apply the result in one
-  KiCad undo transaction.

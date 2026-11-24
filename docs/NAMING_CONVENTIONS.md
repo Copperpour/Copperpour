@@ -1,9 +1,7 @@
 # Copperpour naming conventions
 
-Consistent names are part of Copperpour's public API. They help contributors search the
-repository, let agents infer related operations, and prevent accidental compatibility
-breaks. New code and documentation must follow this guide. Existing public names are
-changed only with an explicit compatibility plan.
+Use these conventions in new code and documentation. Preserve existing public names
+or provide an explicit compatibility plan.
 
 ## Product and protocol names
 
@@ -12,7 +10,7 @@ Use the official spelling in prose, comments, errors, and UI text:
 | Use | Do not introduce | Notes |
 |---|---|---|
 | `Copperpour` | `copperpour` as a product name | Lowercase remains correct for binaries, commands, and paths. Some paths keep the earlier `konnect` name. |
-| `KiCad` | `KiCAD`, `Kicad` | Applies to NEW prose only — the existing codebase uses `KiCAD` widely (hundreds of occurrences) and is not to be mass-renamed; match surrounding style when editing existing text. |
+| `KiCad` | `KiCAD`, `Kicad` | Use in new prose. Match surrounding style in existing text and avoid bulk renames. |
 | `MCP` | `Mcp` in prose | Rust type names use `Mcp`, for example `McpHandler`. |
 | `IPC` | `Ipc` in prose | Rust type names use `Ipc`, for example `KiCadIpcClient`. |
 | `PCB`, `ERC`, `DRC`, `BOM` | mixed-case variants in prose | Rust identifiers treat each acronym as a word. |
@@ -64,7 +62,7 @@ Collection responses use a plural noun plus `count` when useful:
 
 ```json
 {
-  "count": 2,
+  "count": 0,
   "components": []
 }
 ```
@@ -139,4 +137,4 @@ Before introducing or changing a name, check:
 5. Are tests, tool-directory metadata, examples, and error messages updated together?
 
 When compatibility and style conflict, preserve compatibility and document the legacy
-name. Consistency is valuable; silently breaking users is worse.
+name.

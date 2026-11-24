@@ -1,18 +1,14 @@
-# AGENTS.md
+# Copperpour agent instructions
 
-Guidance for coding agents working on Copperpour. Read the human docs first; this file
-adds only the traps they don't spell out.
-
-- [CONTRIBUTING.md](CONTRIBUTING.md): setup, `protoc`, adding tools, PR checklist
-- [DEV.md](DEV.md): crate layout, IPC vs. S-expression editing, structured errors, router
-- [docs/RELIABILITY_CONTRACT.md](docs/RELIABILITY_CONTRACT.md): argument, mutation,
-  result and recovery rules for every tool
-- [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md): identifiers, `KiCad` vs.
-  `KiCAD`, `snake_case` JSON keys
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and review,
+[DEV.md](DEV.md) for implementation,
+[the reliability contract](docs/RELIABILITY_CONTRACT.md) for tool behavior,
+and [the naming conventions](docs/NAMING_CONVENTIONS.md) for identifiers and API names.
 
 ## Before you push
 
-Run what `.github/workflows/ci.yml` runs:
+Run the checks for the changed paths in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+Use the following commands for the Rust baseline.
 
 ```bash
 cargo fmt --all -- --check
@@ -22,51 +18,36 @@ cargo test --workspace --locked --lib --tests
 cargo test --workspace --locked --doc
 ```
 
-If you added or removed a tool, add or remove its `tool-directory.md` row but leave the tool counts in the
-docs alone: they move at release.
-
 ## Public API
 
-MCP tool names, toolset names, arguments, CLI flags, env vars, config keys, JSON keys and
-documented paths are public API. Never rename or repurpose one silently: add an alias or
-a deprecation period, and a migration note in `docs/api-migrations/` (see its README).
+Preserve MCP tool and toolset names, arguments, CLI flags, environment variables,
+config keys, JSON keys, and documented paths. For a public rename or repurpose,
+provide an alias or deprecation period and a [migration note](docs/api-migrations/README.md).
+Update tool rows in [tool-directory.md](tool-directory.md) when tools change.
+Counts move at release.
 
-## Nets: identity vs. name
+## Schematic nets
 
-A net's identity is its `NetGraph` root (`tools/sch_connectivity.rs`), never its name.
-One net can carry several names, such as a `+3V3` power symbol beside a `VCC` label, so
-comparing by name fails against the net itself. Compare with `root_at`; use
-`name_of_root` and `net_at` only to *report* a net.
-
-KiCad joins a sheet's nets by name as well as by wire. `seed_net_graph` joins points by
-geometry, then `merge_named_nets` joins points that share a name: two segments that each
-carry a `SIG` label are one net, and every `GND` symbol on the sheet is one rail.
-
-A net's reported name follows KiCad's precedence, encoded in `driver_priority`: global
-label > power symbol > local label > hierarchical label, ties broken by name ascending
-(measured against KiCad 10.0.5). A local label cannot rename a power rail.
+Compare `NetGraph` roots with `root_at` in `tools/sch_connectivity.rs`.
+One root can have several names. Use `name_of_root` and `net_at` for reporting.
+`seed_net_graph` joins points by geometry, then `merge_named_nets` joins points
+by name. `driver_priority` ranks global labels first, followed by power symbols, local
+labels, and hierarchical labels. Ties use ascending name order.
 
 ## File writes
 
-DEV.md describes the revision-checked atomic writes and the create-only `save()`. Never
-delete a destination to get around a `conflict`, and never weaken `save()` into an
-unconditional overwrite: a conflict from KiCad's autosave means the mechanism works, so
-reload and reapply.
+Use [revision-checked writes](DEV.md#s-expression-file-editing-schematic-offline).
+On `SexpError::Conflict`, reload and reapply. Preserve create-only `save()`
+for new paths and keep the destination in place.
 
-The writers return `SexpError::Conflict` only when the file changed before the write, so
-nothing was written: a `conflict` refusal. A readback after the rename that does not
-match is `SexpError::ReadbackMismatch`, which dispatch reports as
-`mutation_outcome_uncertain`, because the file was already replaced. Never turn it into
-an `Ok` refusal; return it, or call `tools::readback_mismatch_result`.
+`SexpError::Conflict` proves the writer stopped before replacement.
+`SexpError::ReadbackMismatch` follows replacement and maps to
+`mutation_outcome_uncertain`. Propagate it or use `tools::readback_mismatch_result`.
 
-For a post-write readback, parse with `parse_sexp` and read positions with `parse_at`,
-as `sch_wiring.rs::observed_no_connect_moves` does. `Schematic::from_source` in
-`copperpour-schematic-editor` prints every item it skips to stderr, so a readback through it
-adds noise on each call.
+Use `parse_sexp` and `parse_at` for post-write readback. Follow
+`sch_wiring.rs::observed_no_connect_moves` to avoid per-item stderr output from
+`Schematic::from_source`.
 
 ## Parallel sessions
 
-When several agents share one clone, give each task its own git worktree and its own
-`CARGO_TARGET_DIR`. Switching branches in a shared checkout changes files under another
-session's running tests, and a shared target directory can hand one worktree another's
-stale build artifacts.
+Give each concurrent task its own git worktree and `CARGO_TARGET_DIR`.
