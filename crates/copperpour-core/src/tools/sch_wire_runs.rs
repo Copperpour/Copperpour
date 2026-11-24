@@ -986,6 +986,21 @@ mod tests {
     }
 
     #[test]
+    fn wire_run_coordinate_range_keeps_the_bus_bucket_margin() {
+        // A large coordinate still fits; the limit is not a page-size cutoff.
+        assert!(coordinate_is_representable(100_000_000.0));
+
+        // The f64 quotient for i64::MAX / 4,000,000. The limit itself is
+        // excluded, but its immediate predecessor is admitted on either axis.
+        let limit = 2_305_843_009_213.694_f64;
+        for sign in [-1.0, 1.0] {
+            assert!(coordinate_is_representable(sign * limit.next_down()));
+            assert!(!coordinate_is_representable(sign * limit));
+            assert!(!coordinate_is_representable(sign * limit.next_up()));
+        }
+    }
+
+    #[test]
     fn wire_runs_do_not_name_pins_from_empty_or_non_power_values() {
         for (power, value) in [("(power)", ""), ("", "REGULATOR")] {
             let body = inspect(&format!(
