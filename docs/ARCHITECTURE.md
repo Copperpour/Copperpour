@@ -52,7 +52,8 @@ domain modules.
 
 `sourcing/catalog`, `sourcing/lcsc_api` and `sourcing/easyeda` need the
 `jlcpcb` Cargo feature, and `autorouting` needs `freerouting`.
-`native_specctra_bridge.rs` reaches the KiCad plugin only with `native-bridge`. All three features are on by default. `fab` and `sourcing`'s
+`native_specctra_bridge.rs` reaches the KiCad plugin only with `native-bridge`.
+All three features are on by default. `fab` and `sourcing`'s
 `LcscCatalog` are in every build: fabrication and assembly output need no
 network. See [Build Features](../DEV.md#build-features).
 
@@ -70,6 +71,7 @@ sheets, and related schematic concepts.
 request/reply transport, typed board operations, and the distinction among an
 unreachable transport, a requested board positively absent from KiCad's complete
 open-document set, an ambiguous document set, and a request KiCad rejected.
+Policy for when to use IPC belongs in the calling `copperpour-core` handler.
 
 ### Shared viewer engine
 
@@ -95,7 +97,8 @@ names.
 `specctra::RoutingSnapshot` owns the validated live-board model and manifest
 inputs. Rust DSN generation and native DSN adoption consume that same model.
 Native correlation uses the shared snapshot directly. Edge.Cuts outline
-geometry checks run for the Rust writer, including fallback. Source stability, identity correlation and strict SES import
+geometry checks run for the Rust writer, including fallback. Source stability,
+identity correlation and strict SES import
 remain shared. The optional native bridge is KiCad-10-only; see
 [selection and safety checks](KICAD_INTEGRATION.md).
 

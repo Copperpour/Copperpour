@@ -209,7 +209,8 @@ meta-tools. JSONL IO failures never fail a call (`tracing::warn!`, dropped). Tes
 ## Tool Routing
 
 `router/registry.rs::STARTER_KIT` loads `project` and `config` at startup.
-`auto_load_toolsets` loads a tool's owner on demand when the tool is called. `eager_toolsets` exposes the full catalogue on the first
+`auto_load_toolsets` loads a tool's owner on demand when the tool is called.
+`eager_toolsets` exposes the full catalogue on the first
 `tools/list` for clients that cache that response. Both default to `false`.
 
 See [Tool System](docs/TOOL_SYSTEM.md) for dispatch, list-change notifications,
@@ -224,7 +225,8 @@ result in one KiCad undo transaction.
 
 `specctra::prepare_export` captures the import-owned board model without invoking
 the Rust DSN writer. `RoutingSnapshot::identity` supplies the existing native
-correlator directly and has fixture coverage against the DSN-derived identity. `export_rust` owns Edge.Cuts outline geometry and flattening
+correlator directly and has fixture coverage against the DSN-derived identity.
+`export_rust` owns Edge.Cuts outline geometry and flattening
 checks. `adopt_native` preserves the actual native DSN and rewrites only its
 reverse-manifest identifiers/outline label after validation.
 
@@ -297,8 +299,6 @@ checks remain separate evidence. The MCP launch tool owns viewers through a
 registry on `ToolContext` until the server context ends. `open_browser: false`
 suppresses the OS opener; successful service starts return a private credential
 URL. See [the viewer README](crates/copperpour-viewer/README.md).
-
-
 
 ## Server-delivered guidance
 

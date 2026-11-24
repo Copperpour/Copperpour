@@ -83,8 +83,9 @@ the PR body is welcome but not required: reviewers run their own.
 - Verify the branch can merge into current `main`, required checks passed on
   the reviewed head, and the commit list and diff contain only this PR's work.
 - For tool changes, follow [Developing Tools](docs/DEVELOPING_TOOLS.md).
-  Update the affected row in `tool-directory.md`. At release, `cargo xtask
-  fix-doc-counts` updates totals from each toolset's `tools()` list.
+  Add, update or remove the tool's row in `tool-directory.md`, and leave the
+  tool counts alone. At release, `cargo xtask fix-doc-counts` updates them
+  from each toolset's `tools()` list.
 - Preserve public API compatibility. Add a separate
   [migration note](docs/api-migrations/README.md) for caller-visible changes.
 - If fixture line endings differ locally despite a clean checkout, run

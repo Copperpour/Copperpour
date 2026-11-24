@@ -9,7 +9,7 @@ Use the official spelling in prose, comments, errors, and UI text:
 
 | Use | Do not introduce | Notes |
 |---|---|---|
-| `Copperpour` | `copperpour` as a product name | Lowercase remains correct for binaries, commands, and paths. |
+| `Copperpour` | `copperpour` as a product name | Lowercase remains correct for binaries, commands, and paths. Some paths keep the earlier `konnect` name. |
 | `KiCad` | `KiCAD`, `Kicad` | Use in new prose. Match surrounding style in existing text and avoid bulk renames. |
 | `MCP` | `Mcp` in prose | Rust type names use `Mcp`, for example `McpHandler`. |
 | `IPC` | `Ipc` in prose | Rust type names use `Ipc`, for example `KiCadIpcClient`. |

@@ -602,8 +602,9 @@ evidence, and `cli::run_drc` for parsing and item ownership. By default they
 check the saved file. Standalone refill waits for completion and leaves saving
 to the caller. See [DRC synchronization](docs/DRC_SYNCHRONIZATION.md).
 
-### Regenerating this doc
+## Regenerating this doc
 
 Update tool rows from the `tool!(...)` definitions in
 `crates/copperpour-core/src/tools/`. At release, `cargo xtask fix-doc-counts`
-updates the totals from the registry.
+updates the totals from the registry; each table's rows must then match its
+toolset's `tools()` list.
