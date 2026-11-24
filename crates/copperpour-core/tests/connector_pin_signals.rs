@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 
 const TOOL: &str = "check_connector_pin_signals";
 const CONNECTORS: &str = include_str!("fixtures/connector_pin_signals_kicad10.kicad_sch");
+const HIDDEN_POWER: &str = include_str!("fixtures/connector_hidden_power_kicad10.kicad_sch");
 const SHEET_PINS: &str = include_str!("fixtures/pin_net_names_kicad10.kicad_sch");
 const WIRE_STUB: &str = include_str!("fixtures/rigid_block_move_kicad10.kicad_sch");
 
@@ -609,6 +610,36 @@ async fn a_power_symbol_on_another_run_is_evidence_without_a_nearby_mark() {
         json!(["label", "power_symbol"])
     );
     assert_eq!(context(&answer, 0, 1)["nearest_power_symbol"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_hidden_power_input_reaches_a_remote_power_symbol_without_a_nearby_mark() {
+    let answer = check(HIDDEN_POWER, json!({})).await;
+    assert_eq!(answer["connectors"][0]["reference"], "J1", "{answer}");
+    let pin = &answer["connectors"][0]["pins"][0];
+    assert_eq!(pin["pin"], "1");
+    assert_eq!(pin["status"], "identified", "{answer}");
+    assert_eq!(pin["evidence"], json!(["power_symbol"]), "{pin}");
+    assert_eq!(
+        pin["context"].get("nearest_power_symbol"),
+        Some(&Value::Null)
+    );
+    assert_eq!(answer["unidentified_count"], 0);
+}
+
+#[tokio::test]
+async fn a_visible_power_input_does_not_join_a_remote_power_net_by_name() {
+    // Expose U1.14, not the hidden pin of the separate power symbol.
+    let visible = HIDDEN_POWER.replacen(
+        "(length 2.54)\n\t\t\t\t\t(hide yes)\n\t\t\t\t\t(name \"VCC\"",
+        "(length 2.54)\n\t\t\t\t\t(name \"VCC\"",
+        1,
+    );
+    assert_ne!(visible, HIDDEN_POWER);
+    let answer = check(&visible, json!({})).await;
+    let pin = &answer["connectors"][0]["pins"][0];
+    assert_eq!(pin["status"], "unidentified", "{answer}");
+    assert_eq!(pin["evidence"], json!([]), "{pin}");
 }
 
 #[tokio::test]

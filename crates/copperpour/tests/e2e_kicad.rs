@@ -678,6 +678,49 @@ fn netlisted(kicad_cli: &str, root: &std::path::Path, label: &str) -> (Vec<Strin
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn hidden_power_input_shares_the_remote_vcc_net_in_kicad() {
+    let cli = find_kicad_cli().expect("kicad-cli required for the native e2e workflow");
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("connector_hidden_power.kicad_sch");
+    let netlist = schematic.with_extension("net");
+    std::fs::write(
+        &schematic,
+        include_bytes!(
+            "../../copperpour-core/tests/fixtures/connector_hidden_power_kicad10.kicad_sch"
+        ),
+    )
+    .unwrap();
+    let export = Command::new(cli)
+        .args(["sch", "export", "netlist", "--output"])
+        .arg(&netlist)
+        .arg(&schematic)
+        .output()
+        .unwrap();
+    assert!(export.status.success(), "{export:?}");
+    let text = std::fs::read_to_string(netlist).unwrap();
+    let tree = copperpour_sexp::parse_sexp(&text).unwrap();
+    let vcc = tree
+        .find("nets")
+        .unwrap()
+        .find_all("net")
+        .into_iter()
+        .find(|net| net.find_str("name") == Some("VCC"))
+        .expect("KiCad should merge the hidden input and power symbol into VCC");
+    let members: std::collections::BTreeSet<_> = vcc
+        .find_all("node")
+        .into_iter()
+        .map(|pin| (pin.find_str("ref").unwrap(), pin.find_str("pin").unwrap()))
+        .collect();
+    assert_eq!(
+        members,
+        [("J1", "1"), ("R1", "1"), ("U1", "1"), ("U1", "14")]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn a_nested_hierarchy_annotated_from_its_root_netlists_cleanly() {
     let Some(kicad_cli) = find_kicad_cli() else {
         panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");

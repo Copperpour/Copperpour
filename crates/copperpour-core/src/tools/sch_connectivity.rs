@@ -35,7 +35,7 @@ use copperpour_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
         extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
-        pin_endpoint, wire_end_needs_junction, Label, LabelKind, LibPin, Wire,
+        pin_endpoint, wire_end_needs_junction, Label, LabelKind, LibPin, SymbolInstance, Wire,
     },
     SexpNode,
 };
@@ -333,11 +333,6 @@ impl NetGraph {
 
     fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
         self.add_driver(x, y, net, kind, false);
-    }
-
-    /// Name a power pin without attaching it to a wire that only crosses it.
-    pub(super) fn add_power_pin_driver(&mut self, x: f64, y: f64, net: &str, local: bool) {
-        self.add_driver(x, y, net, LabelKind::PowerSymbol, local);
     }
 
     fn add_driver(&mut self, x: f64, y: f64, net: &str, kind: LabelKind, power_local: bool) {
@@ -639,12 +634,68 @@ pub(super) fn drawn_net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Lab
     )
 }
 
-/// Power labels name their pin's node. They do not attach that pin to an
-/// unsplit wire crossed without a junction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SymbolPower {
+    Ordinary,
+    Global,
+    Local,
+}
+
+impl SymbolPower {
+    pub(super) fn from_library(lib: &SexpNode) -> Self {
+        match lib.find("power") {
+            None => Self::Ordinary,
+            Some(power) if power.get(1).and_then(SexpNode::as_str) == Some("local") => Self::Local,
+            Some(_) => Self::Global,
+        }
+    }
+}
+
+/// Add node-only drivers from the pins chosen by the caller. A hidden power
+/// input on an ordinary symbol names a global net, but is not a drawn mark.
+/// Only real power symbols contribute marks for the connector check.
+pub(super) fn add_symbol_power_drivers<'a>(
+    graph: &mut NetGraph,
+    instance: &SymbolInstance,
+    power: SymbolPower,
+    pins: impl IntoIterator<Item = (&'a LibPin, (f64, f64))>,
+    mut drawn_mark: impl FnMut(Label),
+) {
+    for (pin, (x, y)) in pins {
+        if pin.electrical_type != "power_in" {
+            continue;
+        }
+        match power {
+            SymbolPower::Ordinary if pin.hidden => {
+                let name = super::sch_label_rename::stored_name(&pin.name);
+                graph.add_driver(x, y, &name, LabelKind::PowerSymbol, false);
+            }
+            SymbolPower::Global | SymbolPower::Local if !instance.value.is_empty() => {
+                graph.add_driver(
+                    x,
+                    y,
+                    &instance.value,
+                    LabelKind::PowerSymbol,
+                    power == SymbolPower::Local,
+                );
+                drawn_mark(Label {
+                    kind: LabelKind::PowerSymbol,
+                    net: instance.value.clone(),
+                    x,
+                    y,
+                    rotation: instance.rotation,
+                    uuid: instance.uuid.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Power drivers name their pin's node without attaching it to a wire that
+/// crosses the pin without a junction.
 pub(super) fn snapshot_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
-    use copperpour_sexp::schematic::{
-        extract_labels, extract_power_symbol_labels, find_lib_symbol,
-    };
+    use copperpour_sexp::schematic::{extract_labels, find_lib_symbol};
 
     let labels = extract_labels(tree);
     let mut graph = drawn_net_graph_for(tree, wires, &labels);
@@ -652,26 +703,23 @@ pub(super) fn snapshot_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
         .find("lib_symbols")
         .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
-    let mut local_power = HashSet::new();
     for (inst, pins) in crate::tools::placed_pins_by_reference(tree) {
-        if let Some(power) = find_lib_symbol(&lib_symbols, &inst).and_then(|lib| lib.find("power"))
-        {
-            if power.get(1).and_then(SexpNode::as_str) == Some("local") {
-                local_power.extend(inst.uuid);
-            }
-        } else {
-            for (pin, transform) in pins {
-                if pin.hidden && pin.electrical_type == "power_in" {
-                    let (x, y) = pin_endpoint(&pin, transform);
-                    let name = super::sch_label_rename::stored_name(&pin.name);
-                    graph.add_power_pin_driver(x, y, &name, false);
-                }
-            }
-        }
-    }
-    for label in extract_power_symbol_labels(tree) {
-        let local = label.uuid.is_some_and(|uuid| local_power.contains(&uuid));
-        graph.add_power_pin_driver(label.x, label.y, &label.net, local);
+        let Some(lib) = find_lib_symbol(&lib_symbols, &inst) else {
+            continue;
+        };
+        let power = match SymbolPower::from_library(lib) {
+            // The snapshot historically identified local symbols by UUID.
+            SymbolPower::Local if inst.uuid.is_none() => SymbolPower::Global,
+            power => power,
+        };
+        add_symbol_power_drivers(
+            &mut graph,
+            &inst,
+            power,
+            pins.iter()
+                .map(|(pin, transform)| (pin, pin_endpoint(pin, *transform))),
+            drop,
+        );
     }
     graph.into_named_nets()
 }
@@ -1456,6 +1504,51 @@ mod agreement_tests {
     use serde_json::json;
     use std::io::Write;
     use std::sync::Arc;
+
+    #[test]
+    fn snapshot_preserves_hidden_power_join_and_name_scope() {
+        let source = include_str!("../../tests/fixtures/connector_hidden_power_kicad10.kicad_sch");
+        let tree = copperpour_sexp::parse_sexp(source).unwrap();
+        let mut graph = snapshot_net_graph(&tree, &extract_wires(&tree));
+        let connector = graph.root_at(0.0, 0.0);
+        assert_eq!(connector, graph.root_at(10.16, 20.32));
+        assert_eq!(
+            graph.scoped_name_of_root(connector),
+            Some(("VCC".into(), 0))
+        );
+
+        let local = source.replacen("(power global)", "(power local)", 1);
+        assert_ne!(local, source);
+        let tree = copperpour_sexp::parse_sexp(&local).unwrap();
+        let mut graph = snapshot_net_graph(&tree, &extract_wires(&tree));
+        let connector = graph.root_at(0.0, 0.0);
+        assert_eq!(connector, graph.root_at(10.16, 20.32));
+        assert_eq!(
+            graph.scoped_name_of_root(connector),
+            Some(("VCC".into(), 0))
+        );
+        assert!(graph
+            .named_net_aliases()
+            .contains(&(("VCC".into(), 0), ("VCC".into(), 1))));
+    }
+
+    #[test]
+    fn snapshot_does_not_join_a_visible_power_input_by_name() {
+        let source = include_str!("../../tests/fixtures/connector_hidden_power_kicad10.kicad_sch");
+        let visible = source.replacen(
+            "(length 2.54)\n\t\t\t\t\t(hide yes)\n\t\t\t\t\t(name \"VCC\"",
+            "(length 2.54)\n\t\t\t\t\t(name \"VCC\"",
+            1,
+        );
+        assert_ne!(visible, source);
+        let tree = copperpour_sexp::parse_sexp(&visible).unwrap();
+        let mut graph = snapshot_net_graph(&tree, &extract_wires(&tree));
+        let connector = graph.root_at(0.0, 0.0);
+        let rail = graph.root_at(10.16, 20.32);
+        assert_ne!(connector, rail);
+        assert_eq!(graph.scoped_name_of_root(connector), None);
+        assert_eq!(graph.scoped_name_of_root(rail), Some(("VCC".into(), 0)));
+    }
 
     /// Run a registered tool from either schematic toolset against a temporary
     /// file, exactly as the MCP dispatch layer does after selecting its

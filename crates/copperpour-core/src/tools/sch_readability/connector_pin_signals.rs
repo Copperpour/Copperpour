@@ -4,8 +4,8 @@ use crate::tools::{
     get_path, opt_str_list,
     placement::ref_prefix,
     sch_connectivity::{
-        drawn_net_graph_for, label_roots, ConnectivityIndex, NetRoot, PinNetNames, UnitNotation,
-        COINCIDENT_TOLERANCE,
+        add_symbol_power_drivers, drawn_net_graph_for, label_roots, ConnectivityIndex, NetRoot,
+        PinNetNames, SymbolPower, UnitNotation, COINCIDENT_TOLERANCE,
     },
     sch_hierarchy::natural_compare,
     symbol_body_style, ToolContext, ToolDef, UNRESOLVED_PIN_GEOMETRY,
@@ -82,8 +82,7 @@ impl DrawnPin {
 struct DrawnSymbol {
     instance: SymbolInstance,
     pins: Vec<DrawnPin>,
-    is_power: bool,
-    is_local_power: bool,
+    power: SymbolPower,
 }
 
 fn read_symbol(node: &SexpNode, libs: &[&SexpNode]) -> Result<DrawnSymbol, String> {
@@ -146,15 +145,10 @@ fn read_symbol(node: &SexpNode, libs: &[&SexpNode]) -> Result<DrawnSymbol, Strin
     pins.sort_by(|a, b| {
         natural_compare(&a.pin.number, &b.pin.number).then_with(|| a.pin.number.cmp(&b.pin.number))
     });
-    let power = lib.find("power");
     Ok(DrawnSymbol {
         instance,
         pins,
-        is_power: power.is_some(),
-        is_local_power: power
-            .and_then(|node| node.get(1))
-            .and_then(SexpNode::as_str)
-            == Some("local"),
+        power: SymbolPower::from_library(lib),
     })
 }
 
@@ -234,30 +228,14 @@ async fn handle_check_connector_pin_signals(
     let mut labels = extract_labels(&tree);
     let mut runs = drawn_net_graph_for(&tree, &wires, &labels);
     let mut nets = runs.clone();
-    for symbol in placed
-        .iter()
-        .filter(|symbol| symbol.is_power && !symbol.instance.value.is_empty())
-    {
-        for drawn in symbol
-            .pins
-            .iter()
-            .filter(|drawn| drawn.pin.electrical_type == "power_in")
-        {
-            nets.add_power_pin_driver(
-                drawn.at.0,
-                drawn.at.1,
-                &symbol.instance.value,
-                symbol.is_local_power,
-            );
-            labels.push(Label {
-                kind: LabelKind::PowerSymbol,
-                net: symbol.instance.value.clone(),
-                x: drawn.at.0,
-                y: drawn.at.1,
-                rotation: symbol.instance.rotation,
-                uuid: symbol.instance.uuid.clone(),
-            });
-        }
+    for symbol in &placed {
+        add_symbol_power_drivers(
+            &mut nets,
+            &symbol.instance,
+            symbol.power,
+            symbol.pins.iter().map(|drawn| (&drawn.pin, drawn.at)),
+            |mark| labels.push(mark),
+        );
     }
     let buses = extract_buses(&tree);
     let index = ConnectivityIndex::with_placed_pins(
@@ -325,11 +303,10 @@ async fn handle_check_connector_pin_signals(
     for DrawnSymbol {
         instance,
         pins,
-        is_power,
-        ..
+        power,
     } in &placed
     {
-        if *is_power {
+        if *power != SymbolPower::Ordinary {
             continue;
         }
         for drawn in pins {
@@ -353,13 +330,12 @@ async fn handle_check_connector_pin_signals(
     for DrawnSymbol {
         instance,
         pins,
-        is_power,
-        ..
+        power,
     } in placed
     {
         let reference = &instance.reference;
         let selected_by = match &references {
-            _ if *is_power => continue,
+            _ if *power != SymbolPower::Ordinary => continue,
             Some(refs) if refs.contains(reference) => "references",
             None if ref_prefix(reference) == "J" => "reference_prefix",
             _ => continue,
