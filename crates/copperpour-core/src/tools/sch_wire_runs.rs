@@ -1158,6 +1158,17 @@ mod tests {
     }
 
     #[test]
+    fn wire_runs_skip_unrepresentable_wires_without_scoring_them() {
+        let report = measure(
+            "(wire (pts (xy 10 20) (xy 30 20)))
+             (wire (pts (xy 10 40) (xy 10000000000000 40)))",
+        );
+        assert_eq!(report.skipped_wire_count, 1, "skip the out-of-range wire");
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(report.runs[0].length_mm, 20.0);
+    }
+
+    #[test]
     fn wire_runs_do_not_call_an_endpoint_with_a_zero_length_wire_open() {
         let report =
             measure("(wire (pts (xy 10 20) (xy 30 20))) (wire (pts (xy 30 20) (xy 30 20)))");
@@ -1199,6 +1210,19 @@ mod tests {
         let report = measure("(wire (pts (xy 10 20) (xy 15 20))) (wire (pts (xy 15 20) (xy 25 20))) (bus_entry (at 15 20) (size 5 5))");
         assert_eq!(report.runs.len(), 1);
         assert_eq!(report.runs[0].length_mm, 15.0);
+    }
+
+    #[test]
+    fn wire_runs_do_not_split_at_a_bus_entry_near_but_off_the_bus() {
+        let report = measure(
+            "(wire (pts (xy 10 20) (xy 15 20)))
+             (wire (pts (xy 15 20) (xy 25 20)))
+             (bus_entry (at 15 20) (size 5 5))
+             (bus (pts (xy 20 25.2) (xy 30 25.2)))",
+        );
+        assert_eq!(report.runs.len(), 1, "do not attach the off-bus entry");
+        assert_eq!(report.runs[0].length_mm, 15.0);
+        assert_eq!(report.runs[0].segments.len(), 2);
     }
 
     #[test]
