@@ -4553,11 +4553,10 @@ impl KiCadIpcClient {
         }
     }
 
-    fn find_footprint_instance_in(
+    pub(super) fn footprint_inventory_in(
         &self,
         document: kiapi::common::types::DocumentSpecifier,
-        reference: &str,
-    ) -> Result<kiapi::board::types::FootprintInstance> {
+    ) -> Result<Vec<kiapi::board::types::FootprintInstance>> {
         let reply = self.get_items_response_in(
             document,
             &[kiapi::common::types::KiCadObjectType::KotPcbFootprint],
@@ -4571,7 +4570,7 @@ impl KiCadIpcClient {
             PreflightRefusal::check_failed(format!("Cannot read footprint inventory: {error:#}"))
         })?;
         ensure_item_request_ok(inventory.status, "item retrieval")?;
-        let mut matches = Vec::new();
+        let mut footprints = Vec::with_capacity(inventory.items.len());
         for item in inventory.items {
             let footprint = (|| -> Result<_> {
                 anyhow::ensure!(
@@ -4591,10 +4590,21 @@ impl KiCadIpcClient {
                     "Cannot read footprint inventory: {error:#}"
                 ))
             })?;
-            if crate::builders::footprint_reference(&footprint) == reference {
-                matches.push(footprint);
-            }
+            footprints.push(footprint);
         }
+        Ok(footprints)
+    }
+
+    fn find_footprint_instance_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<kiapi::board::types::FootprintInstance> {
+        let mut matches: Vec<_> = self
+            .footprint_inventory_in(document)?
+            .into_iter()
+            .filter(|footprint| crate::builders::footprint_reference(footprint) == reference)
+            .collect();
         match matches.len() {
             0 => Err(FootprintTargetError::Missing {
                 reference: reference.to_string(),

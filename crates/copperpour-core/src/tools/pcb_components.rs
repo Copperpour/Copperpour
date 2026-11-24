@@ -2487,27 +2487,37 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_component",
-            "Change a placed footprint's value, lock (locked) and assembly flags: dnp (do not \
-             populate), exclude_from_bom and exclude_from_pos_files. Every property not named \
-             is kept. One KiCad undo step; the result is a fresh readback of what the board \
-             holds, and a readback that does not match the request is reported as an error \
-             rather than success. This edit sends the whole footprint over IPC and can drop \
-             symbol-unit mappings on KiCad 10.0–10.0.7. Rule areas inside footprints can also \
-             change. Readback verifies neither. See 'Footprint unit metadata disappears after \
-             a live PCB edit' in Troubleshooting. update_pcb_from_schematic \
-             sets dnp and exclude_from_bom from a linked footprint's symbol again. With no \
-             property named, reports the footprint without changing it. Does not save. \
-             Requires KiCad running with the board open.",
+            "Change a placed footprint's reference (new_reference, board-owned footprints only), \
+             value, lock (locked) and assembly flags: dnp (do not populate), exclude_from_bom and \
+             exclude_from_pos_files. Direct board-side rename is permitted only for footprints not \
+             linked to a schematic symbol; schematic-owned references must be renamed with \
+             edit_schematic_component and propagated with update_pcb_from_schematic. Renaming to a \
+             reference already used by another footprint on the board is refused. Optional kiid \
+             pins one exact footprint instance (and disambiguates duplicate references such as \
+             'REF**': without it, a shared reference is refused as ambiguous_target naming each \
+             KIID). A renamed footprint with no symbol link that takes a reference the \
+             schematic uses is adopted by the next update_pcb_from_schematic, which matches it by \
+             reference, as KiCad's Update PCB does. Every property not named is kept. One KiCad undo step; the result is a \
+             fresh readback by KIID of what the board holds, and a readback that does not match \
+             the request is reported as an error rather than success. This edit sends the whole \
+             footprint over IPC and can drop symbol-unit mappings on KiCad 10.0–10.0.7. Rule areas \
+             inside footprints can also change. Readback verifies neither. See 'Footprint unit \
+             metadata disappears after a live PCB edit' in Troubleshooting. \
+             update_pcb_from_schematic sets dnp and exclude_from_bom from a linked footprint's \
+             symbol again. With no property named, reports the footprint without changing it. Does \
+             not save. Requires KiCad running with the board open.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board":     { "type": "string" },
-                    "reference": { "type": "string" },
-                    "value":     { "type": "string", "description": "New value string (optional)" },
-                    "dnp":       { "type": "boolean", "description": "Do not populate (optional)" },
+                    "board":         { "type": "string" },
+                    "reference":     { "type": "string" },
+                    "kiid":          { "type": "string", "description": "Exact footprint KIID (UUID) to pin one instance or disambiguate duplicate references (optional)" },
+                    "new_reference": { "type": "string", "description": "New reference designator for a board-owned footprint not linked to a schematic symbol (optional)" },
+                    "value":         { "type": "string", "description": "New value string (optional)" },
+                    "dnp":           { "type": "boolean", "description": "Do not populate (optional)" },
                     "exclude_from_bom":       { "type": "boolean", "description": "Exclude from the bill of materials (optional)" },
                     "exclude_from_pos_files": { "type": "boolean", "description": "Exclude from position (pick-and-place) files (optional)" },
-                    "locked":    { "type": "boolean", "description": "Lock (true) or unlock (false) the footprint (optional)" }
+                    "locked":        { "type": "boolean", "description": "Lock (true) or unlock (false) the footprint (optional)" }
                 },
                 "required": ["board", "reference"]
             }),
@@ -3496,7 +3506,42 @@ async fn handle_edit_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let kiid = match &args["kiid"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => {
+            if value.trim().is_empty() {
+                return Ok(crate::tools::invalid_arg("kiid", "must not be empty"));
+            }
+            Some(value.clone())
+        }
+        _ => return Ok(crate::tools::invalid_arg("kiid", "must be a string")),
+    };
+    let new_reference = match &args["new_reference"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => {
+            if value.trim().is_empty() {
+                return Ok(crate::tools::invalid_arg(
+                    "new_reference",
+                    "must not be empty",
+                ));
+            }
+            if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Ok(crate::tools::invalid_arg(
+                    "new_reference",
+                    "must not contain whitespace or control characters",
+                ));
+            }
+            Some(value.clone())
+        }
+        _ => {
+            return Ok(crate::tools::invalid_arg(
+                "new_reference",
+                "must be a string",
+            ))
+        }
+    };
     let edit = copperpour_ipc::IpcFootprintEdit {
+        new_reference,
         value: args["value"].as_str().map(str::to_string),
         dnp: args["dnp"].as_bool(),
         exclude_from_bom: args["exclude_from_bom"].as_bool(),
@@ -3504,15 +3549,32 @@ async fn handle_edit_component(
         locked: args["locked"].as_bool(),
     };
     let live_reference = reference.clone();
+    let live_kiid = kiid.clone();
     if edit.is_empty() {
-        let state = ipc!(ctx, args, |c, document| c
-            .footprint_state_in(document, &live_reference));
-        return Ok(CallToolResult::json(&edit_component_body(
-            &state,
-            "unchanged",
-            None,
-            None,
-        )));
+        let lookup = ipc!(ctx, args, |c, document| c.footprint_state_in(
+            document,
+            &live_reference,
+            live_kiid.as_deref()
+        ));
+        return Ok(match lookup {
+            copperpour_ipc::IpcFootprintLookupOutcome::Found(state) => {
+                CallToolResult::json(&edit_component_body(&state, "unchanged", None, None))
+            }
+            copperpour_ipc::IpcFootprintLookupOutcome::StaleTarget { target, reason } => {
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::StaleTarget {
+                        target,
+                        reason: reason.clone(),
+                    },
+                    format!("edit_component refused: {reason}. Nothing was written."),
+                )
+            }
+            copperpour_ipc::IpcFootprintLookupOutcome::AmbiguousTarget {
+                target,
+                candidates,
+                reason,
+            } => ambiguous_footprint_result(target, candidates, &reason),
+        });
     }
     let outcome = ipc!(ctx, args, |c, document| {
         match super::pcb_footprint_update::refuse_owned_groups(
@@ -3524,7 +3586,7 @@ async fn handle_edit_component(
         )? {
             Some(refused) => Ok(Err(refused)),
             None => c
-                .edit_footprint_in(document, &live_reference, &edit)
+                .edit_footprint_in(document, &live_reference, live_kiid.as_deref(), &edit)
                 .map(Ok),
         }
     });
@@ -3560,6 +3622,7 @@ fn schematic_owned_flags_changed(
 
 fn edit_component_state_json(state: &copperpour_ipc::IpcFootprintState) -> serde_json::Value {
     json!({
+        "reference": state.reference,
         "value": state.value,
         "dnp": state.dnp,
         "exclude_from_bom": state.exclude_from_bom,
@@ -3581,6 +3644,7 @@ fn edit_component_body(
     let before_json = before.map(edit_component_state_json);
     let changed: Vec<&str> = match &before_json {
         Some(before_json) => [
+            "reference",
             "value",
             "dnp",
             "exclude_from_bom",
@@ -3596,6 +3660,7 @@ fn edit_component_body(
         "status": status,
         "applied": status == "applied",
         "source": "ipc",
+        "kiid": state.kiid,
         "reference": state.reference,
         "value": state.value,
         "footprint": state.footprint,
@@ -3611,16 +3676,29 @@ fn edit_component_body(
     })
 }
 
+/// `ambiguous_target` for a reference several placed footprints carry,
+/// naming their KIIDs so the caller can retry with `kiid`.
+fn ambiguous_footprint_result(
+    target: String,
+    candidates: Vec<String>,
+    reason: &str,
+) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::AmbiguousTarget { target, candidates },
+        format!("edit_component refused: {reason}. Nothing was written."),
+    )
+}
+
 fn edit_component_result(
-    outcome: copperpour_ipc::IpcTextEditOutcome<copperpour_ipc::IpcFootprintState>,
+    outcome: copperpour_ipc::IpcFootprintEditOutcome,
     board: &Path,
 ) -> CallToolResult {
-    use copperpour_ipc::IpcTextEditOutcome;
+    use copperpour_ipc::IpcFootprintEditOutcome;
     match outcome {
-        IpcTextEditOutcome::Unchanged { current } => {
+        IpcFootprintEditOutcome::Unchanged { current } => {
             CallToolResult::json(&edit_component_body(&current, "unchanged", None, None))
         }
-        IpcTextEditOutcome::Applied { before, after } => {
+        IpcFootprintEditOutcome::Applied { before, after } => {
             let mut warning = WHOLE_FOOTPRINT_WARNING.to_string();
             let owned = schematic_owned_flags_changed(&before, &after);
             if !owned.is_empty() {
@@ -3639,7 +3717,26 @@ fn edit_component_result(
                 Some(warning),
             ))
         }
-        IpcTextEditOutcome::Uncertain {
+        IpcFootprintEditOutcome::Blocked { reason } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::PlanBlocked {
+                operation: "edit_component".to_string(),
+                reasons: vec![reason.clone()],
+            },
+            format!("edit_component refused: {reason}. Nothing was written."),
+        ),
+        IpcFootprintEditOutcome::StaleTarget { target, reason } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target,
+                reason: reason.clone(),
+            },
+            format!("edit_component refused: {reason}. Nothing was written."),
+        ),
+        IpcFootprintEditOutcome::AmbiguousTarget {
+            target,
+            candidates,
+            reason,
+        } => ambiguous_footprint_result(target, candidates, &reason),
+        IpcFootprintEditOutcome::Uncertain {
             expected,
             observed,
             mismatches,
@@ -11651,6 +11748,8 @@ mod edit_component_tests {
         IgnoresFlags,
         /// Answers OK but keeps the lock it held.
         IgnoresLock,
+        /// Answers OK but keeps the reference it held.
+        IgnoresReference,
         /// Refuses the update and stores nothing.
         Refuses,
         /// Lists the footprint twice, as a board with a repeated reference.
@@ -11764,10 +11863,18 @@ mod edit_component_tests {
         footprint: kiapi::board::types::FootprintInstance,
         kicad: Kicad,
     ) -> (crate::test_support::MockIpcServer, Arc<Mutex<Sent>>) {
+        spawn_many(board, vec![footprint], kicad)
+    }
+
+    fn spawn_many(
+        board: &Path,
+        footprints: Vec<kiapi::board::types::FootprintInstance>,
+        kicad: Kicad,
+    ) -> (crate::test_support::MockIpcServer, Arc<Mutex<Sent>>) {
         use copperpour_ipc::builders::pack_any;
 
         let open = open_board(&board.to_string_lossy());
-        let held = Mutex::new(footprint);
+        let held = Mutex::new(footprints);
         let sent = Arc::new(Mutex::new(Sent::default()));
         let record = sent.clone();
         let server = crate::test_support::MockIpcServer::spawn("edit-component", move |request| {
@@ -11806,16 +11913,24 @@ mod edit_component_tests {
                         "kiapi.common.commands.CreateItemsResponse",
                     )));
                 }
-                let item = if kicad == Kicad::UnreadableFootprint {
-                    prost_types::Any {
+                let items = if kicad == Kicad::UnreadableFootprint {
+                    vec![prost_types::Any {
                         type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".into(),
                         value: vec![0xff],
-                    }
+                    }]
                 } else {
-                    pack_any(
-                        &*held.lock().unwrap(),
-                        "kiapi.board.types.FootprintInstance",
-                    )
+                    let held = held.lock().unwrap();
+                    let packed: Vec<_> = held
+                        .iter()
+                        .map(|fp| pack_any(fp, "kiapi.board.types.FootprintInstance"))
+                        .collect();
+                    if kicad == Kicad::ListsTwice {
+                        let mut doubled = packed.clone();
+                        doubled.extend(packed);
+                        doubled
+                    } else {
+                        packed
+                    }
                 };
                 ok(Some(pack_any(
                     &kiapi::common::commands::GetItemsResponse {
@@ -11825,7 +11940,7 @@ mod edit_component_tests {
                         } else {
                             kiapi::common::types::ItemRequestStatus::IrsOk as i32
                         },
-                        items: vec![item; if kicad == Kicad::ListsTwice { 2 } else { 1 }],
+                        items,
                     },
                     "kiapi.common.commands.GetItemsResponse",
                 )))
@@ -11868,13 +11983,26 @@ mod edit_component_tests {
                     )));
                 }
                 let mut held = held.lock().unwrap();
+                let target_id = footprint.id.as_ref().map(|id| id.value.as_str());
+                let slot = held
+                    .iter_mut()
+                    .find(|existing| existing.id.as_ref().map(|id| id.value.as_str()) == target_id)
+                    .expect("mock holds updated footprint");
                 if kicad == Kicad::IgnoresFlags {
-                    footprint.attributes = held.attributes.clone();
+                    footprint.attributes = slot.attributes.clone();
                 }
                 if kicad == Kicad::IgnoresLock {
-                    footprint.locked = held.locked;
+                    footprint.locked = slot.locked;
                 }
-                *held = footprint.clone();
+                if kicad == Kicad::IgnoresReference {
+                    footprint.reference_field = slot.reference_field.clone();
+                    if let (Some(def), Some(old_def)) =
+                        (footprint.definition.as_mut(), slot.definition.as_ref())
+                    {
+                        def.reference_field = old_def.reference_field.clone();
+                    }
+                }
+                *slot = footprint.clone();
                 ok(Some(pack_any(
                     &kiapi::common::commands::UpdateItemsResponse {
                         header: None,
@@ -12452,6 +12580,367 @@ mod edit_component_tests {
     #[tokio::test]
     async fn a_repeated_reference_is_refused_when_no_edit_is_requested() {
         assert_repeated_reference(json!({})).await;
+    }
+
+    fn c_0603_with(
+        kiid: &str,
+        reference: &str,
+        linked: bool,
+    ) -> kiapi::board::types::FootprintInstance {
+        let mut footprint = c_0603(linked);
+        footprint.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        footprint
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text = reference.to_string();
+        if let Some(text) = footprint
+            .definition
+            .as_mut()
+            .and_then(|definition| definition.reference_field.as_mut())
+            .and_then(|field| field.text.as_mut())
+            .and_then(|board_text| board_text.text.as_mut())
+        {
+            text.text = reference.to_string();
+        }
+        footprint
+    }
+
+    #[tokio::test]
+    async fn a_board_owned_footprint_is_renamed_in_one_commit_and_read_back_by_kiid() {
+        // Also covers KiCad's empty SheetPath (`[""]`) emitted for board-only
+        // footprints placed directly on the board.
+        let mut before = c_0603(false);
+        before.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: vec![kiapi::common::types::Kiid {
+                value: String::new(),
+            }],
+            path_human_readable: "/".to_string(),
+        });
+        let original_kiid = before.id.as_ref().unwrap().value.clone();
+        let (result, sent, original_ref) = edit(
+            before.clone(),
+            Kicad::Keeps,
+            json!({ "new_reference": "LOGO1" }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["status"], "applied");
+        assert_eq!(body["kiid"], original_kiid);
+        assert_eq!(body["reference"], "LOGO1");
+        assert_eq!(body["before"]["reference"], original_ref);
+        assert_eq!(body["changed"], json!(["reference"]));
+        assert_eq!(body["linked_to_schematic"], false);
+        assert_eq!(body["undo"], "one KiCad undo step");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.begins, 1);
+        let commands: Vec<_> = sent.named.iter().map(|(command, _)| *command).collect();
+        assert_eq!(
+            commands,
+            [
+                "GetItems",
+                "BeginCommit",
+                "UpdateItems",
+                "EndCommit",
+                "GetItems"
+            ]
+        );
+        assert_eq!(sent.updates.len(), 1);
+        assert_eq!(footprint_instance_reference(&sent.updates[0]), "LOGO1");
+        // Only the reference field changed; the rest of KiCad's message went back verbatim.
+        let mut unchanged = sent.updates[0].clone();
+        unchanged.reference_field = before.reference_field.clone();
+        if let (Some(def), Some(before_def)) =
+            (unchanged.definition.as_mut(), before.definition.as_ref())
+        {
+            def.reference_field = before_def.reference_field.clone();
+        }
+        assert_eq!(unchanged, before);
+    }
+
+    #[tokio::test]
+    async fn a_schematic_linked_footprint_refuses_board_side_rename_before_commit() {
+        let (result, sent, reference) = edit(
+            c_0603(true),
+            Kicad::Keeps,
+            json!({ "new_reference": "C99" }),
+        )
+        .await;
+        assert!(result.is_error, "{}", text(&result));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("plan_blocked"),
+            "{}",
+            text(&result)
+        );
+        let msg = text(&result);
+        assert!(msg.contains(&reference), "{msg}");
+        assert!(msg.contains("edit_schematic_component"), "{msg}");
+        assert!(msg.contains("update_pcb_from_schematic"), "{msg}");
+        let sent = sent.lock().unwrap();
+        assert_eq!((sent.begins, sent.updates.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_rename_to_an_existing_reference_is_refused_before_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let fp1 = c_0603_with("fp-1", "LOGO1", false);
+        let fp2 = c_0603_with("fp-2", "FID1", false);
+        let (server, sent) = spawn_many(&board, vec![fp1, fp2], Kicad::Keeps);
+        let result = handle_edit_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "LOGO1",
+                "new_reference": "FID1",
+            }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{}", text(&result));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("plan_blocked"),
+            "{}",
+            text(&result)
+        );
+        assert!(text(&result).contains("fp-2"), "{}", text(&result));
+        assert!(text(&result).contains("FID1"), "{}", text(&result));
+        let sent = sent.lock().unwrap();
+        assert_eq!((sent.begins, sent.updates.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_shared_reference_without_kiid_is_ambiguous_and_names_each_kiid() {
+        for arguments in [json!({}), json!({ "new_reference": "LOGO1" })] {
+            let temp = tempfile::tempdir().unwrap();
+            let board = temp.path().join("board.kicad_pcb");
+            std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+            let fp1 = c_0603_with("fp-logo", "REF**", false);
+            let fp2 = c_0603_with("fp-fid", "REF**", false);
+            let (server, sent) = spawn_many(&board, vec![fp1, fp2], Kicad::Keeps);
+            let mut args = json!({ "board": board.to_string_lossy(), "reference": "REF**" });
+            for (key, value) in arguments.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            let result = handle_edit_component(&args, &context(server.address().to_string()))
+                .await
+                .unwrap();
+            assert!(result.is_error, "{}", text(&result));
+            let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+            assert_eq!(body["error"]["target"], "REF**", "{body}");
+            assert_eq!(
+                body["error"]["candidates"],
+                json!(["fp-fid", "fp-logo"]),
+                "{body}"
+            );
+            assert!(text(&result).contains("pass kiid"), "{}", text(&result));
+            let sent = sent.lock().unwrap();
+            assert_eq!((sent.begins, sent.updates.len()), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn kiid_disambiguates_duplicate_board_only_references_through_served_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let fp1 = c_0603_with("fp-logo", "REF**", false);
+        let fp2 = c_0603_with("fp-fid", "REF**", false);
+        let (server, sent) = spawn_many(&board, vec![fp1, fp2], Kicad::Keeps);
+        let mut config = context(server.address().to_string()).config;
+        config.eager_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+
+        // Served dispatch: rename only `fp-logo` out of two `REF**` footprints.
+        let reply = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": {
+                    "name": "edit_component",
+                    "arguments": {
+                        "board": board,
+                        "reference": "REF**",
+                        "kiid": "fp-logo",
+                        "new_reference": "LOGO1",
+                    }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(reply["isError"], true, "{reply}");
+        let body: serde_json::Value =
+            serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["status"], "applied");
+        assert_eq!(body["kiid"], "fp-logo");
+        assert_eq!(body["reference"], "LOGO1");
+        assert_eq!(body["before"]["reference"], "REF**");
+        assert_eq!(body["changed"], json!(["reference"]));
+        assert_eq!(sent.lock().unwrap().begins, 1);
+
+        // The second footprint is still `REF**` and can be inspected by `kiid`.
+        let inspect = handle_edit_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "REF**",
+                "kiid": "fp-fid",
+            }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!inspect.is_error, "{}", text(&inspect));
+        let inspect_body: serde_json::Value = serde_json::from_str(&text(&inspect)).unwrap();
+        assert_eq!(inspect_body["status"], "unchanged");
+        assert_eq!(inspect_body["kiid"], "fp-fid");
+        assert_eq!(inspect_body["reference"], "REF**");
+    }
+
+    #[tokio::test]
+    async fn a_stale_kiid_or_mismatched_reference_is_refused_as_stale_target() {
+        let before = c_0603_with("fp-1", "LOGO1", false);
+        let original_kiid = "fp-1";
+        for (args, expected_snippet) in [
+            (
+                json!({ "kiid": "fp-missing", "new_reference": "LOGO2" }),
+                "fp-missing",
+            ),
+            (
+                json!({ "reference": "WRONG", "kiid": original_kiid, "new_reference": "LOGO2" }),
+                "currently has reference 'LOGO1'",
+            ),
+            (
+                json!({ "reference": "WRONG", "kiid": original_kiid }),
+                "currently has reference 'LOGO1'",
+            ),
+        ] {
+            let (result, sent, _) = edit(before.clone(), Kicad::Keeps, args.clone()).await;
+            assert!(result.is_error, "{args}: {}", text(&result));
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target"),
+                "{args}: {}",
+                text(&result)
+            );
+            assert!(
+                text(&result).contains(expected_snippet),
+                "{args}: {}",
+                text(&result)
+            );
+            let sent = sent.lock().unwrap();
+            assert_eq!((sent.begins, sent.updates.len()), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reference_kicad_did_not_keep_is_an_uncertain_outcome() {
+        let (result, sent, original_ref) = edit(
+            c_0603(false),
+            Kicad::IgnoresReference,
+            json!({ "new_reference": "LOGO1" }),
+        )
+        .await;
+        assert!(result.is_error, "{}", text(&result));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("mutation_outcome_uncertain"),
+            "{}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!(
+                "reference: expected \"LOGO1\", observed \"{original_ref}\""
+            )),
+            "{body}"
+        );
+        assert_eq!(sent.lock().unwrap().begins, 1);
+    }
+
+    #[tokio::test]
+    async fn a_rename_to_the_same_reference_is_a_noop_when_board_owned_and_blocked_when_linked() {
+        let before = c_0603_with("fp-1", "LOGO1", false);
+        let (result, sent, _) =
+            edit(before, Kicad::Keeps, json!({ "new_reference": "LOGO1" })).await;
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["status"], "unchanged");
+        assert_eq!(body["changed"], json!([]));
+        assert_eq!(sent.lock().unwrap().begins, 0);
+
+        let linked = c_0603_with("fp-1", "C1", true);
+        let (result, sent, _) = edit(linked, Kicad::Keeps, json!({ "new_reference": "C1" })).await;
+        assert!(result.is_error, "{}", text(&result));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("plan_blocked"),
+            "{}",
+            text(&result)
+        );
+        assert_eq!(sent.lock().unwrap().begins, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_new_reference_and_kiid_arguments_are_refused_before_ipc() {
+        let ctx = context("ipc:///nonexistent-copperpour-test-40.sock".to_string());
+        for (args, field) in [
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "new_reference": "" }),
+                "new_reference",
+            ),
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "new_reference": "   " }),
+                "new_reference",
+            ),
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "new_reference": "R 1" }),
+                "new_reference",
+            ),
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "new_reference": "R1\n" }),
+                "new_reference",
+            ),
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "new_reference": 42 }),
+                "new_reference",
+            ),
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "kiid": "" }),
+                "kiid",
+            ),
+            (
+                json!({ "board": "b.kicad_pcb", "reference": "R1", "kiid": 42 }),
+                "kiid",
+            ),
+        ] {
+            let result = handle_edit_component(&args, &ctx).await.unwrap();
+            assert!(result.is_error, "{args}: {}", text(&result));
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{args}: {}",
+                text(&result)
+            );
+            assert!(text(&result).contains(field), "{args}: {}", text(&result));
+        }
     }
 }
 

@@ -1276,8 +1276,7 @@ pub enum IpcFootprintFieldBatchOutcome {
     },
 }
 
-/// Readback-derived result of editing one text item in place, or one placed
-/// footprint's value, assembly flags and lock ([`IpcFootprintEdit`]).
+/// Readback-derived result of editing one text item in place.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcTextEditOutcome<T> {
     /// The item already held every requested value; nothing was sent.
@@ -1300,6 +1299,9 @@ pub enum IpcTextEditOutcome<T> {
 /// placed footprint. `None` leaves a property as KiCad holds it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpcFootprintEdit {
+    /// New reference designator. Permitted only on footprints not linked to a
+    /// schematic symbol.
+    pub new_reference: Option<String>,
     pub value: Option<String>,
     /// Do not populate.
     pub dnp: Option<bool>,
@@ -1312,7 +1314,8 @@ pub struct IpcFootprintEdit {
 impl IpcFootprintEdit {
     /// Whether the edit names no property at all.
     pub fn is_empty(&self) -> bool {
-        self.value.is_none()
+        self.new_reference.is_none()
+            && self.value.is_none()
             && self.dnp.is_none()
             && self.exclude_from_bom.is_none()
             && self.exclude_from_pos_files.is_none()
@@ -1320,10 +1323,12 @@ impl IpcFootprintEdit {
     }
 }
 
-/// A placed footprint's value, assembly flags and lock, as KiCad reports them
-/// on the instance, which is where KiCad reads them (`FOOTPRINT::Deserialize`).
+/// A placed footprint's identity, value, assembly flags and lock, as KiCad
+/// reports them on the instance, which is where KiCad reads them
+/// (`FOOTPRINT::Deserialize`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpcFootprintState {
+    pub kiid: String,
     pub reference: String,
     pub value: String,
     /// `Library:Footprint`, empty for a footprint without a library id.
@@ -1332,7 +1337,62 @@ pub struct IpcFootprintState {
     pub exclude_from_bom: bool,
     pub exclude_from_pos_files: bool,
     pub locked: bool,
-    /// Whether the footprint belongs to a schematic symbol, whose DNP and
-    /// BOM exclusion `update_pcb_from_schematic` carries to the board.
+    /// Whether the footprint belongs to a schematic symbol, whose reference,
+    /// DNP and BOM exclusion `update_pcb_from_schematic` carries to the board.
     pub linked_to_schematic: bool,
+}
+
+/// Outcome of reading a single placed footprint by reference and optional KIID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcFootprintLookupOutcome {
+    Found(IpcFootprintState),
+    /// The caller pinned a KIID that is absent or no longer carries the named
+    /// reference.
+    StaleTarget {
+        target: String,
+        reason: String,
+    },
+    /// No `kiid` was given and several footprints carry the reference;
+    /// `candidates` are their KIIDs, sorted.
+    AmbiguousTarget {
+        target: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
+}
+
+/// Outcome of [`crate::client::KiCadIpcClient::edit_footprint_in`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcFootprintEditOutcome {
+    /// The footprint already held the requested values; nothing was sent.
+    Unchanged { current: IpcFootprintState },
+    /// KiCad accepted the update and a fresh readback by KIID proved the
+    /// requested state.
+    Applied {
+        before: IpcFootprintState,
+        after: IpcFootprintState,
+    },
+    /// Refused before any write because applying the edit would violate a
+    /// safety invariant (e.g. renaming a schematic-linked footprint or
+    /// colliding with an existing reference).
+    Blocked { reason: String },
+    /// Refused before any write because the caller's KIID binding no longer
+    /// matches the live board.
+    StaleTarget { target: String, reason: String },
+    /// Refused before any write: no `kiid` was given and several footprints
+    /// carry the reference. `candidates` are their KIIDs, sorted.
+    AmbiguousTarget {
+        target: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
+    /// KiCad may have changed the footprint, but a fresh readback did not
+    /// prove the requested state.
+    Uncertain {
+        before: IpcFootprintState,
+        expected: IpcFootprintState,
+        observed: Option<IpcFootprintState>,
+        mismatches: Vec<String>,
+        reason: String,
+    },
 }

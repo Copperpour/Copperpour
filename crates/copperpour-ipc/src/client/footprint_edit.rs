@@ -1,10 +1,11 @@
-//! In-place edit of a placed footprint's value, its assembly flags (do not
-//! populate, exclude from BOM and exclude from position files) and its lock.
+//! In-place edit of a placed footprint's reference (for board-owned
+//! footprints), value, assembly flags (do not populate, exclude from BOM and
+//! exclude from position files) and lock.
 //!
 //! The contract is the one [`super::text_edit`] follows for fields: read the
 //! exact footprint, change only the requested properties on the message KiCad
 //! sent, send it in one KiCad undo step, then prove the result with a fresh
-//! read rather than echoing the request.
+//! read by KIID rather than echoing the request.
 
 use super::text_edit::{footprint_kiid, footprint_mismatches, settle, Settled};
 use super::*;
@@ -13,8 +14,30 @@ use crate::gen::kiapi::common::types as common;
 
 const FOOTPRINT_INSTANCE: &str = "kiapi.board.types.FootprintInstance";
 
-/// The value, assembly flags and lock of `footprint`, from its instance, which
-/// is where KiCad reads them.
+/// The schematic symbol path of `footprint`, or `None` when it is not linked
+/// to a schematic symbol.
+///
+/// KiCad's IPC layer sends a present-but-empty `SheetPath` (or all-empty
+/// KIIDs) for a footprint placed directly on the board (a logo, fiducial or
+/// mounting hole). Only a path with at least one non-empty KIID binds the
+/// footprint to a schematic symbol.
+fn linked_symbol_path(footprint: &board::FootprintInstance) -> Option<String> {
+    let path = footprint.symbol_path.as_ref()?;
+    if path.path.iter().all(|part| part.value.is_empty()) {
+        return None;
+    }
+    Some(format!(
+        "/{}",
+        path.path
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<Vec<_>>()
+            .join("/")
+    ))
+}
+
+/// The identity, value, assembly flags and lock of `footprint`, from its
+/// instance, which is where KiCad reads them.
 pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootprintState {
     let attributes = footprint.attributes.clone().unwrap_or_default();
     let field_text = |field: &Option<board::Field>| {
@@ -26,6 +49,7 @@ pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootpr
             .unwrap_or_default()
     };
     IpcFootprintState {
+        kiid: footprint_kiid(footprint),
         reference: field_text(&footprint.reference_field),
         value: field_text(&footprint.value_field),
         // As `list_footprints` writes it, which `edit_component` answered
@@ -40,22 +64,147 @@ pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootpr
         exclude_from_bom: attributes.exclude_from_bill_of_materials,
         exclude_from_pos_files: attributes.exclude_from_position_files,
         locked: footprint.locked == common::LockedState::LsLocked as i32,
-        linked_to_schematic: footprint
-            .symbol_path
-            .as_ref()
-            .is_some_and(|path| !path.path.is_empty()),
+        linked_to_schematic: linked_symbol_path(footprint).is_some(),
+    }
+}
+
+/// Select the one target footprint from `inventory`, pinning by `kiid` when
+/// provided or requiring `reference` to be unique otherwise.
+enum SelectedTarget<'a> {
+    Found(&'a board::FootprintInstance),
+    StaleTarget {
+        target: String,
+        reason: String,
+    },
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
+}
+
+fn select_footprint_target<'a>(
+    inventory: &'a [board::FootprintInstance],
+    reference: &str,
+    kiid: Option<&str>,
+) -> Result<SelectedTarget<'a>> {
+    if let Some(kiid) = kiid {
+        let matches: Vec<_> = inventory
+            .iter()
+            .filter(|footprint| footprint_kiid(footprint) == kiid)
+            .collect();
+        return match matches.len() {
+            0 => Ok(SelectedTarget::StaleTarget {
+                target: kiid.to_string(),
+                reason: format!(
+                    "No placed footprint on the board has KIID '{kiid}' (expected reference \
+                     '{reference}')"
+                ),
+            }),
+            1 => {
+                let footprint = matches[0];
+                let observed_ref = crate::builders::footprint_reference(footprint);
+                if observed_ref != reference {
+                    Ok(SelectedTarget::StaleTarget {
+                        target: kiid.to_string(),
+                        reason: format!(
+                            "Footprint KIID '{kiid}' currently has reference '{observed_ref}', \
+                             not '{reference}'"
+                        ),
+                    })
+                } else {
+                    Ok(SelectedTarget::Found(footprint))
+                }
+            }
+            n => Err(PreflightRefusal::check_failed(format!(
+                "KiCad listed {n} footprints with KIID '{kiid}'"
+            ))
+            .into()),
+        };
+    }
+
+    let matches: Vec<_> = inventory
+        .iter()
+        .filter(|footprint| crate::builders::footprint_reference(footprint) == reference)
+        .collect();
+    match matches.len() {
+        0 => Err(FootprintTargetError::Missing {
+            reference: reference.to_string(),
+        }
+        .into()),
+        1 => Ok(SelectedTarget::Found(matches[0])),
+        count => {
+            // Distinct KIIDs let the caller pick one with `kiid`; a KIID
+            // listed twice or missing is KiCad's inconsistency, not a choice.
+            let mut candidates: Vec<_> = matches
+                .iter()
+                .map(|footprint| {
+                    let at = footprint.position.unwrap_or_default();
+                    (
+                        footprint_kiid(footprint),
+                        at.x_nm as f64 / 1e6,
+                        at.y_nm as f64 / 1e6,
+                    )
+                })
+                .collect();
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            let distinct = candidates.windows(2).all(|pair| pair[0].0 != pair[1].0);
+            if !distinct || candidates.iter().any(|(kiid, ..)| kiid.is_empty()) {
+                return Err(FootprintTargetError::Ambiguous {
+                    reference: reference.to_string(),
+                    matches: count,
+                }
+                .into());
+            }
+            let listed: Vec<_> = candidates
+                .iter()
+                .map(|(kiid, x, y)| format!("{kiid} at ({x:.3}, {y:.3}) mm"))
+                .collect();
+            Ok(SelectedTarget::Ambiguous {
+                target: reference.to_string(),
+                reason: format!(
+                    "Footprint reference '{reference}' matches {count} placed footprints; pass \
+                     kiid to choose one: {}",
+                    listed.join(", ")
+                ),
+                candidates: candidates.into_iter().map(|(kiid, ..)| kiid).collect(),
+            })
+        }
     }
 }
 
 /// Apply `edit` to `footprint`. The flags go on the instance attributes:
 /// `FOOTPRINT::Deserialize` reads them there, and the definition's attributes
-/// carry only the description and keywords. The value goes on the instance's
-/// value field, with the definition's copy kept in step. The lock is the
-/// instance's own `locked`, which `FOOTPRINT::Deserialize` reads.
+/// carry only the description and keywords. The reference and value go on the
+/// instance's fields, with the definition's copies kept in step. The lock is
+/// the instance's own `locked`, which `FOOTPRINT::Deserialize` reads.
 fn apply_footprint_edit(
     footprint: &mut board::FootprintInstance,
     edit: &IpcFootprintEdit,
 ) -> Result<()> {
+    if let Some(new_reference) = &edit.new_reference {
+        let reference = footprint_state(footprint).reference;
+        let text = footprint
+            .reference_field
+            .as_mut()
+            .and_then(|field| field.text.as_mut())
+            .and_then(|board_text| board_text.text.as_mut())
+            .ok_or_else(|| {
+                PreflightRefusal::check_failed(format!(
+                    "Footprint '{reference}' has no editable reference field"
+                ))
+            })?;
+        text.text = new_reference.clone();
+        if let Some(text) = footprint
+            .definition
+            .as_mut()
+            .and_then(|definition| definition.reference_field.as_mut())
+            .and_then(|field| field.text.as_mut())
+            .and_then(|board_text| board_text.text.as_mut())
+        {
+            text.text = new_reference.clone();
+        }
+    }
     if let Some(value) = &edit.value {
         let reference = footprint_state(footprint).reference;
         let text = footprint
@@ -100,8 +249,8 @@ fn apply_footprint_edit(
 }
 
 /// Every difference between two states of the same footprint that this edit
-/// could plausibly touch: the value, the flags and the lock, the pose and
-/// every mandatory field.
+/// could plausibly touch: the reference, value, flags, lock, schematic link,
+/// pose and every mandatory field.
 fn edit_mismatches(
     expected: &board::FootprintInstance,
     observed: &board::FootprintInstance,
@@ -110,6 +259,12 @@ fn edit_mismatches(
     let mut out = Vec::new();
     // Compared here as well as in `footprint_mismatches`, which describes a
     // field only when KiCad sent its text attributes.
+    if want.reference != got.reference {
+        out.push(format!(
+            "reference: expected {:?}, observed {:?}",
+            want.reference, got.reference
+        ));
+    }
     if want.value != got.value {
         out.push(format!(
             "value: expected {:?}, observed {:?}",
@@ -129,6 +284,11 @@ fn edit_mismatches(
             got.exclude_from_pos_files,
         ),
         ("locked", want.locked, got.locked),
+        (
+            "linked_to_schematic",
+            want.linked_to_schematic,
+            got.linked_to_schematic,
+        ),
     ] {
         if want != got {
             out.push(format!("{name}: expected {want}, observed {got}"));
@@ -139,64 +299,129 @@ fn edit_mismatches(
 }
 
 impl KiCadIpcClient {
-    /// The value, assembly flags and lock of the one placed footprint with
-    /// `reference` on `document`.
+    /// The identity, value, assembly flags and lock of the one placed
+    /// footprint with `reference` (and optional exact `kiid`) on `document`.
     pub fn footprint_state_in(
         &self,
         document: common::DocumentSpecifier,
         reference: &str,
-    ) -> Result<IpcFootprintState> {
-        Ok(footprint_state(
-            &self.find_footprint_instance_in(document, reference)?,
-        ))
+        kiid: Option<&str>,
+    ) -> Result<IpcFootprintLookupOutcome> {
+        let inventory = self.footprint_inventory_in(document)?;
+        Ok(
+            match select_footprint_target(&inventory, reference, kiid)? {
+                SelectedTarget::Found(footprint) => {
+                    IpcFootprintLookupOutcome::Found(footprint_state(footprint))
+                }
+                SelectedTarget::StaleTarget { target, reason } => {
+                    IpcFootprintLookupOutcome::StaleTarget { target, reason }
+                }
+                SelectedTarget::Ambiguous {
+                    target,
+                    candidates,
+                    reason,
+                } => IpcFootprintLookupOutcome::AmbiguousTarget {
+                    target,
+                    candidates,
+                    reason,
+                },
+            },
+        )
     }
 
-    /// Change the value, the assembly flags and the lock of the one placed
-    /// footprint with `reference` on `document`, in one KiCad undo step.
+    /// Change the reference (for board-owned footprints), value, assembly
+    /// flags and lock of the one placed footprint with `reference` (and
+    /// optional exact `kiid`) on `document`, in one KiCad undo step.
     ///
     /// The whole footprint is sent back, as KiCad has no narrower update,
     /// with only the requested properties changed. Success requires a fresh
-    /// read in which the footprint holds every requested value, and its pose
-    /// and mandatory fields are otherwise unchanged. A footprint that already
-    /// holds the request is not sent. This method never saves the board.
+    /// read by KIID in which the footprint holds every requested value, and
+    /// its pose and mandatory fields are otherwise unchanged. A footprint that
+    /// already holds the request is not sent. This method never saves the
+    /// board.
     pub fn edit_footprint_in(
         &self,
         document: common::DocumentSpecifier,
         reference: &str,
+        kiid: Option<&str>,
         edit: &IpcFootprintEdit,
-    ) -> Result<IpcTextEditOutcome<IpcFootprintState>> {
+    ) -> Result<IpcFootprintEditOutcome> {
         anyhow::ensure!(!edit.is_empty(), "the edit names no property to change");
-        let footprint = self.find_footprint_instance_in(document.clone(), reference)?;
-        let kiid = footprint_kiid(&footprint);
-        if kiid.is_empty() {
+        let inventory = self.footprint_inventory_in(document.clone())?;
+        let footprint = match select_footprint_target(&inventory, reference, kiid)? {
+            SelectedTarget::Found(footprint) => footprint,
+            SelectedTarget::StaleTarget { target, reason } => {
+                return Ok(IpcFootprintEditOutcome::StaleTarget { target, reason });
+            }
+            SelectedTarget::Ambiguous {
+                target,
+                candidates,
+                reason,
+            } => {
+                return Ok(IpcFootprintEditOutcome::AmbiguousTarget {
+                    target,
+                    candidates,
+                    reason,
+                });
+            }
+        };
+        let target_kiid = footprint_kiid(footprint);
+        if target_kiid.is_empty() {
             return Err(PreflightRefusal::missing_footprint_kiid(reference).into());
         }
-        let before = footprint_state(&footprint);
+        let before = footprint_state(footprint);
+
+        if let Some(new_reference) = &edit.new_reference {
+            if let Some(symbol_path) = linked_symbol_path(footprint) {
+                return Ok(IpcFootprintEditOutcome::Blocked {
+                    reason: format!(
+                        "Footprint '{reference}' (KIID '{target_kiid}') is linked to schematic \
+                         symbol '{symbol_path}'. Direct board-side rename is refused so the board \
+                         and schematic do not silently diverge; rename the symbol with \
+                         edit_schematic_component and propagate with update_pcb_from_schematic"
+                    ),
+                });
+            }
+            if new_reference != &before.reference {
+                if let Some(other) = inventory.iter().find(|other| {
+                    footprint_kiid(other) != target_kiid
+                        && crate::builders::footprint_reference(other) == new_reference.as_str()
+                }) {
+                    let other_kiid = footprint_kiid(other);
+                    return Ok(IpcFootprintEditOutcome::Blocked {
+                        reason: format!(
+                            "Another footprint on the board (KIID '{other_kiid}') already has \
+                             reference '{new_reference}'. Choose a unique reference"
+                        ),
+                    });
+                }
+            }
+        }
 
         let mut edited = footprint.clone();
         apply_footprint_edit(&mut edited, edit)?;
         let expected = footprint_state(&edited);
         if expected == before {
-            return Ok(IpcTextEditOutcome::Unchanged { current: before });
+            return Ok(IpcFootprintEditOutcome::Unchanged { current: before });
         }
 
         let packed = crate::builders::pack_any(&edited, FOOTPRINT_INSTANCE);
         let mutation = self.run_commit("Edit footprint", |client| {
             client.update_items_in(document.clone(), vec![packed])
         });
-        let readback = self.footprint_by_kiid_in(document, &kiid);
+        let readback = self.footprint_by_kiid_in(document, &target_kiid);
         let observed = readback.as_ref().ok().map(footprint_state);
         let evidence = readback
             .as_ref()
             .map(|after| {
                 (
                     edit_mismatches(&edited, after),
-                    edit_mismatches(&footprint, after),
+                    edit_mismatches(footprint, after),
                 )
             })
             .map_err(|error| format!("{error:#}"));
         Ok(match settle(mutation, evidence) {
-            Settled::Applied => IpcTextEditOutcome::Applied {
+            Settled::Applied => IpcFootprintEditOutcome::Applied {
                 before,
                 after: observed.context("readback proved the edit but lost the footprint")?,
             },
@@ -206,7 +431,7 @@ impl KiCadIpcClient {
                      is unchanged",
                 ))
             }
-            Settled::Uncertain { mismatches, reason } => IpcTextEditOutcome::Uncertain {
+            Settled::Uncertain { mismatches, reason } => IpcFootprintEditOutcome::Uncertain {
                 before,
                 expected,
                 observed,
@@ -331,6 +556,71 @@ mod tests {
         assert!(
             mismatches.iter().any(|m| m.contains("value")),
             "{mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn a_rename_updates_instance_and_definition_reference_and_reports_mismatch() {
+        let mut before = footprint("10k", false);
+        before.definition.as_mut().unwrap().reference_field = before.reference_field.clone();
+        let mut edited = before.clone();
+        apply_footprint_edit(
+            &mut edited,
+            &IpcFootprintEdit {
+                new_reference: Some("LOGO1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(footprint_state(&edited).reference, "LOGO1");
+        assert_eq!(footprint_state(&edited).kiid, "fp-1");
+        let definition_ref = edited
+            .definition
+            .as_ref()
+            .unwrap()
+            .reference_field
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_str();
+        assert_eq!(definition_ref, "LOGO1");
+        let mismatches = edit_mismatches(&edited, &before);
+        assert!(
+            mismatches
+                .iter()
+                .any(|m| m.contains("reference: expected \"LOGO1\", observed \"R1\"")),
+            "{mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn an_all_empty_sheet_path_is_not_linked_to_a_schematic() {
+        let mut fp = footprint("10k", false);
+        fp.symbol_path = Some(common::SheetPath {
+            path: vec![common::Kiid {
+                value: String::new(),
+            }],
+            path_human_readable: "/".to_string(),
+        });
+        assert!(!footprint_state(&fp).linked_to_schematic);
+        assert_eq!(linked_symbol_path(&fp), None);
+
+        fp.symbol_path = Some(common::SheetPath {
+            path: vec![common::Kiid {
+                value: "11111111-1111-1111-1111-111111111111".to_string(),
+            }],
+            path_human_readable: String::new(),
+        });
+        assert!(footprint_state(&fp).linked_to_schematic);
+        assert_eq!(
+            linked_symbol_path(&fp).as_deref(),
+            Some("/11111111-1111-1111-1111-111111111111")
         );
     }
 }
