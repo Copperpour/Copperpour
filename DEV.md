@@ -325,7 +325,7 @@ Add or remove the affected row in [the tool directory](tool-directory.md).
 
 ## Current Stats
 
-- **26 toolsets, 281 tools** + 9 meta-tools (5 routing + 2 observability + 1 guidance + 1 runtime
+- **27 toolsets, 281 tools** + 9 meta-tools (5 routing + 2 observability + 1 guidance + 1 runtime
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens. Full catalogue: 290 tools (281 registered + 9 meta) / ~25K tokens.

@@ -83,7 +83,7 @@ Never send pending reports without the user's answer. If the user does not choos
 
 | User Request | Channel | Tool / Action |
 |---|---|---|
-| "Review my schematic" | 2 | Load `sch_analysis` toolset, use analysis tools |
+| "Review my schematic" | 2 | Load `sch_analysis` for connectivity and `sch_readability` for drawing checks |
 | "Change R5 from 10k to 4.7k" | 1 | `load_toolset("sch_components")` then `edit_schematic_component` |
 | "Mark C7 do-not-populate" | 1 | `load_toolset("sch_components")` then `edit_schematic_component` with `dnp: true` (KiCad's native attribute; a property named DNP is not that attribute, and is refused), then confirm `dnp` in `get_schematic_component` |
 | "What's connected to SCL?" | 2 | `load_toolset("sch_analysis")` then `get_net_connections` |
@@ -124,7 +124,7 @@ unload_toolset("name")  → Remove a toolset when done
 | Category | Toolsets |
 |----------|----------|
 | Project | project |
-| Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_batch, sch_export, sch_hierarchy |
+| Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_readability, sch_batch, sch_export, sch_hierarchy |
 | PCB | pcb_board, pcb_text, pcb_rule_areas, pcb_components, pcb_routing, pcb_copper, pcb_export, placement |
 | Library | library, library_maintenance, model_3d |
 | Integration | integration (JLCPCB parts, Freerouting installation checks, datasheets) |

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **26 toolsets** organized into 10 categories
+- **27 toolsets** organized into 10 categories
 - **281 registered tools** + **9 always-visible meta-tools** = **290 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -35,7 +35,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 26 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 27 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `find_tools` | Search registered KiCad tools by name or capability across loaded and unloaded toolsets. Returns ranked tool names, descriptions, owning toolsets, and load state without changing the listing. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `call_tool` | Call a tool by name, whether or not its toolset is loaded or listed. `tools/list` does not change. For clients that never see tools added after their first listing. Runs only the reviewed read-only tools unless the operator sets `call_tool_allow_writes = true` in the server configuration; anything else is refused with `tool_not_permitted` before it runs. Never runs itself or `reload_server`. |
@@ -167,7 +167,7 @@ and Windows servers do not.
 | `connect_pins_to_bus` | Fan a set of pins onto a bus: wire stub + bus entry + member label per pin. Bus membership is by name, so the label is part of the connection, not decoration. |
 
 ### `sch_analysis` · 15 tools
-**Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
+**Purpose:** Net connectivity, pin queries, trace paths, and orphan detection.
 **Source:** [`crates/copperpour-core/src/tools/sch_analysis.rs`](crates/copperpour-core/src/tools/sch_analysis.rs)
 
 | Tool | Description |
@@ -183,12 +183,20 @@ and Windows servers do not.
 | `get_net_components` | Get all components (and their pins) connected to a named net. |
 | `trace_from_point` | Trace connectivity from any (X,Y) point — returns the wires, labels, component pins and junction dots at that point, and the net it belongs to. Hierarchical sheet pins and no-connect flags are not reported, so an empty pins_here does not prove a wire dangles. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
-| `find_pin_contacts` | Report visible pins touching on distinct symbols and branch-free pin-to-pin runs shorter than `min_wire_mm` (default 2.54 mm). Read-only drawing check on one saved sheet. |
-| `compare_schematic_layout` | Score a saved schematic sheet, including wires crossing visible Reference or Value text on ordinary symbols. Compare with a saved baseline after checking pin connectivity and symbol identity. Does not write or run KiCad. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
+
+### `sch_readability` · 4 tools
+**Purpose:** Read-only drawing and layout checks on saved schematic sheets.
+**Source:** [`crates/copperpour-core/src/tools/sch_readability.rs`](crates/copperpour-core/src/tools/sch_readability.rs)
+
+| Tool | Description |
+|------|-------------|
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text). Report wires drawn through a symbol body, label text, visible power symbol Value text, or visible Reference or Value text on ordinary symbols. Name symbols checked using the origin fallback. |
+| `check_schematic_wire_runs` | Report long or indirect orthogonal wire runs, including collinear backtracking, on one saved sheet. Includes drawn length, detour length, bends and endpoint status. Read-only. |
+| `compare_schematic_layout` | Score a saved schematic sheet, including wires crossing visible Reference or Value text on ordinary symbols. Compare with a saved baseline after checking pin connectivity and symbol identity. Does not write or run KiCad. |
+| `find_pin_contacts` | Report visible pins touching on distinct symbols and branch-free pin-to-pin runs shorter than `min_wire_mm` (default 2.54 mm). Read-only drawing check on one saved sheet. |
 
 ### `sch_batch` · 19 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items; add and list graphic shapes.

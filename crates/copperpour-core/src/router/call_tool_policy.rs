@@ -68,11 +68,13 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "get_schematic_component",
     "get_schematic_pin_locations",
     "list_schematic_components",
-    // sch_analysis
+    // sch_readability
     "check_schematic_overlaps",
+    "check_schematic_wire_runs",
     "compare_schematic_layout",
-    "find_orphan_items",
     "find_pin_contacts",
+    // sch_analysis
+    "find_orphan_items",
     "find_shorted_nets",
     "find_single_pin_nets",
     "get_component_nets",
