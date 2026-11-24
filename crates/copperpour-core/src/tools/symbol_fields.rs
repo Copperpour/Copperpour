@@ -8,6 +8,7 @@ use crate::tools::footprint_metadata::{indent_before, quote_string};
 use crate::tools::library::skip_sexp_token;
 use crate::tools::sch_annotate::opt_string;
 use crate::tools::{invalid_arg, opt_str_list, ToolContext, ToolDef};
+use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::writer::{
     apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
     SexpEdit,
@@ -101,6 +102,46 @@ pub(super) struct SymbolFields {
     /// Custom fields to put first, in this order (#717); only
     /// `set_symbol_properties` takes it.
     pub(super) field_order: Option<Vec<String>>,
+    /// Fields to move, turn or hide, in name order (#867); only
+    /// `set_symbol_properties` takes it.
+    pub(super) placements: Vec<(String, FieldPlacement)>,
+}
+
+/// What `field_placements` sets on one library field; `None` leaves that part
+/// as the file has it. Coordinates are the library file's own: millimetres
+/// from the symbol's origin, y up (KiCad negates y when it reads a library,
+/// `SCH_IO_KICAD_SEXPR_PARSER::parseProperty`, and again when it writes one,
+/// `SCH_IO_KICAD_SEXPR_LIB_CACHE::saveField`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct FieldPlacement {
+    x: Option<f64>,
+    y: Option<f64>,
+    rotation: Option<f64>,
+    hide: Option<bool>,
+}
+
+/// A library field's position, text angle and visibility as KiCad reads them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FieldState {
+    x: f64,
+    y: f64,
+    rotation: f64,
+    hidden: bool,
+}
+
+impl FieldState {
+    fn json(self) -> serde_json::Value {
+        json!({ "x": self.x, "y": self.y, "rotation": self.rotation, "hide": self.hidden })
+    }
+
+    fn placed(self, placement: &FieldPlacement) -> Self {
+        Self {
+            x: placement.x.unwrap_or(self.x),
+            y: placement.y.unwrap_or(self.y),
+            rotation: placement.rotation.unwrap_or(self.rotation),
+            hidden: placement.hide.unwrap_or(self.hidden),
+        }
+    }
 }
 
 impl SymbolFields {
@@ -259,7 +300,117 @@ fn parse_symbol_edits(
     fields.renames = parse_rename_fields(args, fields)?;
     fields.removals = parse_remove_fields(args, fields)?;
     fields.field_order = parse_field_order(args, fields)?;
+    fields.placements = parse_field_placements(args, fields)?;
     Ok(())
+}
+
+/// KiCad's schematic resolution: 0.0001 mm (`schIUScale`, 10 000 IU per mm).
+/// A finer coordinate is rounded to it, as KiCad rounds it on load.
+fn to_schematic_resolution(mm: f64) -> f64 {
+    let rounded = (mm * 10_000.0).round() / 10_000.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+/// A text angle in `[0, 360)`, as `edit_schematic_component`'s
+/// `field_placements` writes it.
+fn normalize_rotation(degrees: f64) -> f64 {
+    let wrapped = degrees.rem_euclid(360.0);
+    if wrapped == 0.0 || wrapped == 360.0 {
+        0.0
+    } else {
+        wrapped
+    }
+}
+
+/// `field_placements`, checked in full before the library is read. A field is
+/// named as this call leaves it: a field renamed in the same call by its new
+/// name, and one removed in it not at all. Whether the symbol has the field is
+/// checked on the library, after the call's other changes.
+fn parse_field_placements(
+    args: &serde_json::Value,
+    fields: &SymbolFields,
+) -> Result<Vec<(String, FieldPlacement)>, CallToolResult> {
+    let map = match args.get("field_placements") {
+        None => return Ok(Vec::new()),
+        Some(serde_json::Value::Object(map)) if !map.is_empty() => map,
+        Some(_) => {
+            return Err(invalid_arg(
+                "field_placements",
+                "expected a non-empty object of field name: {x?, y?, rotation?, hide?}",
+            ))
+        }
+    };
+    let mut placements = Vec::new();
+    for (name, spec) in map {
+        let argument = format!("field_placements.{name}");
+        let refusal = if name.is_empty() {
+            Some("a field name must be non-empty".to_string())
+        } else if is_ki_name(name) {
+            Some(format!("'{name}' {KI_RESERVED}, which it never draws"))
+        } else if fields.removals.iter().any(|removed| removed == name) {
+            Some(format!(
+                "'{name}' is also named in remove_fields; a call cannot both remove and place a field"
+            ))
+        } else {
+            fields
+                .renames
+                .iter()
+                .find(|(old, new)| old == name && old != new)
+                .map(|(_, new)| {
+                    format!("'{name}' is renamed to '{new}' in the same call; place it as '{new}'")
+                })
+        };
+        if let Some(reason) = refusal {
+            return Err(invalid_arg(&argument, &reason));
+        }
+        let spec = spec
+            .as_object()
+            .ok_or_else(|| invalid_arg(&argument, "must be an object of x, y, rotation, hide"))?;
+        let mut placement = FieldPlacement::default();
+        for (key, value) in spec {
+            let part = format!("{argument}.{key}");
+            match key.as_str() {
+                "x" | "y" | "rotation" => {
+                    let number = value
+                        .as_f64()
+                        .filter(|number| number.is_finite())
+                        .ok_or_else(|| invalid_arg(&part, "expected a finite number"))?;
+                    match key.as_str() {
+                        "x" => placement.x = Some(to_schematic_resolution(number)),
+                        "y" => placement.y = Some(to_schematic_resolution(number)),
+                        _ => placement.rotation = Some(normalize_rotation(number)),
+                    }
+                }
+                "hide" => {
+                    placement.hide = Some(
+                        value
+                            .as_bool()
+                            .ok_or_else(|| invalid_arg(&part, "expected true or false"))?,
+                    );
+                }
+                _ => {
+                    return Err(invalid_arg(
+                        &part,
+                        "unknown key; a placement takes x, y, rotation and hide",
+                    ))
+                }
+            }
+        }
+        if placement == FieldPlacement::default() {
+            return Err(invalid_arg(
+                &argument,
+                "sets nothing; give x, y, rotation or hide",
+            ));
+        }
+        placements.push((name.clone(), placement));
+    }
+    // Name order, whatever order the JSON map keeps its keys in.
+    placements.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(placements)
 }
 
 /// `field_order`: custom field names, each once, none mandatory, `ki_*` or
@@ -482,9 +633,11 @@ pub(super) fn tool() -> ToolDef {
         "set_symbol_properties",
         "Set the Reference prefix, Value, Footprint, Datasheet, Description, keywords, footprint filters or custom fields \
          (MPN, LCSC, ...) of an existing library symbol, rename or remove its custom fields, and \
-         reorder them (field_order). Only the supplied fields change; an existing or renamed \
-         field keeps its position and visibility. Reports each changed field's previous and \
-         current value, and the previous and current custom field order.",
+         reorder them (field_order), and move, turn or hide any field's text \
+         (field_placements). Only the supplied fields change; an existing or renamed \
+         field keeps its position and visibility unless field_placements names it. Reports each \
+         changed field's previous and current value, the previous and current custom field \
+         order, and each placed field's previous and current placement.",
         with_field_schema(json!({
             "type": "object",
             "properties": {
@@ -508,6 +661,21 @@ pub(super) fn tool() -> ToolDef {
                     "type": "array",
                     "description": "Custom field names to delete from the symbol. KiCad's mandatory fields (Reference, Value, Footprint, Datasheet, Description) and ki_* names cannot be removed. A name the symbol does not carry is reported in absent_fields.",
                     "items": { "type": "string" }
+                },
+                "field_placements": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "description": "Move, turn or hide a field's text, keyed by field name (Reference, Value, Footprint, Datasheet, Description, or a custom field) as this call leaves it: a field renamed in the same call by its new name, a field added in it too. Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are millimetres in the symbol's own frame, as the library file and create_symbol use them: from the symbol's origin, with y up. They are rounded to KiCad's 0.0001 mm. A name the symbol does not carry is refused before writing; ki_* names cannot be placed.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "number" },
+                            "y": { "type": "number", "description": "Up is positive, as the library file stores it." },
+                            "rotation": { "type": "number", "description": "Text angle in degrees, stored in [0, 360). KiCad's Symbol Properties dialog offers 0 (horizontal) and 90 (vertical)." },
+                            "hide": { "type": "boolean", "description": "true hides the field's text; false shows it." }
+                        },
+                        "additionalProperties": false
+                    }
                 }
             },
             "required": ["library_path", "symbol_name"],
@@ -540,7 +708,8 @@ async fn handle_set_symbol_properties(
         return Ok(invalid_arg(
             "symbol_properties",
             "supply at least one of reference_prefix, value, footprint, datasheet, description, \
-             keywords, fp_filters, fields, rename_fields, remove_fields or field_order",
+             keywords, fp_filters, fields, rename_fields, remove_fields, field_order or \
+             field_placements",
         ));
     }
     let source = match read_consistent(&path) {
@@ -557,6 +726,7 @@ async fn handle_set_symbol_properties(
         replacement,
         changes,
         field_order,
+        placements,
     } = match prepare_edit(&path, &source, symbol, &fields) {
         Ok(edit) => edit,
         Err(error) => return Ok(error),
@@ -578,6 +748,9 @@ async fn handle_set_symbol_properties(
     });
     if let Some((previous, current)) = field_order {
         body["field_order"] = json!({ "previous": previous, "current": current });
+    }
+    if !placements.is_empty() {
+        body["field_placements"] = serde_json::Value::Object(placements);
     }
     if !fields.removals.is_empty() {
         // Only a removal puts a remove_fields name into `changes`, since each
@@ -663,6 +836,9 @@ struct PreparedEdit {
     changes: serde_json::Map<String, serde_json::Value>,
     /// The custom fields' order before and after, when `field_order` was given.
     field_order: Option<(Vec<String>, Vec<String>)>,
+    /// `{field: {"previous": placement, "current": placement}}` for each field
+    /// `field_placements` names, changed or not.
+    placements: serde_json::Map<String, serde_json::Value>,
 }
 
 pub(super) struct Property {
@@ -876,11 +1052,266 @@ fn prepare_edit(
         }
         None => None,
     };
+    // Placements come after everything else, so they may name a field added
+    // or renamed in the same call.
+    let mut placements = serde_json::Map::new();
+    if !fields.placements.is_empty() {
+        let (placed, report) = place_fields(path, &replacement, symbol, &fields.placements)?;
+        replacement = placed;
+        placements = report;
+    }
     Ok(PreparedEdit {
         replacement,
         changes,
         field_order,
+        placements,
     })
+}
+
+/// A direct child of a list: its span, and its head when it is a list.
+struct Child<'a> {
+    span: (usize, usize),
+    head: Option<&'a str>,
+}
+
+/// The direct children of the list at `block`, after its head.
+fn list_children(text: &str, block: (usize, usize)) -> Option<Vec<Child<'_>>> {
+    let close = block.1 - 1;
+    let (_, mut index) = skip_sexp_token(text, block.0 + 1)?;
+    let mut children = Vec::new();
+    loop {
+        while text.as_bytes()[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= close {
+            return Some(children);
+        }
+        let child = if text.as_bytes()[index] == b'(' {
+            let span = copperpour_sexp::writer::find_balanced_block(text, index)?;
+            let (head_start, head_end) = skip_sexp_token(text, span.0 + 1)?;
+            Child {
+                span,
+                head: Some(&text[head_start..head_end]),
+            }
+        } else {
+            Child {
+                span: skip_sexp_token(text, index)?,
+                head: None,
+            }
+        };
+        index = child.span.1;
+        children.push(child);
+    }
+}
+
+/// Where a library field's placement sits in its `(property …)` block.
+struct FieldLayout {
+    state: FieldState,
+    /// The `(at x y angle)` child.
+    at: (usize, usize),
+    /// The `(effects …)` child, when the field has one.
+    effects: Option<(usize, usize)>,
+    /// Every flag that hides the text: a `(hide …)` child of the property,
+    /// as KiCad 9 and later write it, or a `hide` or `(hide …)` in its
+    /// `(effects …)`, as KiCad 6 to 8 wrote it. KiCad reads both, in any file
+    /// version, the later one winning (`SCH_IO_KICAD_SEXPR_PARSER::
+    /// parseProperty` and `parseEDA_TEXT`).
+    hide_flags: Vec<(usize, usize)>,
+}
+
+/// Whether a hide flag reads as hidden: a bare `hide`, `(hide)`, or `(hide
+/// yes)`; KiCad's `parseMaybeAbsentBool` takes anything but `no` as yes.
+fn hides(text: &str, flag: (usize, usize)) -> bool {
+    let token = &text[flag.0..flag.1];
+    let inner = token
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim_start_matches("hide")
+        .trim();
+    inner != "no"
+}
+
+/// The placement of the `(property …)` block at `block`, or why it cannot be
+/// read.
+fn field_layout(text: &str, block: (usize, usize)) -> Result<FieldLayout, String> {
+    let children = list_children(text, block).ok_or("it does not parse")?;
+    let ats: Vec<&Child> = children
+        .iter()
+        .filter(|child| child.head == Some("at"))
+        .collect();
+    let [at] = ats.as_slice() else {
+        return Err(format!("it has {} (at …) placements, not one", ats.len()));
+    };
+    let raw = &text[at.span.0 + 1..at.span.1 - 1];
+    let values: Vec<&str> = raw.split_whitespace().skip(1).collect();
+    let numbers: Vec<f64> = values
+        .iter()
+        .map(|value| value.parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()
+        .ok_or_else(|| format!("its placement `({raw})` is not numeric"))?;
+    // KiCad writes `(at x y angle)`; it reads the angle unconditionally, so a
+    // placement without one is not one it wrote.
+    let [x, y, rotation] = numbers.as_slice() else {
+        return Err(format!(
+            "its placement `({raw})` does not hold x, y and an angle"
+        ));
+    };
+    let effects = children
+        .iter()
+        .find(|child| child.head == Some("effects"))
+        .map(|child| child.span);
+    // File order, so the last flag is the one KiCad keeps.
+    let mut hide_flags: Vec<(usize, usize)> = Vec::new();
+    for child in &children {
+        if child.head == Some("hide") {
+            hide_flags.push(child.span);
+        }
+        if child.head == Some("effects") {
+            let inner = list_children(text, child.span).ok_or("its effects do not parse")?;
+            hide_flags.extend(
+                inner
+                    .iter()
+                    .filter(|flag| {
+                        flag.head == Some("hide")
+                            || (flag.head.is_none() && &text[flag.span.0..flag.span.1] == "hide")
+                    })
+                    .map(|flag| flag.span),
+            );
+        }
+    }
+    let hidden = hide_flags.last().is_some_and(|flag| hides(text, *flag));
+    Ok(FieldLayout {
+        state: FieldState {
+            x: *x,
+            y: *y,
+            rotation: *rotation,
+            hidden,
+        },
+        at: at.span,
+        effects,
+        hide_flags,
+    })
+}
+
+/// The span to delete to take out the token at `span`: with the whitespace
+/// before it, back to the line break when the token had its line to itself,
+/// and otherwise only the spaces between it and its neighbour.
+fn token_removal(text: &str, span: (usize, usize)) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let mut from = span.0;
+    while from > 0 && matches!(bytes[from - 1], b' ' | b'\t') {
+        from -= 1;
+    }
+    let alone = (from == 0 || bytes[from - 1] == b'\n') && text[span.1..].starts_with(['\r', '\n']);
+    if alone && from > 0 {
+        from -= 1;
+        if from > 0 && bytes[from - 1] == b'\r' {
+            from -= 1;
+        }
+    }
+    (from, span.1)
+}
+
+/// `text` with each of `placements` applied to `symbol`'s fields, and the
+/// report of each: its placement before and after. Only the field's
+/// `(at …)` and hide flags change. A hidden field gets KiCad 10's
+/// `(hide yes)`, before its `(effects …)` as KiCad writes it
+/// (`SCH_IO_KICAD_SEXPR_LIB_CACHE::saveField`); a shown one loses every flag
+/// that hid it, in either form.
+fn place_fields(
+    path: &Path,
+    text: &str,
+    symbol: &str,
+    placements: &[(String, FieldPlacement)],
+) -> Result<(String, serde_json::Map<String, serde_json::Value>), CallToolResult> {
+    let (start, end) = symbol_block(text, symbol)?;
+    let properties =
+        symbol_properties(text, start, end).map_err(|reason| unusable(path, &reason))?;
+    let mut edits = Vec::new();
+    let mut report = serde_json::Map::new();
+    for (name, placement) in placements {
+        let Some(property) = field(&properties, name) else {
+            let names = properties
+                .iter()
+                .filter(|property| !is_ki_name(&property.name))
+                .map(|property| format!("'{}'", property.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(invalid_arg(
+                &format!("field_placements.{name}"),
+                &format!("symbol '{symbol}' has no field '{name}'; its fields are {names}"),
+            ));
+        };
+        let layout = field_layout(text, property.block).map_err(|reason| {
+            unusable(
+                path,
+                &format!("the '{name}' field of symbol '{symbol}' cannot be placed: {reason}"),
+            )
+        })?;
+        let current = layout.state.placed(placement);
+        if (current.x, current.y, current.rotation)
+            != (layout.state.x, layout.state.y, layout.state.rotation)
+        {
+            edits.push(SexpEdit::replace(
+                layout.at.0,
+                layout.at.1,
+                format!(
+                    "(at {} {} {})",
+                    fmt_f64(current.x),
+                    fmt_f64(current.y),
+                    fmt_f64(current.rotation)
+                ),
+            ));
+        }
+        match (current.hidden, layout.state.hidden) {
+            (true, false) => {
+                // Flags that read as shown go, so the new one is the only one.
+                for flag in &layout.hide_flags {
+                    let (from, to) = token_removal(text, *flag);
+                    edits.push(SexpEdit::delete(from, to));
+                }
+                let (anchor, before) = match layout.effects {
+                    Some(effects) => (effects.0, true),
+                    None => (layout.at.1, false),
+                };
+                let line_start = text[..anchor].rfind('\n').map_or(0, |nl| nl + 1);
+                let indent: String = text[line_start..anchor]
+                    .chars()
+                    .take_while(|c| matches!(c, ' ' | '\t'))
+                    .collect();
+                let on_own_line = text[line_start..anchor].trim().is_empty();
+                // The file's own line break, so a CRLF library stays CRLF.
+                let newline = if text[..line_start].ends_with("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                let inserted = match (before, on_own_line) {
+                    (true, true) => format!("(hide yes){newline}{indent}"),
+                    _ => " (hide yes)".to_string(),
+                };
+                let at = if before && !on_own_line {
+                    // `(at …) (effects …)` on one line: the flag goes between.
+                    layout.at.1
+                } else {
+                    anchor
+                };
+                edits.push(SexpEdit::insert(at, inserted));
+            }
+            (false, true) => {
+                for flag in &layout.hide_flags {
+                    let (from, to) = token_removal(text, *flag);
+                    edits.push(SexpEdit::delete(from, to));
+                }
+            }
+            _ => {}
+        }
+        report.insert(
+            name.clone(),
+            json!({ "previous": layout.state.json(), "current": current.json() }),
+        );
+    }
+    Ok((apply_edits(text.to_string(), edits), report))
 }
 
 /// Whether KiCad writes `name` among a symbol's custom fields: not mandatory,
@@ -1116,6 +1547,13 @@ fn readback_mismatch(
                     return Some(format!("field '{old}' is still present after its rename"));
                 }
                 let was = exact(&original, old)?;
+                // A field placed in the same call keeps its value; the
+                // placement check reads its new place.
+                if fields.placements.iter().any(|(placed, _)| placed == new) {
+                    let value = exact(&properties, new).map(|p| p.value.as_str());
+                    return (value != Some(was.value.as_str()))
+                        .then(|| format!("field '{new}' does not keep the value of '{old}'"));
+                }
                 let expected = format!(
                     "{}{}{}",
                     &before[was.block.0..was.name_span.0],
@@ -1133,7 +1571,24 @@ fn readback_mismatch(
         (!found.starts_with(order))
             .then(|| format!("the custom fields read {found:?}, not starting with {order:?}"))
     };
-    requested.or_else(removed).or_else(renamed).or_else(ordered)
+    let placed = || {
+        fields.placements.iter().find_map(|(name, placement)| {
+            let Some(property) = field(&properties, name) else {
+                return Some(format!("field '{name}' is gone after its placement"));
+            };
+            let state = match field_layout(written, property.block) {
+                Ok(layout) => layout.state,
+                Err(reason) => return Some(format!("field '{name}' cannot be read: {reason}")),
+            };
+            (state.placed(placement) != state)
+                .then(|| format!("field '{name}' reads {}", state.json()))
+        })
+    };
+    requested
+        .or_else(removed)
+        .or_else(renamed)
+        .or_else(ordered)
+        .or_else(placed)
 }
 
 #[cfg(test)]
@@ -2396,7 +2851,7 @@ pub(super) mod tests {
             (
                 json!({"rename_fields": {}, "remove_fields": []}),
                 "symbol_properties",
-                "supply at least one of reference_prefix, value, footprint, datasheet, description, keywords, fp_filters, fields, rename_fields, remove_fields or field_order",
+                "supply at least one of reference_prefix, value, footprint, datasheet, description, keywords, fp_filters, fields, rename_fields, remove_fields, field_order or field_placements",
             ),
         ] {
             let (_dir, path) = library_with(FIXTURE);
@@ -2752,5 +3207,354 @@ pub(super) mod tests {
         );
         let reason = readback_mismatch(ORDER_SOURCE, ORDER_SOURCE, "CAP", &fields).unwrap();
         assert!(reason.contains("not starting with"), "{reason}");
+    }
+
+    /// The tool's output for two `field_placements` calls on FIXTURE, which
+    /// KiCad 10.0.8 resaves unchanged; see symbol_fields_kicad10.placed.README.md.
+    const PLACED: &str =
+        include_str!("../../tests/fixtures/symbol_fields_kicad10.placed.kicad_sym");
+    /// The same for KICAD7, and KiCad 10.0.8's resave of it.
+    const KICAD7_PLACED: &str =
+        include_str!("../../tests/fixtures/fiber_optic_kicad7.placed.kicad_sym");
+    const KICAD7_PLACED_RESAVED: &str =
+        include_str!("../../tests/fixtures/fiber_optic_kicad7.placed.resaved.kicad_sym");
+
+    /// How `source`'s `symbol` places `name`, as KiCad reads it.
+    fn placement_of(source: &str, symbol: &str, name: &str) -> FieldState {
+        let (start, end) = symbol_block(source, symbol).unwrap();
+        let properties = symbol_properties(source, start, end).unwrap();
+        field_layout(source, field(&properties, name).unwrap().block)
+            .unwrap()
+            .state
+    }
+
+    fn state(x: f64, y: f64, rotation: f64, hidden: bool) -> FieldState {
+        FieldState {
+            x,
+            y,
+            rotation,
+            hidden,
+        }
+    }
+
+    /// Moving, turning, showing and hiding fields writes what KiCad 10.0.8
+    /// resaves unchanged, and reports each field's placement before and after.
+    #[tokio::test]
+    async fn field_placements_write_what_kicad_resaves() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+
+        let bare = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_BARE",
+            json!({"field_placements": {
+                "Reference": {"y": 6.35},
+                "Value": {"y": -6.35, "rotation": 90},
+                "Footprint": {"hide": false, "x": 2.54, "y": -8.89}
+            }}),
+        )
+        .await;
+        assert_ne!(bare["is_error"], true, "{bare}");
+        assert_eq!(
+            bare["field_placements"]["Value"],
+            json!({
+                "previous": {"x": 0.0, "y": -5.08, "rotation": 0.0, "hide": false},
+                "current": {"x": 0.0, "y": -6.35, "rotation": 90.0, "hide": false}
+            })
+        );
+        assert_eq!(
+            bare["field_placements"]["Footprint"]["previous"]["hide"],
+            true
+        );
+        assert_eq!(bare["changes"], json!({}));
+
+        let full = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"field_placements": {
+                "Value": {"hide": true},
+                "MPN": {"hide": false, "x": 0, "y": -10.16}
+            }}),
+        )
+        .await;
+        assert_ne!(full["is_error"], true, "{full}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PLACED);
+    }
+
+    /// A field a KiCad 6 to 8 library hides inside its `(effects …)` is shown
+    /// by taking that flag out, and a field hidden there gets KiCad 10's
+    /// `(hide yes)`; KiCad reads both as asked.
+    #[tokio::test]
+    async fn field_placements_reach_kicad_in_a_kicad7_library() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(KICAD7);
+        assert!(placement_of(KICAD7, "AFBR-1624Z", "Footprint").hidden);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "AFBR-1624Z",
+            json!({"field_placements": {
+                "Footprint": {"hide": false},
+                "Reference": {"hide": true, "x": -7.62, "y": 10.16}
+            }}),
+        )
+        .await;
+
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD7_PLACED);
+        assert_eq!(
+            placement_of(KICAD7_PLACED_RESAVED, "AFBR-1624Z", "Reference"),
+            state(-7.62, 10.16, 0.0, true)
+        );
+        assert_eq!(
+            placement_of(KICAD7_PLACED_RESAVED, "AFBR-1624Z", "Footprint"),
+            state(0.0, -15.24, 0.0, false)
+        );
+    }
+
+    /// A field is named as the call leaves it: one added or renamed in the
+    /// same call can be placed.
+    #[tokio::test]
+    async fn field_placements_name_fields_as_the_call_leaves_them() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({
+                "fields": {"Manufacturer": "TI"},
+                "rename_fields": {"LCSC": "LCSC Part"},
+                "field_placements": {
+                    "Manufacturer": {"hide": false, "y": -7.62},
+                    "LCSC Part": {"hide": false, "y": -8.89}
+                }
+            }),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            placement_of(&written, "FIELDS_FULL", "Manufacturer"),
+            state(0.0, -7.62, 0.0, false)
+        );
+        assert_eq!(
+            placement_of(&written, "FIELDS_FULL", "LCSC Part"),
+            state(0.0, -8.89, 0.0, false)
+        );
+    }
+
+    /// A placement the field already has writes nothing.
+    #[tokio::test]
+    async fn a_placement_the_field_already_has_writes_nothing() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_BARE",
+            json!({"field_placements": {"Reference": {"x": 0, "y": 5.08, "hide": false}}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["field_placements"]["Reference"]["previous"],
+            body["field_placements"]["Reference"]["current"]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
+    /// A coordinate finer than KiCad's 0.0001 mm is rounded to it, and the
+    /// angle is written in [0, 360).
+    #[tokio::test]
+    async fn a_placement_is_written_at_kicad_s_resolution() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_BARE",
+            json!({"field_placements": {"Value": {"x": 1.234_56, "y": -5.000_04, "rotation": -270}}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("(at 1.2346 -5 90)"), "{written}");
+        assert_eq!(
+            body["field_placements"]["Value"]["current"],
+            json!({"x": 1.2346, "y": -5.0, "rotation": 90.0, "hide": false})
+        );
+    }
+
+    /// A library saved with CRLF line breaks keeps them where a field is
+    /// hidden.
+    #[tokio::test]
+    async fn hiding_a_field_keeps_a_crlf_library_crlf() {
+        let handler = handler().await;
+        let crlf = FIXTURE.replace('\n', "\r\n");
+        let (_dir, path) = library_with(&crlf);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_BARE",
+            json!({"field_placements": {"Reference": {"hide": true}}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(written, crlf);
+        assert_eq!(
+            written.matches('\n').count(),
+            written.matches("\r\n").count()
+        );
+        assert!(placement_of(&written, "FIELDS_BARE", "Reference").hidden);
+    }
+
+    /// A field the symbol does not carry after the call's other changes is
+    /// refused on the library, with nothing written.
+    #[tokio::test]
+    async fn a_placement_of_a_field_the_symbol_lacks_is_refused() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_BARE",
+            json!({"value": "CH347T", "field_placements": {"MPN": {"hide": false}}}),
+        )
+        .await;
+        assert_eq!(body["is_error"], true, "{body}");
+        assert_eq!(body["error"]["field"], "field_placements.MPN", "{body}");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("has no field 'MPN'"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
+    /// The handler's own parsing, which the schema does not cover: names a
+    /// call removes, renames away or KiCad reserves, and entries that set
+    /// nothing or something unknown.
+    #[test]
+    fn field_placements_refuse_what_cannot_be_placed() {
+        let base = SymbolFields {
+            removals: vec!["MPN".into()],
+            renames: vec![("LCSC".into(), "LCSC Part".into())],
+            ..SymbolFields::default()
+        };
+        for (placements, field, reason) in [
+            (
+                json!({"MPN": {"hide": true}}),
+                "field_placements.MPN",
+                "remove_fields",
+            ),
+            (
+                json!({"LCSC": {"hide": true}}),
+                "field_placements.LCSC",
+                "place it as 'LCSC Part'",
+            ),
+            (
+                json!({"ki_keywords": {"hide": false}}),
+                "field_placements.ki_keywords",
+                "ki_*",
+            ),
+            (
+                json!({"Value": {}}),
+                "field_placements.Value",
+                "sets nothing",
+            ),
+            (
+                json!({"Value": {"angle": 90}}),
+                "field_placements.Value.angle",
+                "unknown key",
+            ),
+            (
+                json!({"Value": {"x": "1"}}),
+                "field_placements.Value.x",
+                "finite number",
+            ),
+            (
+                json!({"Value": {"hide": "yes"}}),
+                "field_placements.Value.hide",
+                "true or false",
+            ),
+            (json!({}), "field_placements", "non-empty"),
+        ] {
+            let error = parse_field_placements(&json!({ "field_placements": placements }), &base)
+                .unwrap_err();
+            let body = order_body(&error);
+            assert_eq!(body["error"]["field"], field, "{placements}: {body}");
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains(reason),
+                "{placements}: {body}"
+            );
+        }
+        let kept = parse_field_placements(
+            &json!({"field_placements": {"LCSC Part": {"hide": false}, "Value": {"rotation": 450}}}),
+            &base,
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            vec![
+                (
+                    "LCSC Part".to_string(),
+                    FieldPlacement {
+                        hide: Some(false),
+                        ..FieldPlacement::default()
+                    }
+                ),
+                (
+                    "Value".to_string(),
+                    FieldPlacement {
+                        rotation: Some(90.0),
+                        ..FieldPlacement::default()
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// The check before writing and after wants each placement as asked.
+    #[test]
+    fn the_check_wants_each_field_placed() {
+        let fields = SymbolFields {
+            placements: vec![(
+                "Value".into(),
+                FieldPlacement {
+                    y: Some(-6.35),
+                    rotation: Some(90.0),
+                    ..FieldPlacement::default()
+                },
+            )],
+            ..SymbolFields::default()
+        };
+        assert_eq!(
+            readback_mismatch(PLACED, FIXTURE, "FIELDS_BARE", &fields),
+            None
+        );
+        let reason = readback_mismatch(FIXTURE, FIXTURE, "FIELDS_BARE", &fields).unwrap();
+        assert!(reason.contains("field 'Value' reads"), "{reason}");
+    }
+
+    /// KiCad reads the hide flags of a field in file order, the later one
+    /// winning, and takes a flag as hiding unless it says `no`.
+    #[test]
+    fn the_last_hide_flag_decides() {
+        for (property, hidden) in [
+            ("(property \"X\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27)) (hide no)))", false),
+            ("(property \"X\" \"\" (at 0 0 0) (hide no) (effects (font (size 1.27 1.27)) hide))", true),
+            ("(property \"X\" \"\" (at 0 0 0) (hide no) (effects (font (size 1.27 1.27))))", false),
+            ("(property \"X\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide)))", true),
+        ] {
+            let layout = field_layout(property, (0, property.len())).unwrap();
+            assert_eq!(layout.state.hidden, hidden, "{property}");
+        }
     }
 }
