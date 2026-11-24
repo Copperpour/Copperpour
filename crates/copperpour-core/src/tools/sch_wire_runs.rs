@@ -912,6 +912,88 @@ mod tests {
     }
 
     #[test]
+    fn interior_hits_reject_tolerated_but_inexact_contacts() {
+        let tree = parse_sexp(
+            "(kicad_sch
+                (wire (pts (xy 30 20) (xy 10 20)) (uuid H))
+                (wire (pts (xy 40 10) (xy 40 30)) (uuid V))
+                (wire (pts (xy 10 40) (xy 30 40.005)) (uuid D)))",
+        )
+        .unwrap();
+        let wires = extract_wires(&tree);
+        let index = WireIndex::build(&wires, COINCIDENT_TOLERANCE);
+        let hits = |x, y| {
+            index
+                .interior_hits(x, y, point)
+                .map(|w| w.uuid.as_deref().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hits(20.0, 20.0), ["H"]);
+        assert_eq!(hits(40.0, 20.0), ["V"]);
+        for (x, y) in [
+            (9.995, 20.0),  // inside the tolerance, before the low end
+            (30.005, 20.0), // inside the tolerance, past the high end
+            (10.0, 20.0),   // exactly at an end is not an interior hit
+            (30.0, 20.0),
+            (40.005, 20.0), // next to a vertical wire, not on it
+            (20.0, 40.0),   // next to a nearly horizontal diagonal
+        ] {
+            assert!(hits(x, y).is_empty(), "spurious interior hit at {x}, {y}");
+        }
+    }
+
+    #[test]
+    fn wire_runs_reject_an_attachment_with_an_out_of_range_coordinate() {
+        for (x, y) in [(1e13, 20.0), (20.0, 1e13)] {
+            let tree = parse_sexp(&format!(
+                "(kicad_sch (wire (pts (xy 10 20) (xy 30 20))) (label BAD (at {x} {y} 0)))"
+            ))
+            .unwrap();
+            assert_eq!(
+                measure_wire_runs(&tree).err(),
+                Some("one or more wire attachments have unreadable positions"),
+                "{x}, {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_runs_do_not_name_pins_from_empty_or_non_power_values() {
+        for (power, value) in [("(power)", ""), ("", "REGULATOR")] {
+            let body = inspect(&format!(
+                r#"
+                (lib_symbols
+                  (symbol "Test:Input" {power}
+                    (pin power_in line (at 0 0 0) (number "1"))))
+                (symbol (lib_id "Test:Input") (at 30 20 0)
+                  (property "Reference" "U1") (property "Value" "{value}"))
+                (wire (pts (xy 10 20) (xy 30 20)))
+                "#
+            ));
+            assert_eq!(body["pin_geometry_resolved"], true, "{body}");
+            assert_eq!(body["findings"][0]["end"]["status"], "attached", "{body}");
+            assert_eq!(body["findings"][0]["net"], Value::Null, "{body}");
+        }
+    }
+
+    #[test]
+    fn wire_runs_mark_geometry_unresolved_for_out_of_range_pin_tips() {
+        for (x, y) in [(1e13, 20.0), (20.0, 1e13)] {
+            let body = inspect(&format!(
+                r#"
+                (lib_symbols
+                  (symbol "Test:Pin" (pin passive line (at 0 0 0) (number "1"))))
+                (symbol (lib_id "Test:Pin") (at {x} {y} 0) (property "Reference" "U1"))
+                (wire (pts (xy 10 20) (xy 30 20)))
+                "#
+            ));
+            assert_eq!(body["pin_geometry_resolved"], false, "{body}");
+            assert_eq!(body["findings"][0]["start"]["status"], "unknown", "{body}");
+            assert_eq!(body["findings"][0]["end"]["status"], "unknown", "{body}");
+        }
+    }
+
+    #[test]
     fn wire_runs_keep_distinct_net_roots_at_saved_precision() {
         let body = inspect(
             "(wire (pts (xy 10 20) (xy 20 20))) (label FIRST (at 10 20 0))
@@ -1000,15 +1082,16 @@ mod tests {
     #[test]
     fn wire_runs_report_distinct_ends_on_a_loop_split_by_labels() {
         let body = inspect(&format!(
-            "{RECTANGLE} (label LOOP (at 0 0 0)) (label LOOP (at 10 0 0))"
+            "{RECTANGLE} (label LOOP (at 10 0 0)) (label LOOP (at 10 10 0))"
         ));
         assert_eq!(body["skipped_closed_segment_count"], 0);
         assert_eq!(body["run_count"], 2);
         assert_eq!(body["finding_count"], 2);
         let findings = body["findings"].as_array().unwrap();
         for run in findings {
-            assert_eq!(run["start"], json!({"x":0.0,"y":0.0,"status":"attached"}));
-            assert_eq!(run["end"], json!({"x":10.0,"y":0.0,"status":"attached"}));
+            // The first corner in point order, (0, 0), is not a stop.
+            assert_eq!(run["start"], json!({"x":10.0,"y":0.0,"status":"attached"}));
+            assert_eq!(run["end"], json!({"x":10.0,"y":10.0,"status":"attached"}));
             assert_eq!(run["net"], "LOOP");
         }
         assert!(findings.iter().any(|run| run["length_mm"] == 10.0));
@@ -1029,6 +1112,18 @@ mod tests {
             assert_eq!(report.runs[0].end, status, "{skipped}");
             assert_eq!(report.runs[1].start, status, "{skipped}");
         }
+    }
+
+    #[test]
+    fn wire_runs_do_not_call_an_endpoint_with_a_zero_length_wire_open() {
+        let report = measure(
+            "(wire (pts (xy 10 20) (xy 30 20))) (wire (pts (xy 30 20) (xy 30 20)))",
+        );
+        assert!(report.pin_geometry_resolved);
+        assert_eq!(report.skipped_wire_count, 1);
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(report.runs[0].start, "open");
+        assert_eq!(report.runs[0].end, "unknown");
     }
 
     #[test]
