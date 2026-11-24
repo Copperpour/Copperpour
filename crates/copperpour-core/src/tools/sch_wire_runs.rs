@@ -1159,9 +1159,8 @@ mod tests {
 
     #[test]
     fn wire_runs_do_not_call_an_endpoint_with_a_zero_length_wire_open() {
-        let report = measure(
-            "(wire (pts (xy 10 20) (xy 30 20))) (wire (pts (xy 30 20) (xy 30 20)))",
-        );
+        let report =
+            measure("(wire (pts (xy 10 20) (xy 30 20))) (wire (pts (xy 30 20) (xy 30 20)))");
         assert!(report.pin_geometry_resolved);
         assert_eq!(report.skipped_wire_count, 1);
         assert_eq!(report.runs.len(), 1);
