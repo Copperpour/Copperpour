@@ -2425,3 +2425,767 @@ async fn stage4b_estimate_cost_without_layers_table_reports_copper_layers_unavai
         "{cost}"
     );
 }
+
+// ─── Stage 5: CLI/render/export provenance disclosure (#58) ──────────────────
+
+/// Fake `kicad-cli` stub that creates verified non-empty output artifacts for
+/// every Stage 5 CLI export, render, BOM, and netlist subcommand.
+#[cfg(unix)]
+fn write_fake_export_cli(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("fake-kicad-export-cli.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         set -eu\n\
+         sub1=\"${1:-}\"\n\
+         sub2=\"${2:-}\"\n\
+         sub3=\"${3:-}\"\n\
+         out=\"\"\n\
+         layers=\"\"\n\
+         last=\"\"\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           if [ \"$1\" = \"--output\" ] || [ \"$1\" = \"-o\" ]; then\n\
+             out=\"$2\"; shift 2\n\
+           elif [ \"$1\" = \"--layers\" ]; then\n\
+             layers=\"$2\"; shift 2\n\
+           else\n\
+             last=\"$1\"; shift\n\
+           fi\n\
+         done\n\
+         stem=\"$(basename \"$last\" .kicad_pcb)\"\n\
+         case \"$sub1:$sub2:$sub3\" in\n\
+           pcb:export:gerbers)\n\
+             mkdir -p \"$out\"\n\
+             if [ -n \"$layers\" ]; then\n\
+               IFS=','; for l in $layers; do\n\
+                 safe=\"$(printf '%s' \"$l\" | tr '.' '_')\"\n\
+                 printf 'G04 fake gerber*\\nM02*\\n' > \"$out/${stem}-${safe}.gbr\"\n\
+               done\n\
+             else\n\
+               printf 'G04 fake gerber*\\nM02*\\n' > \"$out/${stem}-F_Cu.gbr\"\n\
+             fi\n\
+             ;;\n\
+           pcb:export:drill)\n\
+             mkdir -p \"$out\"\n\
+             printf 'M48\\nM30\\n' > \"$out/${stem}-PTH.drl\"\n\
+             ;;\n\
+           pcb:export:dxf)\n\
+             mkdir -p \"$out\"\n\
+             printf '0\\nEOF\\n' > \"$out/${stem}-F_Cu.dxf\"\n\
+             ;;\n\
+           pcb:drc:*)\n\
+             printf '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}\\n' > \"$out\"\n\
+             ;;\n\
+           *)\n\
+             mkdir -p \"$(dirname \"$out\")\"\n\
+             printf 'fake-kicad-cli-output\\n' > \"$out\"\n\
+             ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+/// Every Stage 5 `CliSaved` export tool and `get_board_2d_view` reports
+/// per-domain `sources` and `source_evidence` disclosing that unsaved KiCad
+/// editor changes are excluded, both offline and with a sibling lock file.
+#[cfg(unix)]
+#[tokio::test]
+async fn stage5_cli_export_and_render_tools_disclose_saved_snapshot_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = fixture_board(dir.path());
+    write_project(&board);
+    let sch = write_minimal_schematic(dir.path());
+    let fake_cli = write_fake_export_cli(dir.path());
+
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: fake_cli.to_string_lossy().into_owned(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+    let scene = Scene {
+        _dir: dir,
+        board,
+        kicad: None,
+        handler,
+    };
+    let board_str = scene.board.to_string_lossy().to_string();
+    let out = scene._dir.path().join("stage5-out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // export_gerber: default layers + drill_file=true
+    let gerber_default = body_of(
+        &scene
+            .call_with(
+                "export_gerber",
+                json!({
+                    "board": board_str,
+                    "output_dir": out.join("gerbers-default").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        gerber_default["sources"],
+        json!({
+            "board": "saved_board",
+            "layers": "saved_board",
+            "gerbers": "kicad_cli",
+            "drill": "kicad_cli",
+        }),
+        "{gerber_default}"
+    );
+    assert_eq!(
+        gerber_default["source_evidence"]["board_state"],
+        "saved_board"
+    );
+    assert_eq!(
+        gerber_default["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(
+        gerber_default["source_evidence"]["reason"],
+        "saved_snapshot_only"
+    );
+
+    // export_gerber: explicit layers + drill_file=false
+    let gerber_explicit = body_of(
+        &scene
+            .call_with(
+                "export_gerber",
+                json!({
+                    "board": board_str,
+                    "output_dir": out.join("gerbers-explicit").to_string_lossy(),
+                    "layers": ["F.Cu"],
+                    "drill_file": false,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        gerber_explicit["sources"],
+        json!({
+            "board": "saved_board",
+            "layers": "argument",
+            "gerbers": "kicad_cli",
+        }),
+        "{gerber_explicit}"
+    );
+
+    // export_pdf: default vs explicit layers
+    let pdf_default = body_of(
+        &scene
+            .call_with(
+                "export_pdf",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board-default.pdf").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        pdf_default["sources"],
+        json!({
+            "board": "saved_board",
+            "layers": "saved_board",
+            "pdf": "kicad_cli",
+        }),
+        "{pdf_default}"
+    );
+    let pdf_explicit = body_of(
+        &scene
+            .call_with(
+                "export_pdf",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board-explicit.pdf").to_string_lossy(),
+                    "layers": ["F.Cu"],
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        pdf_explicit["sources"]["layers"],
+        json!("argument"),
+        "{pdf_explicit}"
+    );
+
+    // export_svg: default vs explicit layers
+    let svg_default = body_of(
+        &scene
+            .call_with(
+                "export_svg",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board-default.svg").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        svg_default["sources"],
+        json!({
+            "board": "saved_board",
+            "layers": "saved_board",
+            "svg": "kicad_cli",
+        }),
+        "{svg_default}"
+    );
+    let svg_explicit = body_of(
+        &scene
+            .call_with(
+                "export_svg",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board-explicit.svg").to_string_lossy(),
+                    "layers": ["F.Cu"],
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        svg_explicit["sources"]["layers"],
+        json!("argument"),
+        "{svg_explicit}"
+    );
+
+    // export_3d
+    let step = body_of(
+        &scene
+            .call_with(
+                "export_3d",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.step").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        step["sources"],
+        json!({ "board": "saved_board", "model_3d": "kicad_cli" }),
+        "{step}"
+    );
+
+    // export_netlist: IPC-D-356 (board) vs KiCad (schematic)
+    let net_ipc = body_of(
+        &scene
+            .call_with(
+                "export_netlist",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.d356").to_string_lossy(),
+                    "format": "ipc",
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        net_ipc["sources"],
+        json!({ "board": "saved_board", "netlist": "kicad_cli" }),
+        "{net_ipc}"
+    );
+    assert_eq!(net_ipc["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(net_ipc["source_evidence"]["reason"], "saved_snapshot_only");
+
+    let net_sch = body_of(
+        &scene
+            .call_with(
+                "export_netlist",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.net").to_string_lossy(),
+                    "format": "kicad",
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        net_sch["sources"],
+        json!({ "schematic": "saved_schematic", "netlist": "kicad_cli" }),
+        "{net_sch}"
+    );
+    assert_eq!(net_sch["source_evidence"]["board_state"], "saved_schematic");
+    assert_eq!(
+        net_sch["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(net_sch["source_evidence"]["reason"], "saved_snapshot_only");
+
+    // export_position_file, export_dxf, export_gencad, export_ipc2581, export_odb
+    let pos = body_of(
+        &scene
+            .call_with(
+                "export_position_file",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.pos.csv").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        pos["sources"],
+        json!({ "board": "saved_board", "positions": "kicad_cli" }),
+        "{pos}"
+    );
+
+    let dxf = body_of(
+        &scene
+            .call_with(
+                "export_dxf",
+                json!({
+                    "board": board_str,
+                    "output_dir": out.join("dxf").to_string_lossy(),
+                    "layers": ["Edge.Cuts"],
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        dxf["sources"],
+        json!({ "board": "saved_board", "dxf": "kicad_cli" }),
+        "{dxf}"
+    );
+
+    let gencad = body_of(
+        &scene
+            .call_with(
+                "export_gencad",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.cad").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        gencad["sources"],
+        json!({ "board": "saved_board", "gencad": "kicad_cli" }),
+        "{gencad}"
+    );
+
+    let ipc2581 = body_of(
+        &scene
+            .call_with(
+                "export_ipc2581",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.xml").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        ipc2581["sources"],
+        json!({ "board": "saved_board", "ipc2581": "kicad_cli" }),
+        "{ipc2581}"
+    );
+
+    let odb = body_of(
+        &scene
+            .call_with(
+                "export_odb",
+                json!({
+                    "board": board_str,
+                    "output": out.join("board.zip").to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        odb["sources"],
+        json!({ "board": "saved_board", "odb": "kicad_cli" }),
+        "{odb}"
+    );
+
+    // get_board_2d_view returns [Text { provenance metadata }, Image { png }]
+    let view_result = scene
+        .call_with("get_board_2d_view", json!({ "board": board_str }))
+        .await;
+    assert!(!view_result.is_error, "{}", text_of(&view_result));
+    assert_eq!(view_result.content.len(), 2, "{:?}", view_result.content);
+    let view_meta = body_of(&view_result);
+    assert_eq!(
+        view_meta["sources"],
+        json!({ "board": "saved_board", "render": "kicad_cli" }),
+        "{view_meta}"
+    );
+    assert_eq!(view_meta["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(
+        view_meta["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(
+        view_meta["source_evidence"]["reason"],
+        "saved_snapshot_only"
+    );
+    match &view_result.content[1] {
+        crate::mcp::protocol::ToolContent::Image { data, mime_type } => {
+            assert_eq!(mime_type, "image/png");
+            assert!(!data.is_empty());
+        }
+        other => panic!("expected image block second, got {other:?}"),
+    }
+
+    // Sibling board lock is disclosed on every board-backed CLI export/render tool.
+    let board_lock = copperpour_sexp::writer::kicad_editor_lock_path(&scene.board).unwrap();
+    std::fs::write(&board_lock, "locked").unwrap();
+    for (tool, args) in [
+        (
+            "export_gerber",
+            json!({ "board": board_str, "output_dir": out.join("lock-gerber").to_string_lossy() }),
+        ),
+        (
+            "export_pdf",
+            json!({ "board": board_str, "output": out.join("lock.pdf").to_string_lossy() }),
+        ),
+        (
+            "export_svg",
+            json!({ "board": board_str, "output": out.join("lock.svg").to_string_lossy() }),
+        ),
+        (
+            "export_3d",
+            json!({ "board": board_str, "output": out.join("lock.step").to_string_lossy() }),
+        ),
+        (
+            "export_netlist",
+            json!({ "board": board_str, "output": out.join("lock.d356").to_string_lossy(), "format": "ipc" }),
+        ),
+        (
+            "export_position_file",
+            json!({ "board": board_str, "output": out.join("lock.pos.csv").to_string_lossy() }),
+        ),
+        (
+            "export_dxf",
+            json!({ "board": board_str, "output_dir": out.join("lock-dxf").to_string_lossy(), "layers": ["Edge.Cuts"] }),
+        ),
+        (
+            "export_gencad",
+            json!({ "board": board_str, "output": out.join("lock.cad").to_string_lossy() }),
+        ),
+        (
+            "export_ipc2581",
+            json!({ "board": board_str, "output": out.join("lock.xml").to_string_lossy() }),
+        ),
+        (
+            "export_odb",
+            json!({ "board": board_str, "output": out.join("lock.zip").to_string_lossy() }),
+        ),
+        ("get_board_2d_view", json!({ "board": board_str })),
+    ] {
+        let result = scene.call_with(tool, args).await;
+        assert!(!result.is_error, "{tool}: {}", text_of(&result));
+        let body = body_of(&result);
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("saved_snapshot_only_with_editor_lock"),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            json!(true),
+            "{tool}: {body}"
+        );
+    }
+
+    // Sibling schematic lock is disclosed on schematic netlist export.
+    let sch_lock = copperpour_sexp::writer::kicad_editor_lock_path(&sch).unwrap();
+    std::fs::write(&sch_lock, "locked").unwrap();
+    let net_sch_locked = body_of(
+        &scene
+            .call_with(
+                "export_netlist",
+                json!({
+                    "board": board_str,
+                    "output": out.join("lock.net").to_string_lossy(),
+                    "format": "kicad",
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        net_sch_locked["source_evidence"]["board_state"],
+        "saved_schematic"
+    );
+    assert_eq!(
+        net_sch_locked["source_evidence"]["reason"],
+        "saved_snapshot_only_with_editor_lock"
+    );
+}
+
+/// After the server has observed a board live in KiCad, Stage 5 CLI export and
+/// render tools disclose `saved_snapshot_only_after_live_observation`.
+#[cfg(unix)]
+#[tokio::test]
+async fn stage5_cli_export_and_render_tools_disclose_after_live_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = fixture_board(dir.path());
+    write_project(&board);
+    let fake_cli = write_fake_export_cli(dir.path());
+    let kicad = spawn_live_kicad(&board);
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: fake_cli.to_string_lossy().into_owned(),
+        kicad_binary: String::new(),
+        ipc_address: kicad.address().to_string(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+    let scene = Scene {
+        _dir: dir,
+        board,
+        kicad: Some(kicad),
+        handler,
+    };
+    let board_str = scene.board.to_string_lossy().to_string();
+    let out = scene._dir.path().join("stage5-live");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Observe the board live first on the same handler.
+    let live = scene.body("get_layer_list", Some("live")).await;
+    assert_eq!(live["source_evidence"]["board_state"], "ipc", "{live}");
+
+    for (tool, args) in [
+        (
+            "export_gerber",
+            json!({ "board": board_str, "output_dir": out.join("gerbers").to_string_lossy() }),
+        ),
+        (
+            "export_pdf",
+            json!({ "board": board_str, "output": out.join("board.pdf").to_string_lossy() }),
+        ),
+        (
+            "export_netlist",
+            json!({ "board": board_str, "output": out.join("board.d356").to_string_lossy(), "format": "ipc" }),
+        ),
+        (
+            "export_position_file",
+            json!({ "board": board_str, "output": out.join("board.pos.csv").to_string_lossy() }),
+        ),
+        ("get_board_2d_view", json!({ "board": board_str })),
+    ] {
+        let result = scene.call_with(tool, args).await;
+        assert!(!result.is_error, "{tool}: {}", text_of(&result));
+        let body = body_of(&result);
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("saved_snapshot_only_after_live_observation"),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            json!(true),
+            "{tool}: {body}"
+        );
+    }
+}
+
+/// `export_manufacturing_package` reports per-domain `sources` and
+/// `source_evidence` alongside its existing `board_source` and
+/// `project_settings_source` fields.
+#[cfg(unix)]
+#[tokio::test]
+async fn stage5_export_manufacturing_package_discloses_mixed_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = fixture_board(dir.path());
+    write_project(&board);
+    let sch = write_minimal_schematic(dir.path());
+    let fake_cli = write_fake_export_cli(dir.path());
+
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: fake_cli.to_string_lossy().into_owned(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+    let scene = Scene {
+        _dir: dir,
+        board,
+        kicad: None,
+        handler,
+    };
+    let board_str = scene.board.to_string_lossy().to_string();
+    let sch_str = sch.to_string_lossy().to_string();
+    let out = scene._dir.path().join("mfg-pkg");
+
+    // Generic fab house with assembly + schematic + .kicad_pro present.
+    let pkg = body_of(
+        &scene
+            .call_with(
+                "export_manufacturing_package",
+                json!({
+                    "board": board_str,
+                    "schematic": sch_str,
+                    "output_dir": out.join("with-asm").to_string_lossy(),
+                    "fab_house": "generic",
+                    "include_assembly": true,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(pkg["board_source"], "saved_file", "{pkg}");
+    assert_eq!(
+        pkg["project_settings_source"], "saved_kicad_pro_if_present",
+        "{pkg}"
+    );
+    assert_eq!(
+        pkg["sources"],
+        json!({
+            "board": "saved_board",
+            "project_settings": "project_file",
+            "gerber_layers": "saved_board",
+            "gerbers": "kicad_cli",
+            "drill": "kicad_cli",
+            "positions": "kicad_cli",
+            "schematic": "saved_schematic",
+            "bom": "kicad_cli",
+        }),
+        "{pkg}"
+    );
+    assert_eq!(pkg["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(
+        pkg["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(pkg["source_evidence"]["reason"], "saved_snapshot_only");
+
+    // Remove .kicad_pro, pass explicit gerber_layers, disable assembly, add board lock.
+    std::fs::remove_file(scene.board.with_extension("kicad_pro")).unwrap();
+    let lock_path = copperpour_sexp::writer::kicad_editor_lock_path(&scene.board).unwrap();
+    std::fs::write(&lock_path, "locked").unwrap();
+    let pkg_fab_only = body_of(
+        &scene
+            .call_with(
+                "export_manufacturing_package",
+                json!({
+                    "board": board_str,
+                    "output_dir": out.join("fab-only").to_string_lossy(),
+                    "fab_house": "jlcpcb",
+                    "include_assembly": false,
+                    "gerber_layers": ["F.Cu", "Edge.Cuts"],
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        pkg_fab_only["sources"],
+        json!({
+            "board": "saved_board",
+            "project_settings": "unavailable",
+            "gerber_layers": "argument",
+            "gerbers": "kicad_cli",
+            "drill": "kicad_cli",
+        }),
+        "{pkg_fab_only}"
+    );
+    assert_eq!(
+        pkg_fab_only["source_evidence"]["reason"],
+        "saved_snapshot_only_with_editor_lock"
+    );
+
+    // Assembly enabled without a schematic reports schematic and bom as unavailable.
+    let pkg_no_sch = body_of(
+        &scene
+            .call_with(
+                "export_manufacturing_package",
+                json!({
+                    "board": board_str,
+                    "output_dir": out.join("asm-no-sch").to_string_lossy(),
+                    "fab_house": "generic",
+                    "include_assembly": true,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        pkg_no_sch["sources"]["schematic"],
+        json!("unavailable"),
+        "{pkg_no_sch}"
+    );
+    assert_eq!(
+        pkg_no_sch["sources"]["bom"],
+        json!("unavailable"),
+        "{pkg_no_sch}"
+    );
+    assert_eq!(
+        pkg_no_sch["sources"]["positions"],
+        json!("kicad_cli"),
+        "{pkg_no_sch}"
+    );
+}
+
+/// A package whose kicad-cli exports fail names those domains unavailable,
+/// not `kicad_cli`.
+#[tokio::test]
+async fn stage5_export_manufacturing_package_reports_failed_exports_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = fixture_board(dir.path());
+    let failing_cli = crate::tools::cli::test_support::write_script(
+        dir.path(),
+        "failing-cli",
+        "#!/bin/sh\nexit 1\n",
+        "@exit /b 1\r\n",
+    );
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: failing_cli.to_string_lossy().into_owned(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+    let scene = Scene {
+        _dir: dir,
+        board,
+        kicad: None,
+        handler,
+    };
+    let pkg = body_of(
+        &scene
+            .call_with(
+                "export_manufacturing_package",
+                json!({
+                    "board": scene.board.to_string_lossy(),
+                    "output_dir": scene._dir.path().join("failed").to_string_lossy(),
+                    "fab_house": "generic",
+                    "include_assembly": false,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(pkg["complete"], false, "{pkg}");
+    assert_eq!(
+        pkg["sources"],
+        json!({
+            "board": "saved_board",
+            "project_settings": "unavailable",
+            "gerber_layers": "saved_board",
+            "gerbers": "unavailable",
+            "drill": "unavailable",
+        }),
+        "{pkg}"
+    );
+}

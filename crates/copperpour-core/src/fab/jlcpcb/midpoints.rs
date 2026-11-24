@@ -698,6 +698,36 @@ mod tests {
         (text, output)
     }
 
+    /// #58: a live JLCPCB package names the IPC snapshot for the board and
+    /// its derived positions, and its evidence is the live board's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_jlcpcb_package_reports_live_snapshot_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (text, _) = served_package(dir.path(), "midpoints").await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["board_source"], "stable_live_ipc_snapshot", "{body:#}");
+        assert_eq!(
+            body["sources"],
+            serde_json::json!({
+                "board": "ipc",
+                "project_settings": "unavailable",
+                "gerber_layers": "ipc",
+                "gerbers": "kicad_cli",
+                "drill": "kicad_cli",
+                "positions": "derived",
+                "schematic": "saved_schematic",
+                "bom": "kicad_cli",
+            }),
+            "{body:#}"
+        );
+        assert_eq!(body["source_evidence"]["board_state"], "ipc", "{body:#}");
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            false
+        );
+    }
+
     /// #69: the package writes its whole placement evidence beside the CPL
     /// and its response carries the counts and the first `limit` applied
     /// corrections, the verdict first.

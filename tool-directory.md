@@ -348,7 +348,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
-| `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
+| `get_board_2d_view` | Render the saved board with kicad-cli and return a JSON report with its provenance, then the PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
 ### `pcb_routing` · 20 tools
 **Purpose:** Traces, vias, pad nets, copper pours, net classes, differential pairs, and strict Specctra SES import.
