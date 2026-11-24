@@ -228,6 +228,7 @@ mod tests {
                         "create_symbol/properties/fields" |
                         "set_symbol_properties/properties/fields" |
                         "set_symbol_properties/properties/rename_fields" |
+                        "set_symbol_properties/properties/field_placements" |
                         "copy_routing_pattern/properties/net_map" |
                         "apply_template/properties/net_mappings" |
                         "set_erc_severity/properties/severities" |

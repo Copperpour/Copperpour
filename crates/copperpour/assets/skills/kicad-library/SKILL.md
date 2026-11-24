@@ -274,6 +274,11 @@ first, in that order; the others keep their order after them. Each field moves
 whole. Mandatory fields stay first and `ki_*` fields last, so they cannot be
 named; a field set or renamed in the same call can be.
 
+`field_placements={"Reference": {"y": 6.35}, "Value": {"y": -6.35}}` moves a
+field's text, for example when the body grew; each entry may also set
+`rotation` (0 or 90, as KiCad's dialog offers) and `hide`. Coordinates are the
+symbol's own, as `create_symbol` takes them: millimetres from its origin, y up.
+
 ### Remove a Symbol Pin
 
 `delete_symbol_pin` (toolset `library_maintenance`) removes one pin of a library symbol, such as the second of
