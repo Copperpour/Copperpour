@@ -2804,6 +2804,31 @@ impl KiCadIpcClient {
         self.send_command(&cmd, "kiapi.common.commands.GetItems")
     }
 
+    /// The items of `item_types` copper-connected to the item `id`, as
+    /// KiCad's connectivity holds them (`GetConnectedItems`, KiCad 10.0.1+):
+    /// its whole copper cluster on its net, the item itself included when it
+    /// is of a requested type.
+    pub fn get_connected_items_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        id: &str,
+        item_types: &[kiapi::common::types::KiCadObjectType],
+    ) -> Result<Vec<prost_types::Any>> {
+        let cmd = kiapi::board::commands::GetConnectedItems {
+            header: Some(header_for(document)),
+            items: vec![kiapi::common::types::Kiid {
+                value: id.to_string(),
+            }],
+            types: item_types.iter().map(|t| *t as i32).collect(),
+        };
+        let Some(any) = self.send_command(&cmd, "kiapi.board.commands.GetConnectedItems")? else {
+            return Ok(Vec::new());
+        };
+        let response: kiapi::common::commands::GetItemsResponse = unpack_any(&any)?;
+        ensure_item_request_ok(response.status, "connected item retrieval")?;
+        Ok(response.items)
+    }
+
     fn read_item_inventory<M: Message + Default>(
         &self,
         document: &kiapi::common::types::DocumentSpecifier,

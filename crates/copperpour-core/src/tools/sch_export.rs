@@ -220,9 +220,14 @@ pub fn tools() -> Vec<ToolDef> {
              with a `footprint_locked_not_replaced` note that refuses nothing. \
              A pad net change on a net routed copper uses is a `routed_pad_net_change` \
              conflict; naming its `reference` and `net_change` in `acknowledged_net_changes` \
-             plans it as KiCad's Update PCB makes it, with no copper sent, and the apply of \
-             that dry run's plan then reports `routed_copper`, each named net's copper before \
-             and after as KiCad's commit left it, and `drc` of the result. \
+             plans it as KiCad's Update PCB makes it: KiCad's commit carries the tracks \
+             joined to the pads, and each via and copper zone whose net leaves the schematic \
+             moves as KiCad's `updateCopperZoneNets` moves it, a zone to the new net of a pad \
+             connected to it, else to where its net's pads go, listed in `copper_net_changes` \
+             and sent in the same commit. A via or zone on such a net that no pad leads off \
+             stays, with a `via_net_not_in_schematic` or `zone_net_not_in_schematic` note. \
+             The apply of that dry run's plan then reports `routed_copper`, each named net's \
+             copper before and after as KiCad's commit left it, and `drc` of the result. \
              A board footprint no symbol matched is kept and counted in \
              `coverage.board_only_preserved`; `footprints_without_symbols` names each one \
              without the board-only attribute (KiCad's \"Not in schematic\"), with its \

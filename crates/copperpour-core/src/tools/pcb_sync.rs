@@ -51,6 +51,10 @@ struct ExportedDesign {
     /// `Footprint` property is empty. Nothing can be placed for them, so they
     /// are reported rather than planned — and never fatal (#507).
     unassigned: Vec<UnassignedComponent>,
+    /// Every net the export connects to a pin, footprint or not: the nets
+    /// KiCad's Update PCB reads as the netlist's (`updateCopperZoneNets`,
+    /// #862).
+    net_names: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +225,8 @@ struct SyncCounts {
     /// Footprints with no symbol deleted on request
     /// (`delete_footprints_without_symbols`, #861).
     deleted: CountPair,
+    /// Vias and copper zones moved off a net that left the schematic (#862).
+    copper_net_changes: CountPair,
     conflicts: CountPair,
 }
 
@@ -339,6 +345,10 @@ struct SyncDiagnostic {
     /// diagnostic.
     #[serde(skip_serializing_if = "Option::is_none")]
     net_change: Option<NetChange>,
+    /// The via or copper zone a note is about (#862). Absent from every
+    /// other diagnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kiid: Option<String>,
 }
 
 /// One pad's net change on a footprint the diagnostic names (#38).
@@ -370,6 +380,38 @@ struct RoutedCopper {
     after_count: usize,
 }
 
+/// A via or a copper zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CopperKind {
+    Via,
+    Zone,
+}
+
+/// A via or a copper zone on the board, as the sync reads it to move the ones
+/// whose net leaves the schematic (#862). Rule areas are not copper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopperItem {
+    kind: CopperKind,
+    kiid: String,
+    /// Empty for an item on no net.
+    net: String,
+    /// The zone's name; empty for a via or an unnamed zone.
+    name: String,
+}
+
+/// A via or copper zone the plan moves off a net that left the schematic, as
+/// KiCad's Update PCB moves it (#862).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CopperNetChange {
+    kind: CopperKind,
+    kiid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    name: String,
+    from: String,
+    to: String,
+}
+
 /// What an apply that took acknowledged net changes leaves for DRC (#38).
 #[derive(Debug, Clone, PartialEq)]
 struct AcknowledgedApply {
@@ -395,6 +437,10 @@ struct SyncPlan {
     /// with the board-only attribute (#861). Those it deletes are `Delete`
     /// changes instead.
     without_symbols: Vec<FootprintWithoutSymbol>,
+    /// The vias and copper zones the plan moves off nets that leave the
+    /// schematic (#862), set by the handler (`plan_copper_nets`). Part of the
+    /// plan's identity.
+    copper_net_changes: Vec<CopperNetChange>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -466,6 +512,12 @@ struct LiveSnapshot {
     /// Each net's routed copper as counted, before an unreadable zone marks
     /// every net routed in `state.routed_nets`.
     routed_copper: BTreeMap<String, usize>,
+    /// The board's vias and copper zones, in KiCad's order, and each as KiCad
+    /// listed it, by KIID (#862).
+    copper: Vec<CopperItem>,
+    copper_items: BTreeMap<String, prost_types::Any>,
+    /// Each footprint pad's footprint KIID and pad number, by the pad's KIID.
+    pad_owners: BTreeMap<String, (String, String)>,
     document: copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
 }
 
@@ -697,6 +749,28 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 }
             }
             leave_out_updates(&mut plan, left_out);
+            // After the preflight's skips, so a part it left out moves no
+            // via or zone (#862).
+            let zone_pads = connected_zone_pads(client, &snapshot, &plan, &design.net_names)?;
+            if zone_pads.unread {
+                plan.diagnostics.push(conflict(
+                    "zone_pads_not_read",
+                    format!(
+                        "KiCad {} cannot list the pads connected to a zone (10.0.1+), so a zone \
+                         whose net leaves the schematic follows only the net its old net's pads \
+                         move to",
+                        zone_pads.kicad
+                    ),
+                    None,
+                ));
+            }
+            plan_copper_nets(
+                &mut plan,
+                &snapshot.state,
+                &snapshot.copper,
+                &design.net_names,
+                &zone_pads.pads,
+            );
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
             plan.diagnostics
@@ -772,11 +846,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 carried,
             )?;
             let deletions = planned_deletions(&plan);
+            let copper_updates = copper_net_updates(&plan, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             let commit = client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
+                // After the footprints, whose pads bring any new net onto the
+                // board; KiCad's Update PCB moves them after the pads too
+                // (#862).
+                if !copper_updates.is_empty() {
+                    client.update_items_in(snapshot.document.clone(), copper_updates)?;
+                }
                 // In the same commit, after the updates, as KiCad's Update PCB
                 // removes unused footprints last (#861).
                 client.delete_items_in(
@@ -852,6 +933,37 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                         "the footprints it deleted (KiCad accepted each deletion)",
                         &error,
                     ));
+                }
+            }
+            // Each moved via and zone is read back, and one KiCad left on
+            // another net is counted as not moved (#862).
+            plan.counts.copper_net_changes.applied = plan.counts.copper_net_changes.planned;
+            match copper_not_moved(client, &snapshot.document, &plan.copper_net_changes) {
+                Ok(not_moved) => {
+                    for (moved, net) in not_moved {
+                        let mut note = conflict(
+                            "board_readback_differs",
+                            format!(
+                                "the {} {} reads back on '{net}' after the sync moved it to \
+                                 '{}'; it is counted as not moved.",
+                                match moved.kind {
+                                    CopperKind::Via => "via",
+                                    CopperKind::Zone => "copper zone",
+                                },
+                                moved.kiid,
+                                moved.to
+                            ),
+                            None,
+                        );
+                        note.kiid = Some(moved.kiid.clone());
+                        plan.diagnostics.push(note);
+                        plan.counts.copper_net_changes.applied -= 1;
+                    }
+                }
+                Err(error) => {
+                    unchecked = true;
+                    plan.diagnostics
+                        .push(readback_unchecked("the vias and zones it moved", &error));
                 }
             }
             // Checked only when an acknowledged change is still planned: one
@@ -995,6 +1107,10 @@ struct SyncResponse<'a> {
     /// with the board-only ones. `delete_footprints_without_symbols` plans
     /// the unlocked ones as `delete` changes instead.
     footprints_without_symbols: &'a [FootprintWithoutSymbol],
+    /// The vias and copper zones the plan moves off nets that leave the
+    /// schematic, as KiCad's Update PCB moves them (#862); counted in
+    /// `coverage.copper_net_changes`.
+    copper_net_changes: &'a [CopperNetChange],
     /// Bounded as rendered only: `plan.changes` stays whole, since the plan
     /// revision hashes it and the apply sends it.
     changes: &'a [PlannedChange],
@@ -1029,6 +1145,7 @@ impl<'a> SyncResponse<'a> {
                 "unassigned_footprint": plan.counts.unassigned_footprint,
                 "skipped_footprint": plan.counts.skipped_footprint,
                 "footprints_deleted": plan.counts.deleted,
+                "copper_net_changes": plan.counts.copper_net_changes,
                 "conflicts": plan.counts.conflicts
             }),
             staging: plan.staging.as_ref().map(StagingEvidence::json),
@@ -1042,6 +1159,7 @@ impl<'a> SyncResponse<'a> {
             unassigned_footprints: &plan.unassigned,
             skipped_footprints: &plan.skipped,
             footprints_without_symbols: &plan.without_symbols,
+            copper_net_changes: &plan.copper_net_changes,
         }
     }
 }
@@ -1104,6 +1222,7 @@ fn conflict_result(message: String) -> CallToolResult {
             "unassigned_footprint": CountPair::default(),
             "skipped_footprint": CountPair::default(),
             "footprints_deleted": CountPair::default(),
+            "copper_net_changes": CountPair::default(),
             "conflicts": CountPair { planned: 1, applied: 0 }
         },
         "diagnostics": [conflict("preflight_conflict", message, None)]
@@ -1154,8 +1273,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
 
 /// The plan. A pad net change on a net that routed copper uses is a
 /// `routed_pad_net_change` conflict unless `acknowledged` names it exactly;
-/// then it is planned as KiCad's Update PCB makes it, with no copper sent,
-/// and noted. An acknowledgement the plan has no such change for is a
+/// then it is planned as KiCad's Update PCB makes it and noted; the vias and
+/// zones of a net that leaves the schematic follow (`plan_copper_nets`). An acknowledgement the plan has no such change for is a
 /// conflict, so a stale or widened one refuses (#38). With
 /// `delete_without_symbols`, a plan with no conflict deletes each unlocked
 /// footprint no symbol matched that lacks the board-only attribute (#861);
@@ -1502,9 +1621,10 @@ fn plan_sync_acknowledging(
                     let mut note = conflict(
                         "routed_pad_net_change_acknowledged",
                         format!(
-                            "{} pad {} changes from '{}' to '{}' as acknowledged; Copperpour \
-                             changes no copper, and the apply reports the routed copper on both \
-                             nets and runs DRC",
+                            "{} pad {} changes from '{}' to '{}' as acknowledged; KiCad's commit \
+                             carries the tracks joined to it, the vias and zones of a net that \
+                             leaves the schematic are moved as copper_net_changes, and the apply \
+                             reports the routed copper on both nets and runs DRC",
                             component.reference, number, old_net, new_net
                         ),
                         Some(&component.reference),
@@ -1671,6 +1791,8 @@ fn plan_sync_acknowledging(
         // Set by the handler's preflight, which reads the library.
         skipped: Vec::new(),
         without_symbols,
+        // Set by the handler, from the vias and zones the snapshot read.
+        copper_net_changes: Vec::new(),
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
         acknowledged_apply: None,
@@ -1685,6 +1807,7 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
         references: reference.map(str::to_string).into_iter().collect(),
         footprint_id: None,
         net_change: None,
+        kiid: None,
     }
 }
 
@@ -1707,6 +1830,7 @@ fn footprint_conflict(
         references,
         footprint_id: Some(footprint_id.to_string()),
         net_change: None,
+        kiid: None,
     }
 }
 
@@ -1842,6 +1966,9 @@ fn refresh_revision_with_staging(plan: &mut SyncPlan) {
     hasher.update(serde_json::to_vec(&plan.changes).expect("planned changes serialize"));
     // What was left out is part of what was reviewed.
     hasher.update(serde_json::to_vec(&plan.skipped).expect("skipped parts serialize"));
+    hasher.update(
+        serde_json::to_vec(&plan.copper_net_changes).expect("copper net changes serialize"),
+    );
     plan.plan_revision = encode_hex(&hasher.finalize());
 }
 
@@ -1934,12 +2061,18 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
         bail!("KiCad netlist contains zero components");
     }
 
+    let mut net_names = BTreeSet::new();
     if let Some(nets_node) = root.find("nets") {
         for net_node in nets_node.find_all("net") {
             let net_name = required_value(net_node, "name")?;
             for node in net_node.find_all("node") {
                 let reference = required_value(node, "ref")?;
                 let pin = required_value(node, "pin")?;
+                // KiCad's netlist holds the net for any component's pin,
+                // whether or not the component has a footprint.
+                if !net_name.is_empty() {
+                    net_names.insert(net_name.clone());
+                }
                 let Some(&index) = by_reference.get(&reference) else {
                     // A wired pin of a component with no footprint: there is
                     // no pad to carry the net, so the node is dropped, not
@@ -1965,6 +2098,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
         components,
         skipped: Vec::new(),
         unassigned,
+        net_names,
     })
 }
 
@@ -2783,11 +2917,26 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
     let footprint_items = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
     let mut footprints = Vec::new();
     let mut items = BTreeMap::new();
+    let mut pad_owners = BTreeMap::new();
     for item in footprint_items {
         let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
             .context("KiCad returned an invalid footprint item")?;
         let footprint = board_footprint_from_instance(&instance)?;
         let kiid = footprint.kiid.clone();
+        for child in instance
+            .definition
+            .iter()
+            .flat_map(|definition| &definition.items)
+        {
+            if !copperpour_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                continue;
+            }
+            if let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) {
+                if let Some(id) = pad.id.filter(|id| !id.value.is_empty()) {
+                    pad_owners.insert(id.value, (kiid.clone(), pad.number));
+                }
+            }
+        }
         footprints.push(footprint);
         items.insert(kiid, item);
     }
@@ -2798,6 +2947,7 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let (routed_copper, unreadable_zone) = read_routed_copper(client, &document)?;
+    let (copper, copper_items) = read_copper_items(client, &document)?;
     let mut routed_nets = routed_copper.clone();
     if unreadable_zone {
         // A zone whose net cannot be read could pour any net, so every pad-net
@@ -2831,8 +2981,200 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         items,
         net_codes,
         routed_copper,
+        copper,
+        copper_items,
+        pad_owners,
         document,
     })
+}
+
+/// The board's vias and copper zones, in KiCad's order, with each item as
+/// KiCad listed it, by KIID (#862). A rule area is not copper, and a zone
+/// whose net cannot be read is left out: `read_routed_copper` already marks
+/// every net routed for it.
+fn read_copper_items(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+) -> Result<(Vec<CopperItem>, BTreeMap<String, prost_types::Any>)> {
+    use copperpour_ipc::gen::kiapi;
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+
+    let mut copper = Vec::new();
+    let mut items = BTreeMap::new();
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
+        let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) else {
+            continue;
+        };
+        let Some(kiid) = via.id.map(|id| id.value).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        copper.push(CopperItem {
+            kind: CopperKind::Via,
+            kiid: kiid.clone(),
+            net: via.net.map(|net| net.name).unwrap_or_default(),
+            name: String::new(),
+        });
+        items.insert(kiid, item);
+    }
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        let ZoneNet::Copper(net) = zone_net(item.value.as_slice()) else {
+            continue;
+        };
+        let Ok(zone) = kiapi::board::types::Zone::decode(item.value.as_slice()) else {
+            continue;
+        };
+        let Some(kiid) = zone.id.map(|id| id.value).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        copper.push(CopperItem {
+            kind: CopperKind::Zone,
+            kiid: kiid.clone(),
+            net: net.name,
+            name: zone.name,
+        });
+        items.insert(kiid, item);
+    }
+    Ok((copper, items))
+}
+
+/// Move the vias and copper zones whose net leaves the schematic as KiCad's
+/// Update PCB moves them, and note each one it leaves (#862).
+///
+/// KiCad 10.0.8, `BOARD_NETLIST_UPDATER` (`board_netlist_updater.cpp`):
+/// `updateComponentPadConnections` records each pad's old net and new net in
+/// `m_oldToNewNets` when both are non-empty, the last pad winning (`:1202`).
+/// `updateCopperZoneNets` (`:1676`) then looks at every via and copper zone
+/// whose net no schematic pin carries. A via takes the new net the map gives
+/// its old one (`:1703`), else KiCad warns "Via connected to unknown net". A
+/// zone first takes the new net of a pad connected to it before the update
+/// whose net changes (`cacheCopperZoneConnections`, `:1664`), then the map
+/// (`:1796`), else KiCad warns that it "has no pads connected". A zone's net
+/// counts as in the schematic when it starts with a schematic net's name, as
+/// KiCad's `isInNetlist` reads pseudo net names.
+///
+/// The map is built from the pad changes still planned, so a part the
+/// preflight skipped moves nothing. `zone_pads` holds the pads connected to
+/// each zone, as `(footprint kiid, pad number)`, in the order to try them.
+/// An item on no net is left alone without a note: there is nothing to move.
+/// A plan with a conflict moves nothing.
+fn plan_copper_nets(
+    plan: &mut SyncPlan,
+    board: &BoardState,
+    copper: &[CopperItem],
+    net_names: &BTreeSet<String>,
+    zone_pads: &BTreeMap<String, Vec<(String, String)>>,
+) {
+    if plan.status == PlanStatus::Conflict {
+        return;
+    }
+    let mut old_to_new = BTreeMap::<&str, &str>::new();
+    let mut new_nets = BTreeMap::<(&str, &str), &str>::new();
+    for change in &plan.changes {
+        let PlannedChange::Update { kiid, pad_nets, .. } = change else {
+            continue;
+        };
+        let Some(footprint) = board
+            .footprints
+            .iter()
+            .find(|footprint| &footprint.kiid == kiid)
+        else {
+            continue;
+        };
+        for number in &footprint.pad_numbers {
+            let old = footprint.pad_nets.get(number).map_or("", String::as_str);
+            let new = pad_nets.get(number).map_or("", String::as_str);
+            new_nets.insert((kiid.as_str(), number.as_str()), new);
+            // `old != new` as KiCad's `if( pad->GetNetname() != netName )`
+            // (`:1173`); a schematic net in the map would move nothing anyway,
+            // as copper on schematic nets is skipped.
+            if !old.is_empty() && !new.is_empty() && old != new {
+                old_to_new.insert(old, new);
+            }
+        }
+    }
+    let net_after = |footprint_kiid: &str, number: &str| -> String {
+        if let Some(net) = new_nets.get(&(footprint_kiid, number)) {
+            return net.to_string();
+        }
+        board
+            .footprints
+            .iter()
+            .find(|footprint| footprint.kiid == footprint_kiid)
+            .and_then(|footprint| footprint.pad_nets.get(number))
+            .cloned()
+            .unwrap_or_default()
+    };
+    for item in copper {
+        if item.net.is_empty() {
+            continue;
+        }
+        let in_schematic = match item.kind {
+            CopperKind::Via => net_names.contains(&item.net),
+            CopperKind::Zone => net_names
+                .iter()
+                .any(|name| !name.is_empty() && item.net.starts_with(name.as_str())),
+        };
+        if in_schematic {
+            continue;
+        }
+        let mut to = String::new();
+        if item.kind == CopperKind::Zone {
+            if let Some(net) = zone_pads
+                .get(&item.kiid)
+                .into_iter()
+                .flatten()
+                .map(|(footprint, number)| net_after(footprint, number))
+                .find(|net| *net != item.net)
+            {
+                to = net;
+            }
+        }
+        if to.is_empty() {
+            if let Some(net) = old_to_new.get(item.net.as_str()) {
+                to = net.to_string();
+            }
+        }
+        if !to.is_empty() {
+            plan.copper_net_changes.push(CopperNetChange {
+                kind: item.kind,
+                kiid: item.kiid.clone(),
+                name: item.name.clone(),
+                from: item.net.clone(),
+                to,
+            });
+            plan.counts.copper_net_changes.planned += 1;
+            continue;
+        }
+        let (code, message) = match item.kind {
+            CopperKind::Via => (
+                "via_net_not_in_schematic",
+                format!(
+                    "via {} is on '{}', which is not in the schematic, and no planned pad moves \
+                     off it, so it stays; KiCad's Update PCB warns \"Via connected to unknown \
+                     net\"",
+                    item.kiid, item.net
+                ),
+            ),
+            CopperKind::Zone => (
+                "zone_net_not_in_schematic",
+                format!(
+                    "copper zone {}({}) is on '{}', which is not in the schematic, and no pad \
+                     connected to it or moving off its net takes another, so it stays; KiCad's \
+                     Update PCB warns that it has no pads connected",
+                    if item.name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("'{}' ", item.name)
+                    },
+                    item.kiid,
+                    item.net
+                ),
+            ),
+        };
+        let mut note = conflict(code, message, None);
+        note.kiid = Some(item.kiid.clone());
+        plan.diagnostics.push(note);
+    }
 }
 
 /// Each net's routed copper: how many tracks, arcs, vias and copper zones
@@ -4177,6 +4519,156 @@ fn clear_changes(plan: &mut SyncPlan) {
         }
     }
     plan.counts.deleted.planned = 0;
+    plan.copper_net_changes.clear();
+    plan.counts.copper_net_changes.planned = 0;
+}
+
+/// The pads connected to copper zones, read for `plan_copper_nets` (#862).
+struct ZonePads {
+    /// For each copper zone whose net is not in the schematic, the footprint
+    /// pads KiCad's connectivity joins to it, as `(footprint kiid, pad
+    /// number)`, sorted.
+    pads: BTreeMap<String, Vec<(String, String)>>,
+    /// The KiCad holding the board cannot list them (before 10.0.1) and a
+    /// zone needed them.
+    unread: bool,
+    kicad: String,
+}
+
+/// Read the pads connected to each copper zone whose net is not in the
+/// schematic, when the plan changes a pad so a zone could follow one.
+///
+/// KiCad's Update PCB caches the pads each zone touches
+/// (`CONNECTIVITY_DATA::GetConnectedPads`); the API gives the zone's whole
+/// copper cluster on its net (`GetConnectedItems`, KiCad 10.0.1+), which adds
+/// the pads a track joins to the zone. Both are on the zone's net before the
+/// update, so they differ only when that net splits, where KiCad's own choice
+/// follows the order its pads sit in memory.
+fn connected_zone_pads(
+    client: &copperpour_ipc::KiCadIpcClient,
+    snapshot: &LiveSnapshot,
+    plan: &SyncPlan,
+    net_names: &BTreeSet<String>,
+) -> Result<ZonePads> {
+    use copperpour_ipc::gen::kiapi;
+
+    let mut found = ZonePads {
+        pads: BTreeMap::new(),
+        unread: false,
+        kicad: String::new(),
+    };
+    let changes_a_pad = plan
+        .changes
+        .iter()
+        .any(|change| matches!(change, PlannedChange::Update { .. }));
+    if plan.status == PlanStatus::Conflict || !changes_a_pad {
+        return Ok(found);
+    }
+    let zones = snapshot
+        .copper
+        .iter()
+        .filter(|item| item.kind == CopperKind::Zone && !item.net.is_empty())
+        .filter(|item| {
+            !net_names
+                .iter()
+                .any(|name| !name.is_empty() && item.net.starts_with(name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if zones.is_empty() {
+        return Ok(found);
+    }
+    let kicad = client.get_kicad_version()?;
+    if !super::library_footprint::carries_net_ties(&kicad) {
+        // `GetConnectedItems` came with 10.0.1, as net-tie pad groups did.
+        found.unread = true;
+        found.kicad = format!("{}.{}.{}", kicad.major, kicad.minor, kicad.patch);
+        return Ok(found);
+    }
+    for zone in zones {
+        let mut pads = client
+            .get_connected_items_in(
+                snapshot.document.clone(),
+                &zone.kiid,
+                &[kiapi::common::types::KiCadObjectType::KotPcbPad],
+            )?
+            .iter()
+            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+            .filter_map(|pad| {
+                pad.id
+                    .and_then(|id| snapshot.pad_owners.get(&id.value).cloned())
+            })
+            .collect::<Vec<_>>();
+        pads.sort();
+        pads.dedup();
+        found.pads.insert(zone.kiid.clone(), pads);
+    }
+    Ok(found)
+}
+
+/// Each via and copper zone the plan moves, as `UpdateItems` receives it:
+/// the item KiCad listed with only its net changed. KiCad finds the net by
+/// name, so a net the commit's pads bring is found too
+/// (`BOARD_CONNECTED_ITEM::UnpackNet`).
+fn copper_net_updates(plan: &SyncPlan, snapshot: &LiveSnapshot) -> Result<Vec<prost_types::Any>> {
+    use copperpour_ipc::gen::kiapi::board::types::{zone::Settings, Net, NetCode, Via, Zone};
+
+    plan.copper_net_changes
+        .iter()
+        .map(|change| {
+            let item = snapshot.copper_items.get(&change.kiid).with_context(|| {
+                format!("planned {:?} {} disappeared", change.kind, change.kiid)
+            })?;
+            let net = Net {
+                code: snapshot
+                    .net_codes
+                    .get(&change.to)
+                    .copied()
+                    .map(|value| NetCode { value }),
+                name: change.to.clone(),
+            };
+            Ok(match change.kind {
+                CopperKind::Via => {
+                    let mut via = Via::decode(item.value.as_slice())
+                        .context("KiCad listed an invalid via")?;
+                    via.net = Some(net);
+                    copperpour_ipc::builders::pack_any(&via, "kiapi.board.types.Via")
+                }
+                CopperKind::Zone => {
+                    let mut zone = Zone::decode(item.value.as_slice())
+                        .context("KiCad listed an invalid zone")?;
+                    let Some(Settings::CopperSettings(copper)) = zone.settings.as_mut() else {
+                        bail!("planned copper zone {} is not a copper zone", change.kiid);
+                    };
+                    copper.net = Some(net);
+                    copperpour_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
+                }
+            })
+        })
+        .collect()
+}
+
+/// Each moved via or zone KiCad reads back on another net than the plan's,
+/// with the net it reads back on (`""` when it is gone).
+fn copper_not_moved<'a>(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    moved: &'a [CopperNetChange],
+) -> Result<Vec<(&'a CopperNetChange, String)>> {
+    if moved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (copper, _) = read_copper_items(client, document)?;
+    Ok(moved
+        .iter()
+        .filter_map(|change| {
+            let net = copper
+                .iter()
+                .find(|item| item.kiid == change.kiid)
+                .map(|item| item.net.clone())
+                .unwrap_or_default();
+            (net != change.to).then_some((change, net))
+        })
+        .collect())
 }
 
 /// The applied response, an error when a readback after the commit could not
@@ -5323,6 +5815,7 @@ mod tests {
             components: vec![r1, r2, resistor("R3", "/r3"), resistor("R4", "/r4")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let board = board_with(vec![
             board_resistor("R1", Some("/r1")),
@@ -5576,6 +6069,7 @@ mod tests {
             ],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let board = BoardState {
             footprints: vec![
@@ -5677,6 +6171,7 @@ mod tests {
             components: vec![component],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("fields", &design, &board_with(vec![footprint.clone()]));
@@ -5914,6 +6409,7 @@ mod tests {
             ],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         apply_saved_symbol_flags(&[schematic], &mut design).unwrap();
@@ -5951,6 +6447,7 @@ mod tests {
                 components: vec![resistor("U1", "/u1"), resistor("R1", "/r1")],
                 skipped: Vec::new(),
                 unassigned: Vec::new(),
+                net_names: BTreeSet::new(),
             };
             apply_saved_symbol_flags(std::slice::from_ref(&schematic), &mut design).unwrap();
             let plan = plan_sync("netlist", &design, &board_with(Vec::new()));
@@ -6520,6 +7017,7 @@ mod tests {
             }],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let board = BoardState {
             footprints: vec![BoardFootprint {
@@ -6574,6 +7072,7 @@ mod tests {
             }],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let mut board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
         board.routed_nets = BTreeMap::from([("VCC".to_string(), 1), ("GND".to_string(), 3)]);
@@ -6749,6 +7248,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let plan = plan_sync(
             "netlist",
@@ -6772,6 +7272,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
@@ -6828,6 +7329,7 @@ mod tests {
                 symbol_path: "/sheet/existing".to_string(),
             }],
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         }
     }
 
@@ -7066,6 +7568,7 @@ mod tests {
             components: vec![resistor("R2", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let plan = plan_sync(
             "netlist",
@@ -7110,6 +7613,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/new")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let first = plan_sync("netlist", &design, &board_with(Vec::new()));
         let mut changed_board = board_with(Vec::new());
@@ -7353,6 +7857,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -7410,6 +7915,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let mut footprint =
@@ -7452,6 +7958,7 @@ mod tests {
             components: vec![resistor("R5", "/sheet/new")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync(
@@ -7490,6 +7997,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -7529,6 +8037,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -7570,6 +8079,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -7611,6 +8121,7 @@ mod tests {
                 symbol_path: "/sheet/excluded".to_string(),
             }],
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -7651,6 +8162,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -7688,6 +8200,7 @@ mod tests {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         (design, board)
     }
@@ -7820,6 +8333,275 @@ mod tests {
         assert_eq!(plan.changes, vec![r3_deleted()]);
         assert_eq!(plan.counts.added.planned, 0);
         assert_eq!(plan.counts.deleted.planned, 1);
+    }
+
+    /// A via or copper zone on the planner's board (#862).
+    fn copper(kind: CopperKind, kiid: &str, net: &str) -> CopperItem {
+        CopperItem {
+            kind,
+            kiid: kiid.to_string(),
+            net: net.to_string(),
+            name: String::new(),
+        }
+    }
+
+    /// R1 and R2 on the board, pad 1 on VCC and pad 2 on GND; the schematic
+    /// moves R1's pad 2 to `r1_to` and R2's to `r2_to`, and has no GND.
+    fn plan_moving_gnd(r1_to: &str, r2_to: &str) -> (SyncPlan, BoardState, BTreeSet<String>) {
+        let board = board_with(vec![
+            board_resistor("R1", Some("/r1")),
+            board_resistor("R2", Some("/r2")),
+        ]);
+        let mut r1 = resistor("R1", "/r1");
+        r1.pad_nets.insert("2".to_string(), r1_to.to_string());
+        let mut r2 = resistor("R2", "/r2");
+        r2.pad_nets.insert("2".to_string(), r2_to.to_string());
+        let net_names = ["VCC", r1_to, r2_to]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let design = ExportedDesign {
+            root_sheet_uuid: None,
+            components: vec![r1, r2],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+            net_names: net_names.clone(),
+        };
+        let plan = plan_sync("netlist", &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        (plan, board, net_names)
+    }
+
+    fn moved(kind: CopperKind, kiid: &str, from: &str, to: &str) -> CopperNetChange {
+        CopperNetChange {
+            kind,
+            kiid: kiid.to_string(),
+            name: String::new(),
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    fn note_codes(plan: &SyncPlan) -> Vec<(&str, Option<&str>)> {
+        plan.diagnostics
+            .iter()
+            .map(|note| (note.code.as_str(), note.kiid.as_deref()))
+            .collect()
+    }
+
+    /// The via and the zone on GND, which leaves the schematic, follow the
+    /// pads off it; copper on VCC, still in the schematic, and on no net
+    /// stays without a note.
+    #[test]
+    fn the_vias_and_zones_of_a_net_that_left_follow_its_pads() {
+        let (mut plan, board, net_names) = plan_moving_gnd("NEW", "NEW");
+        let copper = [
+            copper(CopperKind::Via, "via-gnd", "GND"),
+            copper(CopperKind::Via, "via-vcc", "VCC"),
+            copper(CopperKind::Via, "via-none", ""),
+            copper(CopperKind::Zone, "zone-gnd", "GND"),
+        ];
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &BTreeMap::new());
+
+        assert_eq!(
+            plan.copper_net_changes,
+            vec![
+                moved(CopperKind::Via, "via-gnd", "GND", "NEW"),
+                moved(CopperKind::Zone, "zone-gnd", "GND", "NEW"),
+            ]
+        );
+        assert_eq!(plan.counts.copper_net_changes.planned, 2);
+        assert_eq!(note_codes(&plan), []);
+    }
+
+    /// GND splits: R1's pad goes to A, R2's to B. As in KiCad, the last pad
+    /// sets the net map, so the via and the zone with no connected pad go to
+    /// B; the zone R1's pad touches goes to A.
+    #[test]
+    fn a_zone_takes_the_net_of_a_pad_connected_to_it_first() {
+        let (mut plan, board, net_names) = plan_moving_gnd("A", "B");
+        let copper = [
+            copper(CopperKind::Via, "via", "GND"),
+            copper(CopperKind::Zone, "zone-r1", "GND"),
+            copper(CopperKind::Zone, "zone-alone", "GND"),
+        ];
+        let zone_pads = BTreeMap::from([(
+            "zone-r1".to_string(),
+            vec![("R1-kiid".to_string(), "2".to_string())],
+        )]);
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &zone_pads);
+
+        assert_eq!(
+            plan.copper_net_changes,
+            vec![
+                moved(CopperKind::Via, "via", "GND", "B"),
+                moved(CopperKind::Zone, "zone-r1", "GND", "A"),
+                moved(CopperKind::Zone, "zone-alone", "GND", "B"),
+            ]
+        );
+    }
+
+    /// A pad connected to the zone that stays on the zone's own net is passed
+    /// over, as KiCad's `if( getNetname( pad ) != zone->GetNetname() )` passes
+    /// it (`board_netlist_updater.cpp:1786`, 10.0.8): H1, a footprint the
+    /// schematic does not touch (a mounting hole or fiducial), keeps its pad 2
+    /// on GND under the GND zone. Listed before R1's pad, the zone still takes
+    /// R1's new net; listed alone, the net map gives the net (#866 review).
+    #[test]
+    fn a_connected_pad_that_stays_on_the_zones_net_is_passed_over() {
+        let (mut plan, mut board, net_names) = plan_moving_gnd("A", "B");
+        board.footprints.push(board_resistor("H1", None));
+        let copper = [
+            copper(CopperKind::Zone, "zone-h1-first", "GND"),
+            copper(CopperKind::Zone, "zone-h1-only", "GND"),
+        ];
+        let h1 = ("H1-kiid".to_string(), "2".to_string());
+        let r1 = ("R1-kiid".to_string(), "2".to_string());
+        let zone_pads = BTreeMap::from([
+            ("zone-h1-first".to_string(), vec![h1.clone(), r1]),
+            ("zone-h1-only".to_string(), vec![h1]),
+        ]);
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &zone_pads);
+
+        assert_eq!(
+            plan.copper_net_changes,
+            vec![
+                moved(CopperKind::Zone, "zone-h1-first", "GND", "A"),
+                moved(CopperKind::Zone, "zone-h1-only", "GND", "B"),
+            ]
+        );
+    }
+
+    /// KiCad records a pad's move in the net map only when its new net is
+    /// not empty: R2's pad 2 losing its net does not take the via off to no
+    /// net, and R1's pad 2 moving to A still leads it there.
+    #[test]
+    fn a_pad_that_loses_its_net_leaves_the_net_map_alone() {
+        let (mut plan, board, net_names) = plan_moving_gnd("A", "");
+        let copper = [copper(CopperKind::Via, "via", "GND")];
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &BTreeMap::new());
+
+        assert_eq!(
+            plan.copper_net_changes,
+            vec![moved(CopperKind::Via, "via", "GND", "A")]
+        );
+    }
+
+    /// Copper on a net that left the schematic, with no pad moving off it,
+    /// stays, each item with KiCad's warning as a note naming it.
+    #[test]
+    fn copper_on_a_net_no_pad_moves_off_stays_with_a_note() {
+        let (mut plan, board, net_names) = plan_moving_gnd("NEW", "NEW");
+        let copper = [
+            copper(CopperKind::Via, "via-old", "OLD"),
+            copper(CopperKind::Zone, "zone-old", "OLD"),
+        ];
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &BTreeMap::new());
+
+        assert_eq!(plan.copper_net_changes, []);
+        assert_eq!(
+            note_codes(&plan),
+            [
+                ("via_net_not_in_schematic", Some("via-old")),
+                ("zone_net_not_in_schematic", Some("zone-old")),
+            ]
+        );
+        assert_eq!(plan.status, PlanStatus::Ready);
+    }
+
+    /// KiCad reads a zone net that starts with a schematic net's name as
+    /// that net (`isInNetlist`); a via gets no such reading.
+    #[test]
+    fn a_zone_on_a_pseudo_name_of_a_schematic_net_stays() {
+        let (mut plan, board, net_names) = plan_moving_gnd("NEW", "NEW");
+        let copper = [
+            copper(CopperKind::Zone, "zone", "NEW_1"),
+            copper(CopperKind::Via, "via", "NEW_1"),
+        ];
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &BTreeMap::new());
+
+        assert_eq!(plan.copper_net_changes, []);
+        assert_eq!(
+            note_codes(&plan),
+            [("via_net_not_in_schematic", Some("via"))]
+        );
+    }
+
+    /// The net map comes from the pad changes still planned: with the
+    /// updates taken off, as the preflight takes off a skipped part's, no
+    /// copper moves.
+    #[test]
+    fn copper_follows_only_the_pad_changes_still_planned() {
+        let (mut plan, board, net_names) = plan_moving_gnd("NEW", "NEW");
+        plan.changes.clear();
+        let copper = [copper(CopperKind::Via, "via", "GND")];
+
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &BTreeMap::new());
+
+        assert_eq!(plan.copper_net_changes, []);
+        assert_eq!(
+            note_codes(&plan),
+            [("via_net_not_in_schematic", Some("via"))]
+        );
+    }
+
+    /// A plan with a conflict moves no copper and notes none; a plan refused
+    /// later drops the moves it planned.
+    #[test]
+    fn a_refused_plan_moves_no_copper() {
+        let copper = [copper(CopperKind::Via, "via", "GND")];
+        let (mut conflicted, board, net_names) = plan_moving_gnd("NEW", "NEW");
+        conflicted.status = PlanStatus::Conflict;
+        plan_copper_nets(
+            &mut conflicted,
+            &board,
+            &copper,
+            &net_names,
+            &BTreeMap::new(),
+        );
+        assert_eq!(conflicted.copper_net_changes, []);
+        assert_eq!(note_codes(&conflicted), []);
+
+        let (mut plan, board, net_names) = plan_moving_gnd("NEW", "NEW");
+        plan_copper_nets(&mut plan, &board, &copper, &net_names, &BTreeMap::new());
+        assert_eq!(plan.counts.copper_net_changes.planned, 1);
+        refuse_plan(
+            &mut plan,
+            vec![conflict("preflight_conflict", "refused".to_string(), None)],
+        );
+        assert_eq!(plan.copper_net_changes, []);
+        assert_eq!(plan.counts.copper_net_changes.planned, 0);
+    }
+
+    /// The parser keeps every net a pin is on, a footprint-less part's
+    /// included, as KiCad's netlist holds it.
+    #[test]
+    fn the_netlist_keeps_the_net_of_a_part_with_no_footprint() {
+        let design = parse_exported_netlist(UNASSIGNED).unwrap();
+        assert!(!design.net_names.is_empty());
+        let footprint_nets = design
+            .components
+            .iter()
+            .flat_map(|component| component.pad_nets.values().cloned())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            design.net_names.is_superset(&footprint_nets),
+            "{:?} lacks some of {footprint_nets:?}",
+            design.net_names
+        );
+        // R1 has no footprint; its pad 2's net is on no other pin.
+        assert!(
+            design.net_names.contains("unconnected-(R1-Pad2)"),
+            "{:?}",
+            design.net_names
+        );
+        assert!(!footprint_nets.contains("unconnected-(R1-Pad2)"));
     }
 
     /// KiCad's own `R1` (`issue_474_r1.ipc.bin`: pad 1 on `VCC`, pad 2 on
@@ -8306,6 +9088,7 @@ mod tests {
             unassigned: Vec::new(),
             skipped: Vec::new(),
             without_symbols: Vec::new(),
+            copper_net_changes: Vec::new(),
             staging: None,
             acknowledged_apply: None,
         }
@@ -8494,6 +9277,7 @@ mod tests {
             components: vec![component],
             skipped: Vec::new(),
             unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
         };
         let board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
 
@@ -8610,6 +9394,32 @@ mod tests {
         /// Listing the footprints after a commit fails from this listing on,
         /// counted from 0; `usize::MAX` (the default) never fails.
         fails_readback: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// The vias the mock's board holds, as `GetItems` lists them (#862).
+        vias: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        /// The zones the mock's board holds, as `UpdateItems` left them.
+        zones: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        /// What `GetConnectedItems` answers, by the KIID asked about.
+        connected: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Vec<prost_types::Any>>>>,
+        /// When set, `UpdateItems` answers OK and leaves vias and zones as
+        /// they were.
+        keeps_copper: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// When set, listing the vias or zones fails once a commit has ended.
+        fails_copper_readback: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// A listed via's or zone's KIID, decoded as its own type (#862).
+    fn copper_kiid(item: &prost_types::Any) -> String {
+        use copperpour_ipc::gen::kiapi::board::types::{Via, Zone};
+        let id = if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Via") {
+            Via::decode(item.value.as_slice())
+                .ok()
+                .and_then(|via| via.id)
+        } else {
+            Zone::decode(item.value.as_slice())
+                .ok()
+                .and_then(|zone| zone.id)
+        };
+        id.map(|id| id.value).unwrap_or_default()
     }
 
     /// A listed footprint's KIID.
@@ -8731,7 +9541,24 @@ mod tests {
                 .collect::<Vec<_>>();
             let held_footprints = std::sync::Arc::new(std::sync::Mutex::new(held.footprints));
             let board_held = held_footprints.clone();
-            let held_zones = held.zones;
+            let zones_held = std::sync::Arc::new(std::sync::Mutex::new(held.zones));
+            let held_zones = zones_held.clone();
+            let zones_updated = zones_held.clone();
+            let vias_held =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
+            let held_vias = vias_held.clone();
+            let vias_updated = vias_held.clone();
+            let vias_measured = vias_held.clone();
+            let connected = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::<
+                String,
+                Vec<prost_types::Any>,
+            >::new()));
+            let connected_items = connected.clone();
+            let keeps_copper = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ignores_copper = keeps_copper.clone();
+            let fails_copper_readback =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let copper_readback_fails = fails_copper_readback.clone();
             let zones_after_commit =
                 std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<prost_types::Any>>));
             let after_commit = zones_after_commit.clone();
@@ -8808,6 +9635,7 @@ mod tests {
                         let footprints =
                             kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
                         let zones = kiapi::common::types::KiCadObjectType::KotPcbZone as i32;
+                        let vias = kiapi::common::types::KiCadObjectType::KotPcbVia as i32;
                         let tables = kiapi::common::types::KiCadObjectType::KotPcbTable as i32;
                         let items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
@@ -8845,6 +9673,22 @@ mod tests {
                                         .map(|item| read_back(item, readback)),
                                 )
                                 .collect(),
+                            _ if (request.types.contains(&zones)
+                                || request.types.contains(&vias))
+                                && copper_readback_fails
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                && committed.load(std::sync::atomic::Ordering::SeqCst) =>
+                            {
+                                return Some(copperpour_ipc::builders::pack_any(
+                                    &kiapi::common::commands::GetItemsResponse {
+                                        header: None,
+                                        status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound
+                                            as i32,
+                                        items: Vec::new(),
+                                    },
+                                    "kiapi.common.commands.GetItemsResponse",
+                                ));
+                            }
                             _ if request.types.contains(&zones) => {
                                 match &*after_commit.lock().unwrap() {
                                     Some(after)
@@ -8852,9 +9696,10 @@ mod tests {
                                     {
                                         after.clone()
                                     }
-                                    _ => held_zones.clone(),
+                                    _ => held_zones.lock().unwrap().clone(),
                                 }
                             }
+                            _ if request.types.contains(&vias) => held_vias.lock().unwrap().clone(),
                             _ if request.types.contains(&tables) => held_tables
                                 .iter()
                                 .map(|(kiid, _)| {
@@ -8916,8 +9761,13 @@ mod tests {
                                 {
                                     return *bounds;
                                 }
+                                let held_via = vias_measured
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|via| copper_kiid(via) == kiid);
                                 assert!(
-                                    held_kiids.iter().any(|held| held == kiid),
+                                    held_via || held_kiids.iter().any(|held| held == kiid),
                                     "only the outline and held items are listed, not {kiid}"
                                 );
                                 (0.0, 0.0, 10.0, 10.0)
@@ -8988,10 +9838,52 @@ mod tests {
                             "kiapi.common.commands.CreateItemsResponse",
                         ));
                     }
+                    if command.type_url.ends_with("GetConnectedItems") {
+                        let request = kiapi::board::commands::GetConnectedItems::decode(
+                            command.value.as_slice(),
+                        )
+                        .expect("GetConnectedItems request");
+                        let connected = connected_items.lock().unwrap();
+                        let items = request
+                            .items
+                            .iter()
+                            .flat_map(|id| connected.get(&id.value).cloned().unwrap_or_default())
+                            .collect();
+                        return Some(copperpour_ipc::builders::pack_any(
+                            &kiapi::common::commands::GetItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                items,
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        ));
+                    }
                     if command.type_url.ends_with("UpdateItems") {
                         let request =
                             kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
                                 .expect("UpdateItems request");
+                        if !ignores_copper.load(std::sync::atomic::Ordering::SeqCst) {
+                            for updated in &request.items {
+                                let copper = if copperpour_ipc::builders::any_is(
+                                    updated,
+                                    "kiapi.board.types.Zone",
+                                ) {
+                                    &zones_updated
+                                } else if copperpour_ipc::builders::any_is(
+                                    updated,
+                                    "kiapi.board.types.Via",
+                                ) {
+                                    &vias_updated
+                                } else {
+                                    continue;
+                                };
+                                for item in copper.lock().unwrap().iter_mut() {
+                                    if copper_kiid(item) == copper_kiid(updated) {
+                                        *item = updated.clone();
+                                    }
+                                }
+                            }
+                        }
                         let mut held = board_held.lock().unwrap();
                         for updated in &request.items {
                             for footprint in held.iter_mut() {
@@ -9116,6 +10008,11 @@ mod tests {
                 keeps_deleted,
                 reports_deleted,
                 fails_readback,
+                vias: vias_held,
+                zones: zones_held,
+                connected,
+                keeps_copper,
+                fails_copper_readback,
             }
         }
 
@@ -10893,7 +11790,20 @@ mod tests {
         assert_eq!(plan["changes_count"], 1, "{plan:#}");
         assert_eq!(plan["changes"][0]["reference"], "C1", "{plan:#}");
         assert_eq!(plan["skipped_footprints"][0]["reference"], "R1", "{plan:#}");
-        assert_eq!(plan["diagnostics"], serde_json::json!([]), "{plan:#}");
+        // R1 keeps its pad on GND, so no pad moves the pour off it; GND has
+        // left the schematic, so the pour stays with KiCad's warning (#862).
+        assert_eq!(
+            plan["copper_net_changes"],
+            serde_json::json!([]),
+            "{plan:#}"
+        );
+        let codes = plan["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["code"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(codes, ["zone_net_not_in_schematic"], "{plan:#}");
 
         let (is_error, applied) = served
             .sync(
@@ -11393,6 +12303,341 @@ mod tests {
         assert_eq!(named_without_symbols(&plan), r3_named(false));
     }
 
+    /// A via as KiCad lists it (the #96 repro board's first via), given
+    /// `kiid` and `net` (#862).
+    fn via_on(kiid: &str, net: &str) -> prost_types::Any {
+        use copperpour_ipc::gen::kiapi;
+        let listed = kiapi::common::commands::GetItemsResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_96_vias.ipc.bin").as_slice(),
+        )
+        .expect("the captured vias decode")
+        .items;
+        let mut via = kiapi::board::types::Via::decode(listed[0].value.as_slice())
+            .expect("the first captured item is a via");
+        via.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        via.net = Some(kiapi::board::types::Net {
+            code: None,
+            name: net.to_string(),
+        });
+        copperpour_ipc::builders::pack_any(&via, "kiapi.board.types.Via")
+    }
+
+    /// The net of each via and zone the mock's board holds, by KIID.
+    fn held_copper_nets(served: &ServedSync) -> BTreeMap<String, String> {
+        use copperpour_ipc::gen::kiapi::board::types::Via;
+        let mut nets = BTreeMap::new();
+        for via in served.vias.lock().unwrap().iter() {
+            let net = Via::decode(via.value.as_slice()).unwrap().net.unwrap().name;
+            nets.insert(copper_kiid(via), net);
+        }
+        for zone in served.zones.lock().unwrap().iter() {
+            let ZoneNet::Copper(net) = zone_net(zone.value.as_slice()) else {
+                panic!("a copper zone");
+            };
+            nets.insert(copper_kiid(zone), net.name);
+        }
+        nets
+    }
+
+    /// The captured pour's KIID.
+    fn pour_kiid() -> String {
+        copper_kiid(&zone_item(GND_POUR))
+    }
+
+    /// R1 under the GND pour, as [`served_r1_under_the_gnd_pour`], with a via
+    /// on GND (which the netlist renames) and a via on VCC (which it keeps).
+    async fn served_with_gnd_copper() -> ServedSync {
+        let served = served_r1_under_the_gnd_pour().await;
+        *served.vias.lock().unwrap() = vec![via_on("via-gnd", "GND"), via_on("via-vcc", "VCC")];
+        served
+    }
+
+    /// The dry run that acknowledges each routed pad change of `netlist`.
+    async fn acknowledged_dry_run(
+        served: &ServedSync,
+        netlist: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let refused = served.dry_run(netlist).await;
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        let acknowledged = acknowledging_each(&refused);
+        let (_, plan) = served
+            .sync(
+                netlist,
+                serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+            )
+            .await;
+        (plan, acknowledged)
+    }
+
+    /// The apply of `plan`, made with `acknowledged`.
+    async fn apply_acknowledged(
+        served: &ServedSync,
+        netlist: &str,
+        plan: &serde_json::Value,
+        acknowledged: &serde_json::Value,
+    ) -> (bool, serde_json::Value) {
+        served
+            .sync(
+                netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                    "acknowledged_net_changes": acknowledged,
+                }),
+            )
+            .await
+    }
+
+    /// The `(kind, kiid, from, to)` of each planned copper move.
+    fn copper_moves(response: &serde_json::Value) -> Vec<(String, String, String, String)> {
+        response["copper_net_changes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no copper_net_changes: {response:#}"))
+            .iter()
+            .map(|change| {
+                let text = |key: &str| change[key].as_str().unwrap().to_string();
+                (text("kind"), text("kiid"), text("from"), text("to"))
+            })
+            .collect()
+    }
+
+    fn move_of(kind: &str, kiid: &str, from: &str, to: &str) -> (String, String, String, String) {
+        (
+            kind.to_string(),
+            kiid.to_string(),
+            from.to_string(),
+            to.to_string(),
+        )
+    }
+
+    /// #862 through `tools/call`: GND leaves the schematic as R1's pad 2
+    /// moves to NEW_NET. The plan moves the via on GND and the pour with it,
+    /// the via on VCC stays, and the apply sends them in the sync's commit.
+    #[tokio::test]
+    async fn the_vias_and_pour_of_a_renamed_net_move_in_the_same_commit() {
+        let served = served_with_gnd_copper().await;
+        let netlist = netlist_moving_off("GND");
+
+        let (plan, acknowledged) = acknowledged_dry_run(&served, &netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            copper_moves(&plan),
+            [
+                move_of("via", "via-gnd", "GND", "NEW_NET"),
+                move_of("zone", &pour_kiid(), "GND", "NEW_NET"),
+            ],
+            "{plan:#}"
+        );
+        assert_eq!(plan["coverage"]["copper_net_changes"]["planned"], 2);
+
+        let (is_error, applied) = apply_acknowledged(&served, &netlist, &plan, &acknowledged).await;
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["copper_net_changes"]["applied"], 2);
+        assert!(
+            !applied["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note["code"] == "board_readback_differs"),
+            "{applied:#}"
+        );
+        assert_eq!(served.sent("BeginCommit"), 1);
+        assert_eq!(
+            held_copper_nets(&served),
+            BTreeMap::from([
+                ("via-gnd".to_string(), "NEW_NET".to_string()),
+                ("via-vcc".to_string(), "VCC".to_string()),
+                (pour_kiid(), "NEW_NET".to_string()),
+            ])
+        );
+    }
+
+    /// A zone first follows a pad KiCad's connectivity joins to it: the
+    /// mock says the pour touches R1's pad 1, which stays on VCC, so the
+    /// pour goes to VCC rather than to NEW_NET, where GND's pads went.
+    /// (A pad on a GND pour is on GND in a real board; the mock only shows
+    /// which source the plan takes the net from.)
+    #[tokio::test]
+    async fn a_zone_follows_the_pad_kicad_joins_to_it() {
+        let served = served_with_gnd_copper().await;
+        served
+            .connected
+            .lock()
+            .unwrap()
+            .insert(pour_kiid(), vec![r1_pad("1")]);
+        let netlist = netlist_moving_off("GND");
+
+        let (plan, _) = acknowledged_dry_run(&served, &netlist).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            copper_moves(&plan)[1],
+            move_of("zone", &pour_kiid(), "GND", "VCC"),
+            "{plan:#}"
+        );
+        assert!(served.sent("GetConnectedItems") >= 1);
+    }
+
+    /// KiCad before 10.0.1 cannot list a zone's pads: the zone follows the
+    /// net map, and a note says why.
+    #[tokio::test]
+    async fn an_older_kicad_moves_a_zone_by_the_net_map_with_a_note() {
+        let served = served_with_gnd_copper().await;
+        served.report_kicad_version(10, 0, 0);
+        served
+            .connected
+            .lock()
+            .unwrap()
+            .insert(pour_kiid(), vec![r1_pad("1")]);
+        let netlist = netlist_moving_off("GND");
+
+        let (plan, _) = acknowledged_dry_run(&served, &netlist).await;
+
+        assert_eq!(
+            copper_moves(&plan)[1],
+            move_of("zone", &pour_kiid(), "GND", "NEW_NET"),
+            "{plan:#}"
+        );
+        assert!(
+            plan["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note["code"] == "zone_pads_not_read"),
+            "{plan:#}"
+        );
+        assert_eq!(served.sent("GetConnectedItems"), 0);
+    }
+
+    /// What the zones' pads say is part of the plan: a dry run that moved
+    /// the pour to VCC does not apply once it would go to NEW_NET.
+    #[tokio::test]
+    async fn the_plan_revision_covers_the_copper_moves() {
+        let served = served_with_gnd_copper().await;
+        served
+            .connected
+            .lock()
+            .unwrap()
+            .insert(pour_kiid(), vec![r1_pad("1")]);
+        let netlist = netlist_moving_off("GND");
+        let (plan, acknowledged) = acknowledged_dry_run(&served, &netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        served.connected.lock().unwrap().clear();
+
+        let (_, refused) = apply_acknowledged(&served, &netlist, &plan, &acknowledged).await;
+
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert!(
+            refused["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note["code"] == "stale_plan_revision"),
+            "{refused:#}"
+        );
+        assert_eq!(refused["copper_net_changes"], serde_json::json!([]));
+        assert_eq!(held_copper_nets(&served)[&pour_kiid()], "GND");
+    }
+
+    /// The board is read back after the commit: a via or zone KiCad left on
+    /// its old net is reported, naming it.
+    #[tokio::test]
+    async fn copper_kicad_did_not_move_is_reported() {
+        let served = served_with_gnd_copper().await;
+        served
+            .keeps_copper
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let netlist = netlist_moving_off("GND");
+        let (plan, acknowledged) = acknowledged_dry_run(&served, &netlist).await;
+
+        let (_, applied) = apply_acknowledged(&served, &netlist, &plan, &acknowledged).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let mut differs = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|note| note["code"] == "board_readback_differs")
+            .map(|note| note["kiid"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        differs.sort();
+        let mut expected = vec!["via-gnd".to_string(), pour_kiid()];
+        expected.sort();
+        assert_eq!(differs, expected, "{applied:#}");
+        // The message reads as one sentence: no run of a source line's
+        // indentation inside it.
+        for note in applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|note| note["code"] == "board_readback_differs")
+        {
+            let message = note["message"].as_str().unwrap();
+            assert!(!message.contains("  "), "{message:?}");
+            assert!(
+                message.contains("reads back on 'GND' after the sync moved it to '"),
+                "{message:?}"
+            );
+        }
+        assert_eq!(applied["coverage"]["copper_net_changes"]["planned"], 2);
+        assert_eq!(applied["coverage"]["copper_net_changes"]["applied"], 0);
+    }
+
+    /// A readback of the moved copper that fails after the commit refuses
+    /// nothing: the apply answers `applied`, with a note, as an error.
+    #[tokio::test]
+    async fn a_copper_readback_that_fails_after_the_commit_is_reported() {
+        let served = served_with_gnd_copper().await;
+        served
+            .fails_copper_readback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let netlist = netlist_moving_off("GND");
+        let (plan, acknowledged) = acknowledged_dry_run(&served, &netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        let (is_error, applied) = apply_acknowledged(&served, &netlist, &plan, &acknowledged).await;
+
+        assert!(is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert!(
+            applied["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| {
+                    note["code"] == "apply_readback_unchecked"
+                        && note["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("the vias and zones it moved")
+                }),
+            "{applied:#}"
+        );
+        assert_eq!(
+            held_copper_nets(&served)[&pour_kiid()],
+            "NEW_NET",
+            "the commit stands"
+        );
+    }
+
+    /// R1's pad `number` as KiCad lists it inside the footprint.
+    fn r1_pad(number: &str) -> prost_types::Any {
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
+        let r1 = FootprintInstance::decode(schematic_backed_resistor().value.as_slice()).unwrap();
+        r1.definition
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|child| {
+                copperpour_ipc::builders::any_is(child, "kiapi.board.types.Pad")
+                    && Pad::decode(child.value.as_slice()).unwrap().number == number
+            })
+            .unwrap_or_else(|| panic!("R1 has a pad {number}"))
+    }
+
     /// The preflight checks a replacement's pads against the new footprint:
     /// the stock 0603 has pads 1 and 2, so a schematic connecting pad 3 is
     /// refused, and so is a board footprint whose pad 3 carries a net the
@@ -11412,6 +12657,7 @@ mod tests {
                 components: vec![component],
                 skipped: Vec::new(),
                 unassigned: Vec::new(),
+                net_names: BTreeSet::new(),
             };
             let board = board_with(vec![footprint]);
             let plan = plan_sync("netlist", &design, &board);
@@ -11475,6 +12721,7 @@ mod tests {
                 components: vec![component],
                 skipped: Vec::new(),
                 unassigned: Vec::new(),
+                net_names: BTreeSet::new(),
             };
             let board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
             let plan = plan_sync("netlist", &design, &board);
@@ -13911,6 +15158,7 @@ mod tests {
                 lib_id: Some("Device:R".to_string()),
                 symbol_path: "/r2-sym".to_string(),
             }],
+            net_names: BTreeSet::new(),
         };
         let board = board_with(vec![
             board_resistor("H1_OLD", Some("/root-uuid/h1-sym")),
