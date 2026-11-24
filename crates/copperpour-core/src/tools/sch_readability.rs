@@ -4,7 +4,7 @@ mod connector_pin_signals;
 
 use super::{
     sch_analysis::handle_check_overlaps, sch_layout_score::handle_compare_schematic_layout,
-    sch_page_fit, sch_pin_contacts, sch_wire_runs, ToolDef,
+    sch_page_fit, sch_pin_contacts, sch_placement_check, sch_wire_runs, ToolDef,
 };
 use crate::tool;
 use serde_json::json;
@@ -19,6 +19,7 @@ pub fn tools() -> Vec<ToolDef> {
         sch_pin_contacts::definition(),
         super::sch_cleanup::definition(),
         super::sch_block_placement::definition(),
+        sch_placement_check::definition(),
     ]
 }
 
@@ -177,5 +178,10 @@ mod tests {
             .iter()
             .all(|tool| tool.name != "preview_block_placement"));
         assert_readability_route("preview_block_placement").await;
+    }
+
+    #[tokio::test]
+    async fn placement_check_belongs_to_readability() {
+        assert_readability_route("check_schematic_placement").await;
     }
 }
