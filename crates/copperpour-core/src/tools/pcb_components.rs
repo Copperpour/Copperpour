@@ -73,6 +73,45 @@ pub(crate) fn resolve_footprint_file(lib_id: &str, board_path: &Path) -> anyhow:
         .map_err(|message| anyhow::anyhow!(message))
 }
 
+/// Resolve and read a library footprint for a tool handler, keeping the
+/// existing refusal text. A bad id is `InvalidArgument` on `field` when the
+/// caller supplied it; with `field` `None` the id came from the board (KiCad
+/// saves footprints without a library nickname), so it is `FileNotFound` like
+/// any other id that resolves to no library file.
+fn read_footprint_source_or_error(
+    lib_id: &str,
+    board_path: &Path,
+    field: Option<&str>,
+) -> Result<(PathBuf, String), CallToolResult> {
+    let path = match resolve_footprint_file(lib_id, board_path) {
+        Ok(path) => path,
+        Err(error) => {
+            let message = error.to_string();
+            let is_bad_syntax = lib_id
+                .split_once(':')
+                .is_none_or(|(nickname, entry)| nickname.is_empty() || entry.is_empty());
+            let kind = match field {
+                Some(field) if is_bad_syntax => crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: field.to_string(),
+                    reason: message.clone(),
+                },
+                _ => crate::mcp::error::ToolErrorKind::FileNotFound {
+                    path: lib_id.to_string(),
+                    absolute_path: String::new(),
+                },
+            };
+            return Err(CallToolResult::error_kind(kind, message));
+        }
+    };
+    let source = std::fs::read_to_string(&path).map_err(|error| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::file_not_found(&path),
+            format!("failed to read {}: {error}", path.display()),
+        )
+    })?;
+    Ok((path, source))
+}
+
 /// Structured rejection for any back-side (`B.*`) placement layer.
 ///
 /// Placing on the back is not a layer rename: KiCAD's flip mirrors the
@@ -1414,7 +1453,7 @@ impl ClosedBoardError {
     /// board untouched. Read, parse, writer and I/O errors return `Err` so dispatch
     /// classifies readback mismatches, revision conflicts, KiCad editor locks,
     /// and remaining I/O failures the same way as for other board writers.
-    pub(crate) fn into_result(self) -> anyhow::Result<CallToolResult> {
+    pub(crate) fn into_result(self, board_path: &Path) -> anyhow::Result<CallToolResult> {
         Ok(match self {
             Self::ReferenceNotFound(reference) => CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::InvalidArgument {
@@ -1437,9 +1476,13 @@ impl ClosedBoardError {
                      give the duplicates distinct references first."
                 ),
             ),
-            Self::Unusable(reason) => CallToolResult::error(format!(
-                "Refusing to edit the board: {reason}. The board file was not modified."
-            )),
+            Self::Unusable(reason) => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!("Refusing to edit the board: {reason}. The board file was not modified."),
+            ),
             Self::FlipBlocked(reason) => CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::PlanBlocked {
                     operation: "flip_component".to_string(),
@@ -1577,7 +1620,7 @@ fn closed_board_dry_run(
             "fallback_reason": reason.evidence(),
             "copper_check": pcb_copper_check::not_run_on_closed_board()
         }))),
-        Err(error) => error.into_result(),
+        Err(error) => error.into_result(board_path),
     }
 }
 
@@ -2795,19 +2838,11 @@ async fn handle_place_component(
             ))
         }
     };
-    let library_path = match resolve_footprint_file(&footprint, &board) {
-        Ok(path) => path,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let source = match std::fs::read_to_string(&library_path) {
-        Ok(source) => source,
-        Err(error) => {
-            return Ok(CallToolResult::error(format!(
-                "failed to read {}: {error}",
-                library_path.display()
-            )))
-        }
-    };
+    let (library_path, source) =
+        match read_footprint_source_or_error(&footprint, &board, Some("footprint")) {
+            Ok(loaded) => loaded,
+            Err(refusal) => return Ok(refusal),
+        };
     // A pre-6.0 `(module …)` file — what easyeda2kicad and many vendor
     // downloads still write — is modernised by KiCad's own converter in a
     // private copy, so the library on disk is left exactly as it was.
@@ -2818,12 +2853,19 @@ async fn handle_place_component(
         match super::cli::upgrade_legacy_footprint(&ctx.config.kicad_cli, &source, entry).await {
             Ok(upgraded) => upgraded,
             Err(error) => {
-                return Ok(CallToolResult::error(format!(
+                let message = format!(
                     "{} is a pre-6.0 (module …) footprint and kicad-cli could not upgrade a \
                      copy of it: {error:#}. Convert the library with `kicad-cli fp upgrade \
                      <dir-or-file>`, then retry.",
                     library_path.display()
-                )))
+                );
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::MalformedFile {
+                        path: library_path.display().to_string(),
+                        reason: format!("pre-6.0 (module …) footprint upgrade failed: {error:#}"),
+                    },
+                    message,
+                ));
             }
         }
     } else {
@@ -2841,7 +2883,16 @@ async fn handle_place_component(
         board.parent(),
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+        Err(error) => {
+            let message = error.to_string();
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MalformedFile {
+                    path: library_path.display().to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
+        }
     };
 
     // Try IPC first. The fallback gate is the typed transport classification:
@@ -2911,9 +2962,14 @@ async fn handle_place_component(
                 ));
             }
             if let Err(error) = prepared.file_block() {
-                return Ok(CallToolResult::error(format!(
-                    "{error:#}. The board file was not modified."
-                )));
+                let reason = format!("{error:#}");
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::PlanBlocked {
+                        operation: "place_component".to_string(),
+                        reasons: vec![reason.clone()],
+                    },
+                    format!("{reason}. The board file was not modified."),
+                ));
             }
             prepared.insert_into_board(&board)?;
             Ok(CallToolResult::json(&json!({
@@ -3003,7 +3059,7 @@ async fn handle_move_component(
                     "warning": reason.warning(),
                     "copper_check": pcb_copper_check::not_run_on_closed_board()
                 }))),
-                Err(error) => error.into_result(),
+                Err(error) => error.into_result(&board),
             }
         }
     }
@@ -3155,7 +3211,7 @@ async fn handle_rotate_component(
                     "warning": reason.warning(),
                     "copper_check": pcb_copper_check::not_run_on_closed_board()
                 }))),
-                Err(error) => error.into_result(),
+                Err(error) => error.into_result(&board),
             }
         }
     }
@@ -3294,7 +3350,7 @@ async fn handle_set_component_placements(
                 "warning": reason.warning(),
                 "copper_check": pcb_copper_check::not_run_on_closed_board()
             }))),
-            Err(error) => error.into_result(),
+            Err(error) => error.into_result(&board),
         },
     }
 }
@@ -3351,7 +3407,7 @@ async fn handle_flip_component(
                     "fallback_reason": reason.evidence(),
                     "warning": reason.warning()
                 }))),
-                Err(error) => error.into_result(),
+                Err(error) => error.into_result(&board),
             }
         }
     }
@@ -4231,11 +4287,17 @@ async fn handle_repair_corrupted_footprints(
     Ok(match outcome {
         BoardWrite::Ipc(value) => CallToolResult::json(&value),
         BoardWrite::Refused(result) => result,
-        BoardWrite::File(reason) => CallToolResult::error(format!(
-            "{} repair_corrupted_footprints is live-IPC-only and never edits the board file \
-             directly. Open the requested board in KiCad and retry.",
-            reason.premise()
-        )),
+        BoardWrite::File(reason) => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: reason.premise().to_string(),
+            },
+            format!(
+                "{} repair_corrupted_footprints is live-IPC-only and never edits the board file \
+                 directly. Open the requested board in KiCad and retry.",
+                reason.premise()
+            ),
+        ),
     })
 }
 
@@ -4462,11 +4524,16 @@ async fn handle_get_component_pads(
         // whole point — and the message says which key to press.
         crate::tools::board_source::BoardRead::Live(Some(_)) => {
             if saved_pad_count(&board_path, &reference).is_some_and(|count| count > 0) {
-                return Ok(CallToolResult::error(format!(
-                    "KiCad reports no pads for footprint '{reference}' while the saved file \
-                     has some. Refusing to answer 'no pads' — save the board in KiCad and \
-                     retry, and report this if it persists."
-                )));
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::Conflict {
+                        paths: vec![board_path.display().to_string()],
+                    },
+                    format!(
+                        "KiCad reports no pads for footprint '{reference}' while the saved file \
+                         has some. Refusing to answer 'no pads' — save the board in KiCad and \
+                         retry, and report this if it persists."
+                    ),
+                ));
             }
             let mut body = json!({
                 "reference": reference,
@@ -4485,9 +4552,14 @@ async fn handle_get_component_pads(
         // still carry a footprint the user has deleted, so answering from it
         // would be answering about a board that no longer exists.
         crate::tools::board_source::BoardRead::Live(None) => {
-            return Ok(CallToolResult::error(format!(
-                "Footprint '{reference}' not found on the board open in KiCad"
-            )))
+            let message = format!("Footprint '{reference}' not found on the board open in KiCad");
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "reference".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         }
         crate::tools::board_source::BoardRead::Saved(why) => why,
     };
@@ -4506,10 +4578,14 @@ async fn handle_get_component_pads(
     let fp_node = match fp_node {
         Some(n) => n,
         None => {
-            return Ok(CallToolResult::error(format!(
-                "Footprint '{}' not found",
-                reference
-            )))
+            let message = format!("Footprint '{}' not found", reference);
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "reference".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         }
     };
 
@@ -4525,14 +4601,26 @@ async fn handle_get_component_pads(
             .and_then(copperpour_sexp::SexpNode::as_str)
             .unwrap_or("<unreadable>");
         let Some(pad_at) = pad.find("at") else {
-            return Ok(CallToolResult::error(format!(
-                "Pad '{pad_number}' on footprint '{reference}' has no readable position"
-            )));
+            let message =
+                format!("Pad '{pad_number}' on footprint '{reference}' has no readable position");
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         };
         let (Some(local_x), Some(local_y)) = (pad_at.get_f64(1), pad_at.get_f64(2)) else {
-            return Ok(CallToolResult::error(format!(
-                "Pad '{pad_number}' on footprint '{reference}' has an invalid position"
-            )));
+            let message =
+                format!("Pad '{pad_number}' on footprint '{reference}' has an invalid position");
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         };
         // Transform local pad coords to board space (rotation only).
         // Uses the canonical KiCAD transform — see copperpour_sexp::geometry.
@@ -4564,9 +4652,16 @@ async fn handle_get_component_pads(
         ) {
             Ok(info) => info,
             Err(error) => {
-                return Ok(CallToolResult::error(format!(
+                let message = format!(
                     "Could not read pad '{pad_number}' on footprint '{reference}': {error}"
-                )))
+                );
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::MalformedFile {
+                        path: board_path.display().to_string(),
+                        reason: message.clone(),
+                    },
+                    message,
+                ));
             }
         };
         let mut value = serde_json::to_value(pad_info)?;
@@ -4631,10 +4726,14 @@ async fn handle_get_pad_position(
             }
         }
     }
-    Ok(CallToolResult::error(format!(
-        "Pad '{}' not found",
-        pad_number
-    )))
+    let message = format!("Pad '{}' not found", pad_number);
+    Ok(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: "pad_number".to_string(),
+            reason: message.clone(),
+        },
+        message,
+    ))
 }
 
 async fn handle_get_component_list(
@@ -4687,11 +4786,31 @@ async fn handle_place_array(
     };
     let count_y = args["count_y"].as_u64().unwrap_or(1);
     let Some(total_count) = count_x.checked_mul(count_y) else {
-        return Ok(CallToolResult::error("Array dimensions overflow."));
+        let message = "Array dimensions overflow.".to_string();
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "count_x".to_string(),
+                reason: message.clone(),
+            },
+            message,
+        ));
     };
     if count_x == 0 || count_y == 0 || total_count > 10_000 {
-        return Ok(CallToolResult::error(
-            "Array dimensions must be non-zero and contain at most 10,000 components.",
+        let field = if count_x == 0 {
+            "count_x"
+        } else if count_y == 0 {
+            "count_y"
+        } else {
+            "count_x"
+        };
+        let message =
+            "Array dimensions must be non-zero and contain at most 10,000 components.".to_string();
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: field.to_string(),
+                reason: message.clone(),
+            },
+            message,
         ));
     }
     let count_x = count_x as usize;
@@ -4704,12 +4823,20 @@ async fn handle_place_array(
     let prefix = args["ref_prefix"].as_str().unwrap_or("U").to_string();
     let ref_start = args["ref_start"].as_u64().unwrap_or(1);
     if ref_start.checked_add(total_count - 1).is_none() {
-        return Ok(CallToolResult::error("Reference number overflow."));
+        let message = "Reference number overflow.".to_string();
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "ref_start".to_string(),
+                reason: message.clone(),
+            },
+            message,
+        ));
     }
-    let source = match resolve_footprint_source(&footprint, &board) {
-        Ok(source) => source,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
+    let (library_path, source) =
+        match read_footprint_source_or_error(&footprint, &board, Some("footprint")) {
+            Ok(loaded) => loaded,
+            Err(refusal) => return Ok(refusal),
+        };
     let mut planned = Vec::with_capacity(total_count as usize);
     for row in 0..count_y {
         for col in 0..count_x {
@@ -4720,7 +4847,16 @@ async fn handle_place_array(
                 &source, &footprint, &reference, None, x, y, 0.0, "F.Cu",
             ) {
                 Ok(prepared) => prepared,
-                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+                Err(error) => {
+                    let message = error.to_string();
+                    return Ok(CallToolResult::error_kind(
+                        crate::mcp::error::ToolErrorKind::MalformedFile {
+                            path: library_path.display().to_string(),
+                            reason: message.clone(),
+                        },
+                        message,
+                    ));
+                }
             };
             planned.push((reference, prepared, x, y));
         }
@@ -4739,10 +4875,17 @@ async fn handle_place_array(
             .map(|(reference, _, _, _)| reference.as_str())
             .collect::<Vec<_>>();
         if !conflicts.is_empty() {
-            anyhow::bail!(
+            let message = format!(
                 "footprint references already exist on the board: {}",
                 conflicts.join(", ")
             );
+            return Ok(Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "ref_start".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            )));
         }
 
         let (carried, older_kicad) = match planned.first() {
@@ -4782,12 +4925,13 @@ async fn handle_place_array(
                 }))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok((components, not_carried))
+        Ok(Ok((components, not_carried)))
     })
     .await?
     {
-        Ok(result) => result,
-        Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error}"))),
+        Ok(Ok(result)) => result,
+        Ok(Err(refusal)) => return Ok(refusal),
+        Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
     };
     let mut response = json!({ "placed_count": placed.len(), "components": placed });
     if !not_carried.is_empty() {
@@ -4804,9 +4948,14 @@ async fn handle_align_components(
     let refs = match args["references"].as_array() {
         Some(references) if !references.is_empty() => references,
         _ => {
-            return Ok(CallToolResult::error(
-                "'references' must be a non-empty array.",
-            ))
+            let message = "'references' must be a non-empty array.".to_string();
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "references".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         }
     };
     let references = match refs
@@ -4815,11 +4964,27 @@ async fn handle_align_components(
         .collect::<Option<Vec<_>>>()
     {
         Some(references) => references,
-        None => return Ok(CallToolResult::error("Every reference must be a string.")),
+        None => {
+            let message = "Every reference must be a string.".to_string();
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "references".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
+        }
     };
     let axis = args["axis"].as_str().unwrap_or("x").to_string();
     if axis != "x" && axis != "y" {
-        return Ok(CallToolResult::error("'axis' must be either 'x' or 'y'."));
+        let message = "'axis' must be either 'x' or 'y'.".to_string();
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "axis".to_string(),
+                reason: message.clone(),
+            },
+            message,
+        ));
     }
     let value = match require_f64(args, "value") {
         Ok(v) => v,
@@ -4882,7 +5047,7 @@ async fn handle_align_components(
                 Some(kind),
             ));
         }
-        Err(error) => return Ok(CallToolResult::error(format!("IPC align error: {error}"))),
+        Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
     };
     Ok(CallToolResult::json(
         &json!({ "aligned_count": aligned.len(), "components": aligned }),
@@ -4920,9 +5085,10 @@ async fn handle_duplicate_component(
     if let Some(rejection) = back_side_layer_error(&src.layer) {
         return Ok(rejection);
     }
-    let source = match resolve_footprint_source(&src.footprint, &board) {
-        Ok(source) => source,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    let (library_path, source) = match read_footprint_source_or_error(&src.footprint, &board, None)
+    {
+        Ok(loaded) => loaded,
+        Err(refusal) => return Ok(refusal),
     };
     let prepared = match PreparedFootprintPlacement::from_library_for_ipc(
         &source,
@@ -4935,7 +5101,16 @@ async fn handle_duplicate_component(
         &src.layer,
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+        Err(error) => {
+            let message = error.to_string();
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MalformedFile {
+                    path: library_path.display().to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
+        }
     };
     let ipc_reference = new_reference.clone();
     let fp_id = src.footprint.clone();
@@ -7346,7 +7521,7 @@ mod tests {
             "(layers (0 \"F.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))\n  (net 0 \"\")",
         );
         let error = prepare_closed_board_footprint_side(&irregular, "U1", "B.Cu").unwrap_err();
-        let result = error.into_result().unwrap();
+        let result = error.into_result(Path::new("board.kicad_pcb")).unwrap();
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("plan_blocked")
@@ -7844,6 +8019,10 @@ mod tests {
         .unwrap();
 
         assert!(res.is_error, "the live board no longer has R1");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&res).as_deref(),
+            Some("invalid_argument")
+        );
         assert!(result_text(&res).contains("open in KiCad"));
     }
 
@@ -7864,6 +8043,10 @@ mod tests {
         .unwrap();
 
         assert!(res.is_error, "'no pads' must not pass as an answer here");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&res).as_deref(),
+            Some("conflict")
+        );
         assert!(result_text(&res).contains("no pads"));
     }
 
@@ -12269,5 +12452,391 @@ mod edit_component_tests {
     #[tokio::test]
     async fn a_repeated_reference_is_refused_when_no_edit_is_requested() {
         assert_repeated_reference(json!({})).await;
+    }
+}
+
+#[cfg(test)]
+mod structured_error_kind_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn served_call(name: &str, arguments: serde_json::Value) -> (bool, serde_json::Value) {
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: "ipc:///nonexistent-copperpour-test-741.sock".to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let reply = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 741,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }))
+            .await
+            .unwrap();
+        let result = reply.result.expect("tools/call returned a JSON-RPC result");
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(text)
+            .unwrap_or_else(|_| panic!("{name} returned non-JSON body: {text}"));
+        (is_error, parsed)
+    }
+
+    fn write_project_lib(dir: &Path, lib_name: &str, fp_name: &str, content: &str) {
+        let pretty = dir.join(format!("{lib_name}.pretty"));
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join(format!("{fp_name}.kicad_mod")), content).unwrap();
+        std::fs::write(
+            dir.join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\n  (version 7)\n  (lib (name \"{lib_name}\")(type \"KiCad\")(uri \"${{KIPRJMOD}}/{lib_name}.pretty\")(options \"\")(descr \"\"))\n)\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    const MINIMAL_BOARD: &str = "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n  (net 0 \"\")\n  (footprint \"Resistor_SMD:R_0603_1608Metric\"\n    (layer \"F.Cu\")\n    (at 10 20)\n    (property \"Reference\" \"R1\" (at 0 0) (layer \"F.SilkS\"))\n    (pad \"1\" smd rect (at -0.8 0) (size 0.8 0.9) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\"))\n  )\n)\n";
+
+    #[tokio::test]
+    async fn place_component_refusals_report_structured_error_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&board, MINIMAL_BOARD).unwrap();
+
+        // Bad Library:Footprint syntax -> invalid_argument
+        let (is_error, body) = served_call(
+            "place_component",
+            json!({
+                "board": board,
+                "footprint": "NoColonSyntax",
+                "reference": "R2",
+                "x": 10.0,
+                "y": 10.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "footprint");
+
+        // Unresolved library footprint -> file_not_found
+        let (is_error, body) = served_call(
+            "place_component",
+            json!({
+                "board": board,
+                "footprint": "NoSuchLib741:NoSuchPart741",
+                "reference": "R2",
+                "x": 10.0,
+                "y": 10.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "file_not_found");
+        assert_eq!(body["error"]["path"], "NoSuchLib741:NoSuchPart741");
+        assert_eq!(body["error"]["absolute_path"], "");
+
+        // Malformed library .kicad_mod -> malformed_file
+        write_project_lib(tmp.path(), "Broken741", "BadFp", "(footprint \"BadFp\"");
+        let (is_error, body) = served_call(
+            "place_component",
+            json!({
+                "board": board,
+                "footprint": "Broken741:BadFp",
+                "reference": "R2",
+                "x": 10.0,
+                "y": 10.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "malformed_file");
+
+        // Closed-board B.Cu placement of footprint with unsupported 3D model -> plan_blocked
+        write_project_lib(
+            tmp.path(),
+            "BackModel741",
+            "WithModel",
+            "(footprint \"WithModel\"\n  (layer \"F.Cu\")\n  (property \"Reference\" \"REF**\" (at 0 0) (layer \"F.SilkS\"))\n  (property \"Value\" \"WithModel\" (at 0 1) (layer \"F.Fab\"))\n  (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\"))\n  (model \"foo.step\" (offset (xyz 0 0 0)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 0)))\n)\n",
+        );
+        let (is_error, body) = served_call(
+            "place_component",
+            json!({
+                "board": board,
+                "footprint": "BackModel741:WithModel",
+                "reference": "R2",
+                "x": 10.0,
+                "y": 10.0,
+                "layer": "B.Cu"
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "plan_blocked");
+        assert_eq!(body["error"]["operation"], "place_component");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), MINIMAL_BOARD);
+    }
+
+    #[test]
+    fn a_board_footprint_without_a_library_nickname_is_not_blamed_on_an_argument() {
+        // KiCad 10.0.8 loads and resaves `(footprint "R_0603_1608Metric" …)`
+        // unchanged, so duplicate_component can read such an id off the board.
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("board.kicad_pcb");
+        let refusal = read_footprint_source_or_error("R_0603_1608Metric", &board, None)
+            .expect_err("an id without a nickname resolves to no library");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("file_not_found")
+        );
+        let refusal =
+            read_footprint_source_or_error("R_0603_1608Metric", &board, Some("footprint"))
+                .expect_err("a caller-supplied id without a nickname is refused");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_board_unusable_refusal_reports_malformed_file_across_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("broken.kicad_pcb");
+        let broken = "(not_a_kicad_pcb (version 1))\n";
+        std::fs::write(&board, broken).unwrap();
+
+        let (is_error, body) = served_call(
+            "move_component",
+            json!({
+                "board": board,
+                "reference": "R1",
+                "x": 20.0,
+                "y": 30.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "malformed_file");
+        assert_eq!(body["error"]["path"], board.display().to_string());
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), broken);
+    }
+
+    #[tokio::test]
+    async fn repair_corrupted_footprints_without_live_kicad_reports_editor_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&board, MINIMAL_BOARD).unwrap();
+
+        let (is_error, body) =
+            served_call("repair_corrupted_footprints", json!({ "board": board })).await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
+        assert_eq!(body["error"]["editor"], "pcb");
+    }
+
+    #[tokio::test]
+    async fn saved_pad_queries_report_structured_error_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&board, MINIMAL_BOARD).unwrap();
+
+        // Missing footprint -> invalid_argument
+        let (is_error, body) = served_call(
+            "get_component_pads",
+            json!({ "board": board, "reference": "U99" }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "reference");
+
+        // Missing pad -> invalid_argument
+        let (is_error, body) = served_call(
+            "get_pad_position",
+            json!({ "board": board, "reference": "R1", "pad_number": "99" }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "pad_number");
+
+        // Malformed saved pads: missing (at), invalid (at), unreadable pad number
+        for (label, pad_sexp) in [
+            (
+                "missing_at",
+                "(pad \"1\" smd rect (size 0.8 0.9) (layers \"F.Cu\"))",
+            ),
+            (
+                "invalid_at",
+                "(pad \"1\" smd rect (at not_a_num) (size 0.8 0.9) (layers \"F.Cu\"))",
+            ),
+            (
+                "unreadable_number",
+                "(pad (nested) smd rect (at 0 0) (size 0.8 0.9) (layers \"F.Cu\"))",
+            ),
+        ] {
+            let bad_board = tmp.path().join(format!("{label}.kicad_pcb"));
+            std::fs::write(
+                &bad_board,
+                format!(
+                    "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n  (footprint \"Resistor_SMD:R_0603_1608Metric\"\n    (layer \"F.Cu\")\n    (at 10 20)\n    (property \"Reference\" \"R1\" (at 0 0) (layer \"F.SilkS\"))\n    {pad_sexp}\n  )\n)\n"
+                ),
+            )
+            .unwrap();
+            let (is_error, body) = served_call(
+                "get_component_pads",
+                json!({ "board": bad_board, "reference": "R1" }),
+            )
+            .await;
+            assert!(is_error, "{label}");
+            assert_eq!(body["error"]["kind"], "malformed_file", "{label}: {body}");
+            assert_eq!(body["error"]["path"], bad_board.display().to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn place_array_and_align_components_report_structured_error_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&board, MINIMAL_BOARD).unwrap();
+
+        // place_array: count overflow -> invalid_argument
+        let (is_error, body) = served_call(
+            "place_component_array",
+            json!({
+                "board": board,
+                "footprint": "Lib:Fp",
+                "start_x": 0.0,
+                "start_y": 0.0,
+                "count_x": u64::MAX,
+                "count_y": 2,
+                "spacing_x": 5.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "count_x");
+
+        // place_array: zero count -> invalid_argument
+        let (is_error, body) = served_call(
+            "place_component_array",
+            json!({
+                "board": board,
+                "footprint": "Lib:Fp",
+                "start_x": 0.0,
+                "start_y": 0.0,
+                "count_x": 2,
+                "count_y": 0,
+                "spacing_x": 5.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "count_y");
+
+        // place_array: ref_start overflow -> invalid_argument
+        let (is_error, body) = served_call(
+            "place_component_array",
+            json!({
+                "board": board,
+                "footprint": "Lib:Fp",
+                "start_x": 0.0,
+                "start_y": 0.0,
+                "count_x": 2,
+                "count_y": 1,
+                "spacing_x": 5.0,
+                "ref_start": u64::MAX
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "ref_start");
+
+        // place_array: valid footprint, unreachable IPC -> editor_unavailable via ipc_failure_result
+        write_project_lib(
+            tmp.path(),
+            "ArrayLib741",
+            "R",
+            "(footprint \"R\"\n  (layer \"F.Cu\")\n  (property \"Reference\" \"REF**\" (at 0 0) (layer \"F.SilkS\"))\n  (property \"Value\" \"R\" (at 0 1) (layer \"F.Fab\"))\n  (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\"))\n)\n",
+        );
+        let (is_error, body) = served_call(
+            "place_component_array",
+            json!({
+                "board": board,
+                "footprint": "ArrayLib741:R",
+                "start_x": 0.0,
+                "start_y": 0.0,
+                "count_x": 2,
+                "count_y": 1,
+                "spacing_x": 5.0
+            }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
+
+        // align_components: empty references -> invalid_argument
+        let (is_error, body) = served_call(
+            "align_components",
+            json!({ "board": board, "references": [], "axis": "x", "value": 10.0 }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "references");
+
+        // align_components: non-string reference -> invalid_argument (schema validates element)
+        let (is_error, body) = served_call(
+            "align_components",
+            json!({ "board": board, "references": ["R1", 42], "axis": "x", "value": 10.0 }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "references[1]");
+
+        // Direct handler check for the in-handler non-string reference guard
+        let direct = handle_align_components(
+            &json!({ "board": board, "references": ["R1", 42], "axis": "x", "value": 10.0 }),
+            &crate::tools::ToolContext::new(
+                Default::default(),
+                std::sync::Arc::new(crate::tools::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(direct.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&direct).as_deref(),
+            Some("invalid_argument")
+        );
+
+        // align_components: invalid axis -> invalid_argument
+        let (is_error, body) = served_call(
+            "align_components",
+            json!({ "board": board, "references": ["R1"], "axis": "z", "value": 10.0 }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "axis");
+
+        // align_components: unreachable IPC -> editor_unavailable via ipc_failure_result
+        let (is_error, body) = served_call(
+            "align_components",
+            json!({ "board": board, "references": ["R1"], "axis": "x", "value": 10.0 }),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
     }
 }
