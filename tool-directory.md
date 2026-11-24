@@ -357,25 +357,25 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | Tool | Description |
 |------|-------------|
 | `add_net` | Idempotently add a net to a pre-KiCad-10 board's top-level net table (S-expression insert, no IPC required). Existing names return their observed ID without writing. KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
-| `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
-| `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
-| `add_via` | Add a through-hole via at a position and assign it to a net via IPC. Reads the via back and reports the net KiCad stored; a via KiCad put on another net (it landed on that net's copper) is removed again and refused with `plan_blocked`. |
+| `route_trace` | Route a trace segment between two points on a copper layer via KiCad IPC. Reports `zone_refill` guidance after success. |
+| `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. Reports `zone_refill` guidance after success. |
+| `add_via` | Add a through-hole via at a position and assign it to a net via IPC. Reads the via back and reports the net KiCad stored; a via KiCad put on another net (it landed on that net's copper) is removed again and refused with `plan_blocked`. Reports `zone_refill` guidance after success. |
 | `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
-| `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
+| `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. Reports `zone_refill` guidance after success. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `query_vias` | List vias on the live board, optionally filtered by net, with the UUID `delete_via` and `move_via` take, position, net, drill, size, type and layer span. |
 | `delete_via` | Delete one observed via by UUID via KiCad IPC. Refuses non-via or stale UUIDs before deletion and reports the observed preimage only after readback proves the via is absent. |
 | `move_via` | Move one via by UUID via KiCad IPC, keeping its net, drill, size and layers. A via KiCad put on another net at the new position is moved back and refused with `plan_blocked`. |
 | `set_pad_net` | Assign a net to a placed footprint's pad, or clear it, via KiCAD IPC: how the netlist is edited on a schematic-less KiCad 10 board. KiCad creates a net it does not have. Every pad sharing the number is set; one undo step; the response is a fresh read-back. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
-| `modify_trace` | Change a trace segment in place, keeping its UUID, in one KiCad undo step. Refuses, leaving the board unchanged, when the UUID is not a trace segment or the board has no such net or copper layer. |
+| `modify_trace` | Change a trace segment in place, keeping its UUID, in one KiCad undo step. Refuses, leaving the board unchanged, when the UUID is not a trace segment or the board has no such net or copper layer. Reports `zone_refill` guidance after success. |
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `delete_netclass` | Delete a netclass, or one `netclass_patterns` entry by its exact text, in the `.kicad_pro`, as Board Setup does: a deleted class's patterns move to `Default`, and `Default` cannot be deleted. Schematic netclass labels are reported, not edited. |
-| `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+| `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). Reports `zone_refill` guidance after success. |
 
 ### `pcb_copper` · 4 tools
 **Purpose:** Copper edits on the board open in KiCad: create tracks and vias, batch-move existing vias, move or turn board items and groups as one rigid block, and read or set native pad and via teardrops.
