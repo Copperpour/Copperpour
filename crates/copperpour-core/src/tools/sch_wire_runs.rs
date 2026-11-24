@@ -727,6 +727,34 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_runs_do_not_treat_a_directory_read_failure_as_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("directory.kicad_sch");
+        fs::create_dir(&path).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(super::super::ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (result, body) = served(
+            &handler,
+            "check_schematic_wire_runs",
+            json!({"schematic": path}),
+        )
+        .await;
+
+        // On Unix, a directory read fails before any bytes can be decoded.
+        // This is an I/O refusal, not a malformed schematic.
+        assert_eq!(result["isError"], true, "{body}");
+        assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     fn measure(items: &str) -> WireRuns {
         measure_wire_runs(&parse_sexp(&format!("(kicad_sch {items})")).unwrap()).unwrap()
     }
