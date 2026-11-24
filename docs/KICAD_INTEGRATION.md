@@ -297,7 +297,7 @@ loopback service needs no GUI runtime in the server. The tool returns a credenti
 URL even when the OS browser opener fails or `open_browser: false` is passed.
 The browser frontend is embedded in `copperpour-viewer`; the standalone Tauri
 application and separate viewer packaging have been retired. See the
-[retirement migration](api-migrations/retire-standalone-viewer.md).
+[retirement migration](API_MIGRATIONS.md#standalone-tauri-schematic-viewer-retired-minor-release).
 
 The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
 only metadata, plugin files, icons, and binaries. Repository developer

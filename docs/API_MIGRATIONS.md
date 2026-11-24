@@ -46,7 +46,7 @@ The new `pcb_rule_areas` toolset provides `add_rule_area` for creating netless K
 
 - Accepts `layers` (specific enabled copper layers or `"*.Cu"`), either `points` or `rect` geometry in millimetres, optional `name`, and KiCad's five keepout flags (`keepout_tracks`, `keepout_vias`, `keepout_pads` defaulting to `true`; `keepout_copper_pours`, `keepout_footprints` defaulting to `false`).
 - Requires a live KiCad PCB Editor holding the exact requested board (no closed-board file fallback in this increment); validates enabled layers before opening a commit, verifies post-commit readback by KIID, refills copper zones afterward (reporting an `applied_but_not_refilled` partial outcome if refill fails), and uses the shared `outcome` envelope.
-- Creating a rule area does not run autorouting. The [Specctra rule-area profile](specctra-rule-areas.md), added by [#81](https://github.com/Copperpour/Copperpour/issues/81), supports straight routing keep-outs with whole-micrometre vertices and lists the forms still refused by export.
+- Creating a rule area does not run autorouting. The [Specctra rule-area profile](#the-specctra-round-trip-keeps-rule-areas-as-keep-outs-minor-release), added by [#81](https://github.com/Copperpour/Copperpour/issues/81), supports straight routing keep-outs with whole-micrometre vertices and lists the forms still refused by export.
 
 ### `add_schematic_net_label` refuses a label shape KiCad cannot load or draw (patch release)
 
@@ -361,7 +361,7 @@ not response bytes or nested violation items.
 
 ### `open_schematic_viewer` uses the browser service; standalone Tauri viewer deprecated (minor release)
 
-> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> Later superseded by [standalone viewer retirement](#standalone-tauri-schematic-viewer-retired-minor-release):
 > the owner waived the planned release grace period and approved immediate removal.
 > Statements below about retention describe this earlier phase only.
 
@@ -400,7 +400,7 @@ shipped; this change does not remove Tauri or provide an automatic fallback to i
 
 ### Shared browser viewer service (minor release; phase two of #242)
 
-> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> Later superseded by [standalone viewer retirement](#standalone-tauri-schematic-viewer-retired-minor-release):
 > the owner waived the planned release grace period and approved immediate removal.
 > Statements below about retention describe this earlier phase only.
 
@@ -615,7 +615,7 @@ the model or modifies the source footprint. Existing output paths are
 refused with `conflict`; a failed post-write readback reports
 `mutation_outcome_uncertain`. `call_tool` requires write permission.
 
-Read [the usage and validation guide](../3d-model-generation.md) for exact
+Read [the usage and validation guide](3d-model-generation.md) for exact
 limits, approximation semantics, defaults, recovery and the independent
 KiCad/OCCT test. Runtime success establishes exact file readback, not CAD
 validation or physical fit. Existing callers need no changes.
@@ -1256,7 +1256,7 @@ refused as `ambiguous_target`. Explicitly configured `ipc_address` and
 
 On tools that return shared IPC recovery, look in `recovery.evidence` for the failed command and KiCad's per-item status. `CreateItems` reports `rejected_items` with zero-based `reply_index`, status names, and KiCad's messages, along with `requested_count` and `reported_created_count`. `DeleteItems` reports `rejected_items` with their KIIDs and status names, as well as `reported_deleted_kiids`, `unclassified_kiids` for rows with unknown statuses, and sorted `unreported_kiids` for requested items with no result row. Reported success describes the reply, not persistence. A missing row does not prove KiCad skipped the item.
 
-Use `recovery.mutation_outcome` and `recovery.evidence.rollback` together. The overall outcome stays `unknown`. `not_established` does not rule out partial application. `confirmed` means KiCad acknowledged dropping the named commit, not that Copperpour independently verified the whole operation left the board unchanged. Both use `recovery.cause: "kicad_api_rejection"` and link to [item rejection troubleshooting](../TROUBLESHOOTING.md#kicad-rejected-items-during-an-ipc-write). `unconfirmed` returns `ipc_outcome_unknown` and retains the original rejection evidence. Inspect the live board before retrying any unknown outcome. Write, rollback and fallback policy are unchanged.
+Use `recovery.mutation_outcome` and `recovery.evidence.rollback` together. The overall outcome stays `unknown`. `not_established` does not rule out partial application. `confirmed` means KiCad acknowledged dropping the named commit, not that Copperpour independently verified the whole operation left the board unchanged. Both use `recovery.cause: "kicad_api_rejection"` and link to [item rejection troubleshooting](TROUBLESHOOTING.md#kicad-rejected-items-during-an-ipc-write). `unconfirmed` returns `ipc_outcome_unknown` and retains the original rejection evidence. Inspect the live board before retrying any unknown outcome. Write, rollback and fallback policy are unchanged.
 
 Tools using the shared live-write path may now return structured JSON instead of plain text for per-item rejections. These include `set_board_size`, `add_board_outline`, `delete_graphics`, `add_mounting_hole`, `add_board_text`, `add_zone`, `add_copper_pour`, and `import_svg_logo`. Continue accepting plain text for other IPC errors. Routing tools using shared IPC recovery may also change from `recovery.cause: "unknown"` to `"kicad_api_rejection"`; use the structured fields rather than matching the old message prefix. `update_pcb_from_schematic` returns structured IPC recovery for these rejections instead of labeling them preflight conflicts.
 
@@ -2038,7 +2038,7 @@ The standalone `schematic-viewer` / `schematic-viewer.exe` command and its
 in the MCP server. Configure the server’s `kicad_cli` when automatic KiCad
 CLI discovery is unsuitable. `open_browser: false` returns the private URL
 without launching a browser; opener failure leaves a successfully started
-service available. See [the MCP contract](browser-viewer-mcp.md) for response
+service available. See [the MCP contract](#open_schematic_viewer-uses-the-browser-service-standalone-tauri-viewer-deprecated-minor-release) for response
 fields, lifetime, saved-file behavior and headless forwarding.
 
 The earlier plan retained Tauri for one shipped deprecation release. The
@@ -2493,7 +2493,7 @@ edited on the file path; on the live path it is set only when footprints were
 sent. The response lists each field's values before and after, and a whole-board
 run reports fields it could not edit in `skipped`.
 
-The live path sends each footprint back whole. See [footprint unit metadata loss before KiCad 10.0.8](../TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit).
+The live path sends each footprint back whole. See [footprint unit metadata loss before KiCad 10.0.8](TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit).
 
 No existing call changes.
 
@@ -3263,7 +3263,7 @@ the server's display, and click again.
 
 ### `open_schematic_viewer` identifies missing schematics (minor release)
 
-> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> Later superseded by [standalone viewer retirement](#standalone-tauri-schematic-viewer-retired-minor-release):
 > the owner waived the planned release grace period and approved immediate removal.
 > Statements below about retention describe this earlier phase only.
 
