@@ -992,6 +992,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // `delete_symbol_pin`'s response field naming the symbols that lose
         // the pin too, not a callable tool (#830's review).
         "derived_symbols",
+        // `update_pcb_from_schematic`'s response list of the footprints no
+        // symbol matched, not a callable tool (#861).
+        "footprints_without_symbols",
     ];
 
     let mut phantom = Vec::new();

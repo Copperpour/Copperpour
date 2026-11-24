@@ -114,6 +114,12 @@ Follow this sequence for a clean PCB workflow:
    with `(clearance convexhull)`, which KiCad's pad message cannot carry), assign
    the part another footprint or fix the pad; when the schematic connects
    a pad the footprint does not have, fix the symbol or the footprint choice. A
+   footprint whose symbol left the schematic stays on the board and is listed under
+   `footprints_without_symbols`. To delete those, as KiCad's **Delete footprints with
+   no symbols** does, ask the user first, then run the dry run and the apply with
+   `delete_footprints_without_symbols: true`: each one is a `delete` change in the
+   plan, a board-only footprint (a logo, a mounting hole) is never deleted, and a
+   locked one is kept with a note. A
    successful apply is one KiCad undo entry, so Ctrl-Z reverses the whole update.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update

@@ -223,6 +223,13 @@ pub fn tools() -> Vec<ToolDef> {
              plans it as KiCad's Update PCB makes it, with no copper sent, and the apply of \
              that dry run's plan then reports `routed_copper`, each named net's copper before \
              and after as KiCad's commit left it, and `drc` of the result. \
+             A board footprint no symbol matched is kept and counted in \
+             `coverage.board_only_preserved`; `footprints_without_symbols` names each one \
+             without the board-only attribute (KiCad's \"Not in schematic\"). With \
+             `delete_footprints_without_symbols`, as KiCad's \"Delete footprints with no \
+             symbols\", the plan deletes those in the same commit as `delete` changes \
+             (`coverage.footprints_deleted`), never a board-only one; a locked one is kept \
+             with a `footprint_locked_not_deleted` note that refuses nothing. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
              is never reported as complete or empty. `changes` lists the first `limit` \
@@ -249,6 +256,7 @@ pub fn tools() -> Vec<ToolDef> {
                             "required": ["reference", "pad", "from", "to"]
                         }
                     },
+                    "delete_footprints_without_symbols": { "type": "boolean", "description": "Delete each unlocked footprint no symbol matched, apart from board-only ones, in the same commit; the dry run plans them as delete changes", "default": false },
                     "limit": { "type": "integer", "minimum": 0, "description": "Maximum planned changes to list; the plan and its revision stay whole", "default": 50 },
                     "output": { "type": "string", "minLength": 1, "description": "Optional path to write the whole response JSON, every change listed" }
                 },
