@@ -97,12 +97,18 @@ use the existing validation-debt process.
 
 ## Adoption and enforcement
 
+These are review requirements for new and changed behavior. Fixing one tool
+does not require migrating every other handler first.
+
 The dispatch compiles, caches, and enforces every advertised tool schema before
 the handler runs. Handlers still own domain rules and checked direct-call paths.
 CI checks that adopted tools serve the envelope through JSON-RPC `tools/call`
 and that each legacy entry names existing paths, rationale, tracking issues, and
 removal criteria. Lower the ceiling when removing a legacy entry. Adding an
 entry requires an explicit, reviewed guard change.
+
+Contributors may use any AI or none. This contract specifies outcomes, not
+model selection.
 
 ## Maintainer references
 

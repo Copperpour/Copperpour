@@ -98,6 +98,8 @@ PCB tools that can read either source use `tools/board_source.rs` for
 It reports per-domain `sources` and `source_evidence`, including whether the
 result excludes unsaved editor state. Readers and the write gates in
 `tools/pcb_board.rs` share `tools/live_board.rs` for document identity.
+A board this process saw KiCad hold is never treated as safely absent later,
+however KiCad stops answering.
 
 Once KiCad positively identifies a board as live, a failed query remains a
 failure. If its endpoint disappears, `auto` refuses. Explicit `saved` can read
