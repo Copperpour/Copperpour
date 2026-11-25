@@ -280,13 +280,20 @@ mod tests {
         assert!(!err.contains(&"a".repeat(501)), "{err}");
     }
 
-    /// A process the application started can still be writing after the
-    /// application itself has exited.
     #[tokio::test]
-    async fn stderr_from_a_child_the_app_started_is_still_quoted() {
-        let err = launch("(sleep 0.2; echo 'render failed' >&2) & exit 1")
-            .await
-            .unwrap_err();
+    async fn exit_report_waits_for_pending_stderr() {
+        let mut app = spawn(sh("exit 1"), "Test app", |_| {}).expect("sh spawns");
+        app.child.wait().await.unwrap();
+        app.forwarder.take().unwrap().await.unwrap();
+
+        // Model stderr arriving after exit, as it can from an app's descendant.
+        // On the current-thread runtime this task can run only once watch yields.
+        let tail = Arc::clone(&app.tail);
+        app.forwarder = Some(tokio::spawn(async move {
+            tail.lock().unwrap().push_back("render failed".into());
+        }));
+
+        let err = app.watch(Duration::from_secs(10)).await.unwrap_err();
         assert!(err.ends_with("render failed"), "{err}");
     }
 
