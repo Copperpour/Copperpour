@@ -316,13 +316,21 @@ fn to_schematic_resolution(mm: f64) -> f64 {
 }
 
 /// A text angle in `[0, 360)`, as `edit_schematic_component`'s
-/// `field_placements` writes it.
+/// `field_placements` writes it, rounded so that KiCad keeps it as written.
+/// KiCad stores the angle it reads unchanged and writes it with
+/// `fmt::format( "{:g}", … )`, six significant digits
+/// (`SCH_IO_KICAD_SEXPR_PARSER::parseProperty`,
+/// `SCH_IO_KICAD_SEXPR_LIB_CACHE::saveField`, KiCad 10.0.8): three decimals
+/// from 100 degrees, four below, where `{:g}` would also switch to an exponent
+/// under 0.0001.
 fn normalize_rotation(degrees: f64) -> f64 {
     let wrapped = degrees.rem_euclid(360.0);
-    if wrapped == 0.0 || wrapped == 360.0 {
+    let scale = if wrapped >= 100.0 { 1_000.0 } else { 10_000.0 };
+    let rounded = (wrapped * scale).round() / scale;
+    if rounded == 0.0 || rounded >= 360.0 {
         0.0
     } else {
-        wrapped
+        rounded
     }
 }
 
@@ -671,7 +679,7 @@ pub(super) fn tool() -> ToolDef {
                         "properties": {
                             "x": { "type": "number" },
                             "y": { "type": "number", "description": "Up is positive, as the library file stores it." },
-                            "rotation": { "type": "number", "description": "Text angle in degrees, stored in [0, 360). KiCad's Symbol Properties dialog offers 0 (horizontal) and 90 (vertical)." },
+                            "rotation": { "type": "number", "description": "Text angle in degrees, stored in [0, 360) and rounded as KiCad keeps it: three decimals from 100 degrees, four below. KiCad's Symbol Properties dialog offers 0 (horizontal) and 90 (vertical)." },
                             "hide": { "type": "boolean", "description": "true hides the field's text; false shows it." }
                         },
                         "additionalProperties": false
@@ -3389,6 +3397,51 @@ pub(super) mod tests {
         );
     }
 
+    /// An angle is written as KiCad 10.0.8 resaves it (`{:g}`, six
+    /// significant digits; checked with `kicad-cli sym upgrade` on a copy of
+    /// the fixture): `33.333333` reads back as `33.3333`, `123.45678` as
+    /// `123.457`, `99.99996` as `100`, and `0.00004` as `4e-05`, which is
+    /// written as 0 here. One that rounds to 360 is 0.
+    #[tokio::test]
+    async fn an_angle_is_written_as_kicad_resaves_it() {
+        for (rotation, written_angle, reported) in [
+            (33.333_333_3, "33.3333", 33.3333),
+            (123.456_78, "123.457", 123.457),
+            (99.999_96, "100", 100.0),
+            (9.876_543, "9.8765", 9.8765),
+            (0.000_04, "0", 0.0),
+            (359.999_8, "0", 0.0),
+        ] {
+            let handler = handler().await;
+            let (_dir, path) = library_with(FIXTURE);
+            let body = edit_symbol(
+                &handler,
+                &path,
+                "FIELDS_BARE",
+                json!({"field_placements": {"Value": {"rotation": rotation}}}),
+            )
+            .await;
+            assert_ne!(body["is_error"], true, "{rotation}: {body}");
+            assert_eq!(
+                body["field_placements"]["Value"]["current"]["rotation"],
+                json!(reported),
+                "{rotation}: {body}"
+            );
+            let written = std::fs::read_to_string(&path).unwrap();
+            let at = format!(" {written_angle})");
+            let value_at = written
+                .split("(symbol \"FIELDS_BARE\"")
+                .nth(1)
+                .and_then(|symbol| symbol.split("(property \"Value\"").nth(1))
+                .and_then(|rest| rest.split(')').next())
+                .unwrap();
+            assert!(
+                format!("{value_at})").ends_with(&at),
+                "{rotation}: {value_at}"
+            );
+        }
+    }
+
     /// A library saved with CRLF line breaks keeps them where a field is
     /// hidden.
     #[tokio::test]
@@ -3540,6 +3593,25 @@ pub(super) mod tests {
             None
         );
         let reason = readback_mismatch(FIXTURE, FIXTURE, "FIELDS_BARE", &fields).unwrap();
+        assert!(reason.contains("field 'Value' reads"), "{reason}");
+
+        // A placement that only hides: the field's position is as asked either
+        // way, so only its hide flag can tell the texts apart.
+        let hidden = SymbolFields {
+            placements: vec![(
+                "Value".into(),
+                FieldPlacement {
+                    hide: Some(true),
+                    ..FieldPlacement::default()
+                },
+            )],
+            ..SymbolFields::default()
+        };
+        assert_eq!(
+            readback_mismatch(PLACED, FIXTURE, "FIELDS_FULL", &hidden),
+            None
+        );
+        let reason = readback_mismatch(FIXTURE, FIXTURE, "FIELDS_FULL", &hidden).unwrap();
         assert!(reason.contains("field 'Value' reads"), "{reason}");
     }
 
