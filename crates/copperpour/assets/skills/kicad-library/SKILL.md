@@ -25,7 +25,7 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # register_footprint_library, get_symbol_info,
                            # set_symbol_properties
 load_toolset('library_maintenance') # upgrade_library, rename_footprint, rename_symbol,
-                                    # delete_symbol_pin
+                                    # edit_symbol_pins, delete_symbol_pin
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -278,6 +278,18 @@ named; a field set or renamed in the same call can be.
 field's text, for example when the body grew; each entry may also set
 `rotation` (0 or 90, as KiCad's dialog offers) and `hide`. Coordinates are the
 symbol's own, as `create_symbol` takes them: millimetres from its origin, y up.
+
+### Change Several Pins at Once
+
+`edit_symbol_pins` (toolset `library_maintenance`) changes several pins of one
+symbol in one write: each entry of `pins` chooses a pin and sets its parts as
+`edit_symbol_pin` does. Every entry is checked first, and one refused entry
+writes nothing. Entries choose pins as the library reads before the call, so
+`[{"pin_number": "1", "new_number": "2"}, {"pin_number": "2", "new_number": "1"}]`
+swaps two numbers. A new `length` keeps the connection point unless the entry
+says `keep: "body"`: then the connection point moves along the pin so its end
+at the body stays where it is. To bring a symbol to a house pin length, give
+every pin an entry with `length` and `keep: "body"`.
 
 ### Remove a Symbol Pin
 
