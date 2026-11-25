@@ -190,7 +190,7 @@ fn ends(wire: &Wire) -> [((f64, f64), (f64, f64)); 2] {
     [(a, b), (b, a)]
 }
 
-fn collinear_overlap(a: &Wire, b: &Wire) -> bool {
+pub(crate) fn collinear_overlap(a: &Wire, b: &Wire) -> bool {
     let a_len = (a.x2 - a.x1).hypot(a.y2 - a.y1);
     let b_len = (b.x2 - b.x1).hypot(b.y2 - b.y1);
     // Both axes must agree: a result must not depend on record order.

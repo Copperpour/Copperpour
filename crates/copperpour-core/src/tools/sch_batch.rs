@@ -143,12 +143,18 @@ pub fn tools() -> Vec<ToolDef> {
              that face the same way, sit on one row and lie within max_gap of a neighbour \
              get a short stub each, a bar joining the stubs, and ONE power symbol on the \
              bar. Use it for the GND or supply pins along one edge of an IC, or for a row \
-             of decoupling caps (one call per rail). A pin with no neighbour gets a symbol \
-             on its endpoint, as add_power_symbol does. Stacked pins share one symbol, and \
+             of decoupling caps (one call per rail). A pin that cannot join gets a symbol on \
+             its own outward stub, with the same orientation rule as add_power_symbol. An optional \
+             rotation on that pin overrides the rule; joined bars ignore it. The reply lists \
+             any bounds_unresolved next to text_overlaps for individual placements. Joined \
+             groups list ignored overrides in ignored_rotations. If any \
+             symbol's pins cannot be resolved, all new stubs are listed in errors. \
+             Stacked pins share one symbol, and \
              a pin already carrying this net's power symbol is skipped. A group whose stubs \
              or bar would touch any other pin, wire, label or junction is not joined; its \
-             pins get a symbol each and the group reports why. Unresolvable pins refuse \
-             the whole call before writing. Each symbol takes the library symbol's reference \
+             pins get a symbol each and the group reports why. A blocked individual stub is \
+             listed in errors; other pins proceed, and if none can be placed, nothing is written. \
+             Unresolvable pins refuse the whole call. Each symbol takes the library symbol's reference \
              prefix (#PWR, or #FLG for PWR_FLAG; each prefix its own series) and the lowest \
              number free in it in the whole hierarchy, after the previous symbol's (one per \
              instance of a sheet placed more than once; a sheet no project owns is numbered \
@@ -169,7 +175,8 @@ pub fn tools() -> Vec<ToolDef> {
                             "type": "object",
                             "properties": {
                                 "reference": { "type": "string" },
-                                "pin_number": { "type": "string" }
+                                "pin_number": { "type": "string" },
+                                "rotation": { "type": "number", "description": "Degrees, used only for a pin on its own stub." }
                             },
                             "required": ["reference", "pin_number"]
                         }
@@ -177,7 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "max_gap": { "type": "number", "minimum": 0, "default": 10.16,
                         "description": "Largest distance in mm between neighbouring pins of one group" },
                     "stub_length": { "type": "number", "exclusiveMinimum": 0, "default": 2.54,
-                        "description": "Stub length in mm from each pin to the bar; a multiple of 1.27" }
+                        "description": "Stub length in mm from each pin to the bar or individual symbol; a positive multiple of 1.27" }
                 },
                 "required": ["schematic", "power_net", "pins"]
             }),

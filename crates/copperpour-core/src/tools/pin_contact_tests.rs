@@ -265,7 +265,7 @@ async fn reports_a_saved_zero_length_wire_between_touching_pins() {
 }
 
 #[tokio::test]
-async fn reports_contacts_created_by_power_placement() {
+async fn named_pin_power_stubs_create_no_contacts_but_coordinates_still_can() {
     let sheet = Sheet::new(SCH).await;
     for args in [
         json!({"power_net": "+5V", "reference": "R20", "pin_number": "1"}),
@@ -285,24 +285,33 @@ async fn reports_contacts_created_by_power_placement() {
         sheet.ok("batch_add_power_symbol", args).await;
     }
     let report = sheet.report().await;
-    assert_eq!(report["contact_count"], 10);
-    for pin in [
-        "R20.1", "R20.2", "R21.1", "R11.2", "R21.2", "R22.1", "R23.1",
-    ] {
-        assert!(
-            report["contacts"].as_array().unwrap().iter().any(|c| {
-                pins(&c["pins"]).iter().any(|name| name == pin)
-                    && c["pins"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter(|p| p["is_power_symbol"] == true)
-                        .count()
-                        == 1
+    assert_eq!(report["contact_count"], 4, "{report}");
+    assert!(
+        report["contacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|contact| {
+                contact["pins"].as_array().unwrap().iter().all(|pin| {
+                    !matches!(
+                        pin["reference"].as_str(),
+                        Some("R20" | "R21" | "R22" | "R23")
+                    )
+                })
             }),
-            "missing power contact at {pin}: {report}"
-        );
-    }
+        "{report}"
+    );
+    assert!(
+        report["contacts"].as_array().unwrap().iter().any(|c| {
+            pins(&c["pins"]).iter().any(|name| name == "R11.2")
+                && c["pins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["is_power_symbol"] == true)
+        }),
+        "{report}"
+    );
 }
 
 #[tokio::test]
