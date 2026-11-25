@@ -1531,6 +1531,8 @@ async fn handle_run_design_review(
             "diagnostics": diagnostics
         }
     });
+    let source_evidence =
+        super::board_source::with_saved_schematic_evidence(source_evidence, Some(&root_path));
     super::board_source::provenance(&mut body, sources, source_evidence);
 
     Ok(crate::outcome::attach(

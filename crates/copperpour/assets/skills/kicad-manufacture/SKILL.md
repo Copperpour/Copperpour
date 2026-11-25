@@ -117,7 +117,13 @@ can still leave a partial directory.
 For JLCPCB assembly, open the exact target board with IPC enabled before export.
 The package uses a stable live board snapshot and native pad-box midpoints;
 the `geometry` of its placement evidence file records the observed source.
-Saved project settings and schematic BOM remain separate inputs. Review legacy position
+Saved project settings and schematic BOM remain separate inputs, disclosed in
+`sources` and `source_evidence` (including `source_evidence.schematic`, which
+reports any KiCad editor lock on the saved schematic even when the board came
+from live IPC). CLI export and render tools (`export_gerber`, `export_pdf`,
+`export_svg`, `export_3d`, `export_netlist`, `export_position_file`,
+`get_board_2d_view`) always read saved files on disk and disclose their
+snapshot boundary in `sources` and `source_evidence`. Review legacy position
 offsets that compensated for anchors before retaining them. Read
 `docs/JLCPCB_CPL_CORRECTIONS.md` for coordinates, refusals, and migration details.
 

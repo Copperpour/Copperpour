@@ -907,6 +907,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Structured recovery and diagnostic response fields, not callable tools (#526).
         "retry_safe",
         "board_state",
+        // Board-source provenance response fields and domain values (#58), not callable tools.
+        "source_evidence",
+        "excludes_unsaved_editor_state",
+        "saved_board",
+        "saved_schematic",
+        "project_file",
         "drop_confirmed",
         "mutation_outcome",
         "retry_prerequisites",

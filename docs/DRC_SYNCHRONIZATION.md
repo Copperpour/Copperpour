@@ -40,10 +40,12 @@ standalone-footprint metadata which the saved board omits. Board version and all
 geometry, connectivity, model and UUID fields remain checked. The saved bytes are
 also checked after CLI.
 This detects a changed final source, but cannot prove the absence of transient
-concurrent changes; callers must finish their mutations first. General live/file
-authority and the shared outcome-envelope migration remain tracked separately
-in [#58](https://github.com/Copperpour/Copperpour/issues/58); response bounding
-does not complete that migration.
+concurrent changes; callers must finish their mutations first. For the
+system-wide board-state source contract across read, analysis, and export tools,
+see [KiCad integration](KICAD_INTEGRATION.md#board-state-source-contract). The
+shared outcome-envelope migration remains tracked separately in
+[the reliability inventory](reliability-legacy-inventory.json); response
+bounding does not complete that migration.
 
 ## Bounded responses and complete reports
 

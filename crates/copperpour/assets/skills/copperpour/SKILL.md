@@ -106,6 +106,14 @@ Never send pending reports without the user's answer. If the user does not choos
 
 **kicad-cli:** Command-line tool for exports (SVG, PDF, Gerbers, BOM, netlist) and checks (ERC, DRC). Does not require KiCAD GUI.
 
+## Board Source & Provenance
+
+Every board-reading, analysis, render, and export tool reports `sources` (per-domain origin such as `ipc`, `saved_board`, `saved_schematic`, `project_file`, `kicad_cli`, `derived`, or `unavailable`) and `source_evidence` (`board_state`, `excludes_unsaved_editor_state`, `reason`, `detail`):
+
+- **Eligible read-only PCB tools** (`get_board_info`, `get_board_extents`, `get_layer_list`, `get_netclasses`, `list_zones`, `score_placement`, `get_placement_overview`, `check_clearance`, `get_component_pads`, `get_pad_position`) accept `board_source`: `"auto"` (default, exact live board when open, guarded saved fallback), `"live"` (require exact live board), or `"saved"` (explicit saved-file snapshot).
+- **Live failure and staleness:** Once KiCad identifies the exact board as live, a failed live query never silently falls back to disk. If KiCad disappears after observing a board live, `board_source: "auto"` refuses with `unsafe_file_fallback`; pass `board_source: "saved"` only to inspect the saved snapshot deliberately.
+- **Saved-snapshot & mixed tools:** CLI exports, renders, and saved-file analyses inspect files on disk without implicit KiCad saves and disclose any editor lock or prior live observation in `source_evidence.reason`. On mixed board+schematic tools (`export_manufacturing_package`, `generate_jlcpcb_order_link`, `run_design_review`), also check `source_evidence.schematic` for saved-schematic lock status even when the board came from live IPC. For DRC against unsaved KiCad edits, pass `sync_live_board: true` to `run_drc` or `get_drc_violations`.
+
 ## Discovery — Finding Available Tools
 
 Copperpour uses a meta-tool router pattern: tools are grouped into toolsets and loaded on demand to keep the context focused. Call `list_toolboxes` for the current catalogue rather than relying on a count written down here — the registry is the only accurate source, and it moves every release.
