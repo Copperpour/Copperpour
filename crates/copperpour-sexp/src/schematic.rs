@@ -1372,7 +1372,7 @@ fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
     }
 }
 
-fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
+pub fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
     let (x, y, rotation) = parse_at(node)?;
     let length = node
         .find("length")

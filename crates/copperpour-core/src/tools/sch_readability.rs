@@ -1,5 +1,7 @@
 //! Read-only checks of one saved schematic sheet's drawing and layout.
 
+mod connector_pin_signals;
+
 use super::{
     sch_analysis::handle_check_overlaps, sch_layout_score::handle_compare_schematic_layout,
     sch_pin_contacts, sch_wire_runs, ToolDef,
@@ -9,6 +11,7 @@ use serde_json::json;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        connector_pin_signals::tool(),
         overlap_tool_def(),
         sch_wire_runs::tool_def(),
         compare_tool_def(),
@@ -130,6 +133,11 @@ mod tests {
             .iter()
             .all(|tool| tool.name != "check_schematic_overlaps"));
         assert_readability_route("check_schematic_overlaps").await;
+    }
+
+    #[tokio::test]
+    async fn connector_signals_belong_to_readability() {
+        assert_readability_route("check_connector_pin_signals").await;
     }
 
     #[tokio::test]
