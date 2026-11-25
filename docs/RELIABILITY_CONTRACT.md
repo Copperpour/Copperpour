@@ -88,11 +88,11 @@ where applicable. Use KiCad-authored fixtures for design parsing and mutation.
 Expected results must be independent of the implementation under test: call
 readback and check relevant external semantics, not just the writer's calculation.
 
-Follow GOVERNANCE.md's negative-control rule for new guards: temporarily
-neutralize a guard and demonstrate that its regression test fails, then restore
-it. Record the distinguishing evidence concisely; an exhaustive narrative or
-every operating system on every PR is not required. Hosted CI and material
-safety evidence remain mandatory. Name secondary environments not observed and
+A new guard is pinned by a test that fails without it. The reviewer checks
+this by neutralizing the guard ([GOVERNANCE.md](../GOVERNANCE.md#evidence));
+authors need not run or record negative controls. Every operating system on
+every PR is not required. Hosted CI and material safety evidence remain
+mandatory. Name secondary environments not observed and
 use the existing validation-debt process.
 
 ## Adoption and enforcement

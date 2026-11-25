@@ -57,12 +57,35 @@ validate when available. Required CI and material safety evidence remain mandato
 Keep generated artifacts, personal settings, downloaded catalogs, build output,
 and unrelated cleanup out of the diff.
 
+## Tests and fixtures
+
+Test what the PR changes, not every corner case:
+
+- One test per behavior the PR adds or changes, and one per new refusal or
+  error path. Edge cases need a test only when the issue names them or the
+  code branches on them.
+- A test asserts what the tool wrote or returned, read back from the result,
+  not values echoed from the request
+  ([Evidence](GOVERNANCE.md#evidence)).
+- A new fixture is needed when the PR changes how a KiCad file is read or
+  written, or claims what KiCad does. It is KiCad's own output (saved by
+  Eeschema or pcbnew, or resaved with `kicad-cli`), never a hand-written
+  file or a Rust string, and gets a `<fixture>.README.md` saying how it was
+  made. A narrow inline unit test may sit beside it, not replace it. Other
+  changes reuse existing fixtures.
+- When the PR claims what KiCad does, show it: a `kicad-cli` netlist, ERC or
+  resave of the fixture, or the KiCad source line, quoted in the body.
+
+The reviewer judges whether the tests show the change works. They don't ask
+for more cases unless a concrete input breaks the change.
+
 ## Negative controls
 
-Reviewers check each guard your change adds: break it, and see which tests fail.
-A guard whose removal fails nothing is not pinned by any test, and the review will
-ask for one. `scripts/control.sh` runs one such control the way reviews do. Commit
-first, then pass a label and the command that breaks the guard:
+Reviewers check the main guards your change adds: break one, and see which
+tests fail. A guard whose removal fails nothing is not pinned by any test, and
+the review will ask for one. Authors don't have to run controls or put a table
+of them in the PR body. To try one yourself, `scripts/control.sh` runs it the way
+reviews do. Commit first, then pass a label and the command that breaks the guard:
 
 ```bash
 CONTROL_TESTS="the_log_is_read_incrementally" scripts/control.sh "fixed log tail" \
@@ -73,23 +96,51 @@ CONTROL_TESTS="the_log_is_read_incrementally" scripts/control.sh "fixed log tail
 It prints `== <label>: N failed` and the failing tests, then restores the tree. It
 tests the edited crates and every crate that depends on them, with `--no-fail-fast`.
 `CONTROL_TESTS` limits the run to your new tests, and the full set runs only when
-they fail nothing. The script's header lists its options. A table of controls in
-the PR body is welcome but not required: reviewers run their own.
+they fail nothing. The script's header lists its options.
 
 ## Pull request checklist
 
-- Run the [Rust baseline](AGENTS.md#before-you-push) and the CI jobs affected by
-  the diff. See [Testing and Release](docs/TESTING_AND_RELEASE.md) for coverage.
-- Verify the branch can merge into current `main`, required checks passed on
-  the reviewed head, and the commit list and diff contain only this PR's work.
-- For tool changes, follow [Developing Tools](docs/DEVELOPING_TOOLS.md).
-  Add, update or remove the tool's row in `tool-directory.md`, and leave the
-  tool counts alone. At release, `cargo xtask fix-doc-counts` updates them
-  from each toolset's `tools()` list.
-- Preserve public API compatibility. Add a separate
-  [migration note](docs/api-migrations/README.md) for caller-visible changes.
-- If fixture line endings differ locally despite a clean checkout, run
-  `cargo xtask check-fixtures`. Its `--fix` option refreshes affected fixtures.
+This is the definition of done for every PR, whoever or whatever wrote it.
+The `PR shape` CI job checks the items marked **(CI)**.
+
+1. **Issue reference (CI).** `Closes #N` on a line of its own, or `Part of #N`
+   for a partial PR. `Closes` links the issue; `Part of` only refers to it,
+   since it is not a GitHub closing keyword. A prose `Issue: #N` line does
+   neither. CI checks the body's wording, not GitHub's linked issues. A mechanical change
+   (formatting, a dependency bump, a typo) says `No issue: <reason>` instead.
+2. **Scope.** The diff does what the issue asks and nothing else. Where it
+   departs from the issue's suggested approach, the body says how and why.
+3. **Public API.** Tool and toolset names, arguments, CLI flags, environment
+   variables, config keys, JSON keys and documented paths keep their names, or
+   gain an alias. New names follow the [naming conventions](docs/NAMING_CONVENTIONS.md).
+4. **Migration note (CI).** A change a caller can see (a tool's arguments,
+   response or behavior) adds a [migration note](docs/api-migrations/README.md),
+   or edits the existing note of an unreleased tool. When tool code changes
+   with nothing a caller can see, the body says `API migration: none — <reason>`.
+   CI checks only tool code (`crates/copperpour-core/src/{tools,router,mcp}/`);
+   a change to CLI flags, environment variables, config keys or the plugin
+   needs a note too, and review checks it.
+5. **Errors.** Failures use a typed `ToolErrorKind` from [DEV.md](DEV.md#structured-errors),
+   not `handler_error`. Several matching targets are `ambiguous_target` with
+   `candidates` the caller can pass back; a changed file is `conflict`; an
+   unproven write is `mutation_outcome_uncertain`.
+6. **Writes.** File and IPC writes follow the [reliability contract](docs/RELIABILITY_CONTRACT.md):
+   revision-checked writes, the requested board only, and a readback of what
+   was written.
+7. **Tests.** As in [Tests and fixtures](#tests-and-fixtures), with coverage
+   by area in [Testing and Release](docs/TESTING_AND_RELEASE.md).
+8. **Docs.** For a tool change, follow [Developing Tools](docs/DEVELOPING_TOOLS.md).
+   The tool's description and its `tool-directory.md` row match what
+   it now does. Leave the tool counts alone; `cargo xtask fix-doc-counts`
+   updates them at release.
+9. **Body.** The [PR template](.github/pull_request_template.md), with the
+   changed-tool-behavior table for any change a caller can see, the exact
+   validation commands and their results, and what was not run.
+10. **CI.** The [Rust baseline](AGENTS.md#before-you-push) and the jobs the diff
+    affects pass on the exact head, and the branch merges into current `main`.
+
+If fixture line endings differ locally despite a clean checkout, run
+`cargo xtask check-fixtures`. Its `--fix` option refreshes affected fixtures.
 
 ## Licensing your contribution
 

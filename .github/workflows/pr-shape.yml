@@ -1,0 +1,47 @@
+name: PR shape
+
+# The mechanical items of CONTRIBUTING.md's pull request checklist, so neither
+# an author nor a reviewer spends time on them: an issue reference (the merge
+# closes a `Closes` one), and a migration note (or a stated reason for none)
+# when tool code changes. It reads only the PR's own event and diff, with a read-only token.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-shape-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  shape:
+    name: PR shape
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        # bash -eo pipefail: a failed `git diff` fails the job instead of
+        # handing the checker an empty diff.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Test the checker
+        working-directory: scripts
+        run: python -m unittest test_check_pr_shape -v
+      - name: Check the body and diff
+        # The body goes through the environment, never into the script text.
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff --name-status --no-renames "$BASE_SHA...$HEAD_SHA" \
+            | python scripts/check_pr_shape.py

@@ -132,9 +132,13 @@ The house rule, and the reason most of this file exists:
   describes the evidence item; it does not automatically decide whether the
   whole pull request is blocked.
 - **Fixtures come from real KiCad output.** A hand-authored fixture tends to
-  share the assumption the code got wrong, so it agrees with the bug.
-- **Neuter every new guard** and confirm the test catches it. A passing test
-  proves nothing until you have watched it fail.
+  share the assumption the code got wrong, so it agrees with the bug. A PR
+  needs a new one only when it changes how a KiCad file is read or written, or
+  claims what KiCad does ([Tests and fixtures](CONTRIBUTING.md#tests-and-fixtures)).
+- **A guard is pinned by a test that fails without it.** The reviewer breaks
+  the main guards a PR adds and checks that a test fails
+  ([Negative controls](CONTRIBUTING.md#negative-controls)); authors may, but
+  need not.
 
 ### Risk-proportionate validation
 

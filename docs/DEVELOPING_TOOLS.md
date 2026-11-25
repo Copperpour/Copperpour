@@ -82,8 +82,8 @@ protocol coverage when the public contract is involved:
 - MCP/CLI behavior in `crates/copperpour/tests`.
 
 Fixtures that parse boards, footprints, symbols, or KiCad reports should come
-from real KiCad output. Synthetic fixtures are useful for narrow grammar tests,
-but they omit optional or positionless forms that real KiCad emits. Minimize a
+from real KiCad output. A narrow inline test of the grammar may stay beside the
+real fixture, but never replaces it: synthetic sources omit optional or positionless forms that real KiCad emits. Minimize a
 real fixture only after the failing shape remains represented.
 
 For a mutating tool, cover the refusal path before the success path: wrong open

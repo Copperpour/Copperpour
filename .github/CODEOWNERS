@@ -7,6 +7,12 @@
 # Default: the maintainer.
 *                                                  @pauliuszaleckas
 
+# The PR shape check runs the PR's own copy, so a PR can loosen its own check:
+# both maintainers see any change to it.
+/scripts/check_pr_shape.py                         @pauliuszaleckas @mn89h
+/scripts/test_check_pr_shape.py                    @pauliuszaleckas @mn89h
+/.github/workflows/pr-shape.yml                    @pauliuszaleckas @mn89h
+
 # JLCPCB and EasyEDA parts, decided by @mn89h.
 /crates/copperpour-core/src/tools/easyeda.rs          @mn89h @pauliuszaleckas
 /crates/copperpour-core/src/fab/jlcpcb/               @mn89h @pauliuszaleckas
