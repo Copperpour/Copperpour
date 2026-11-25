@@ -201,8 +201,11 @@ board now has the intended placement:
 5. **Read back the exact requested live board.** After every batch, call
    `get_component_list` for that board and verify each requested reference's
    observed position, rotation, and layer. Call `get_board_info` and require
-   `source: "ipc"` before treating this as live-board proof (`score_placement`
-   names the same live authority **source: "live_ipc"**). A saved-file or CLI
+   `source: "ipc"` (and `source_evidence.board_state: "ipc"`) before treating
+   this as live-board proof; `score_placement`, `get_placement_overview`,
+   `check_clearance`, `get_component_pads`, and `get_pad_position` share the
+   same `board_source` (`"auto"` | `"live"` | `"saved"`) selector and
+   `sources`/`source_evidence` provenance contract. A saved-file or CLI
    observation may support a separate check, but report it as saved/CLI evidence
    and do not present it as live IPC readback.
 6. **Validate the observed result.** Re-run `score_placement` and KiCad DRC.

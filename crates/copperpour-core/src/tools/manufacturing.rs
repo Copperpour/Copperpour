@@ -671,11 +671,15 @@ pub(crate) async fn build_package(
             super::board_source::FROM_UNAVAILABLE
         });
     }
-    let source_evidence = if snapshot.is_some() {
+    let board_evidence = if snapshot.is_some() {
         super::board_source::live_evidence()
     } else {
         super::board_source::saved_snapshot_evidence(ctx, &board)
     };
+    let source_evidence = super::board_source::with_saved_schematic_evidence(
+        board_evidence,
+        include_assembly.then_some(schematic.as_deref()).flatten(),
+    );
     let evidence_path = orientation_evidence_path
         .as_deref()
         .and_then(std::path::Path::to_str);
@@ -991,11 +995,16 @@ async fn upload_order_package(
             order_sources[domain] = source.clone();
         }
     }
-    let source_evidence = if package.snapshot.is_some() {
+    let mut source_evidence = if package.snapshot.is_some() {
         super::board_source::live_evidence()
     } else {
         super::board_source::saved_snapshot_evidence(ctx, board)
     };
+    if include_assembly {
+        if let Some(schematic_evidence) = package_body["source_evidence"].get("schematic") {
+            source_evidence["schematic"] = schematic_evidence.clone();
+        }
+    }
     let mut response = json!({
         "uploaded": true,
         "upload_outcome": "sent",
@@ -1982,6 +1991,18 @@ mod order_link_tests {
                     "bom": "kicad_cli",
                     "positions": "derived",
                 },
+                "source_evidence": {
+                    "board_state": "ipc",
+                    "excludes_unsaved_editor_state": false,
+                    "reason": null,
+                    "detail": "KiCad answered for the exact requested board over its IPC API.",
+                    "schematic": {
+                        "schematic_state": "saved_schematic",
+                        "excludes_unsaved_editor_state": true,
+                        "reason": "saved_snapshot_only_with_editor_lock",
+                        "detail": "This tool inspects the saved files on disk without consulting KiCad IPC, and the sibling lock '.~order.kicad_sch.lck' is present; any unsaved editor changes are excluded.",
+                    },
+                },
             })
             .to_string(),
             complete: true,
@@ -2034,6 +2055,19 @@ mod order_link_tests {
         assert_eq!(
             answer["source_evidence"]["excludes_unsaved_editor_state"],
             false
+        );
+        assert_eq!(
+            answer["source_evidence"]["schematic"]["schematic_state"], "saved_schematic",
+            "{answer}"
+        );
+        assert_eq!(
+            answer["source_evidence"]["schematic"]["excludes_unsaved_editor_state"], true,
+            "{answer}"
+        );
+        assert_eq!(
+            answer["source_evidence"]["schematic"]["reason"],
+            "saved_snapshot_only_with_editor_lock",
+            "{answer}"
         );
     }
 

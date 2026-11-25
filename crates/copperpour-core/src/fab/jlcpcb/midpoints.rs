@@ -726,6 +726,36 @@ mod tests {
             body["source_evidence"]["excludes_unsaved_editor_state"],
             false
         );
+        assert_eq!(
+            body["source_evidence"]["schematic"]["schematic_state"], "saved_schematic",
+            "{body:#}"
+        );
+        assert_eq!(
+            body["source_evidence"]["schematic"]["excludes_unsaved_editor_state"], true,
+            "{body:#}"
+        );
+        assert_eq!(
+            body["source_evidence"]["schematic"]["reason"], "saved_snapshot_only",
+            "{body:#}"
+        );
+
+        // A KiCad schematic lock on the live JLCPCB path is reported in
+        // `source_evidence.schematic` while `board_state` remains `"ipc"`.
+        let locked_dir = tempfile::tempdir().unwrap();
+        let locked_sch = locked_dir.path().join("midpoints.kicad_sch");
+        let sch_lock = copperpour_sexp::writer::kicad_editor_lock_path(&locked_sch).unwrap();
+        std::fs::write(&sch_lock, "locked").unwrap();
+        let (locked_text, _) = served_package(locked_dir.path(), "midpoints").await;
+        let locked_body: serde_json::Value = serde_json::from_str(&locked_text).unwrap();
+        assert_eq!(
+            locked_body["source_evidence"]["board_state"], "ipc",
+            "{locked_body:#}"
+        );
+        assert_eq!(
+            locked_body["source_evidence"]["schematic"]["reason"],
+            "saved_snapshot_only_with_editor_lock",
+            "{locked_body:#}"
+        );
     }
 
     /// #69: the package writes its whole placement evidence beside the CPL

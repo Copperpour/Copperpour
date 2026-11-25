@@ -3068,6 +3068,46 @@ async fn stage5_export_manufacturing_package_discloses_mixed_provenance() {
         true
     );
     assert_eq!(pkg["source_evidence"]["reason"], "saved_snapshot_only");
+    assert_eq!(
+        pkg["source_evidence"]["schematic"]["schematic_state"], "saved_schematic",
+        "{pkg}"
+    );
+    assert_eq!(
+        pkg["source_evidence"]["schematic"]["excludes_unsaved_editor_state"], true,
+        "{pkg}"
+    );
+    assert_eq!(
+        pkg["source_evidence"]["schematic"]["reason"], "saved_snapshot_only",
+        "{pkg}"
+    );
+
+    // A KiCad schematic lock is reported in per-domain `source_evidence.schematic`.
+    let sch_lock = copperpour_sexp::writer::kicad_editor_lock_path(&sch).unwrap();
+    std::fs::write(&sch_lock, "locked").unwrap();
+    let pkg_sch_locked = body_of(
+        &scene
+            .call_with(
+                "export_manufacturing_package",
+                json!({
+                    "board": board_str,
+                    "schematic": sch_str,
+                    "output_dir": out.join("with-asm-sch-locked").to_string_lossy(),
+                    "fab_house": "generic",
+                    "include_assembly": true,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        pkg_sch_locked["source_evidence"]["schematic"]["reason"],
+        "saved_snapshot_only_with_editor_lock",
+        "{pkg_sch_locked}"
+    );
+    assert_eq!(
+        pkg_sch_locked["source_evidence"]["reason"], "saved_snapshot_only",
+        "{pkg_sch_locked}"
+    );
+    std::fs::remove_file(&sch_lock).unwrap();
 
     // Remove .kicad_pro, pass explicit gerber_layers, disable assembly, add board lock.
     std::fs::remove_file(scene.board.with_extension("kicad_pro")).unwrap();
@@ -3082,6 +3122,7 @@ async fn stage5_export_manufacturing_package_discloses_mixed_provenance() {
                     "output_dir": out.join("fab-only").to_string_lossy(),
                     "fab_house": "jlcpcb",
                     "include_assembly": false,
+                    "schematic": sch_str,
                     "gerber_layers": ["F.Cu", "Edge.Cuts"],
                 }),
             )
@@ -3101,6 +3142,10 @@ async fn stage5_export_manufacturing_package_discloses_mixed_provenance() {
     assert_eq!(
         pkg_fab_only["source_evidence"]["reason"],
         "saved_snapshot_only_with_editor_lock"
+    );
+    assert!(
+        pkg_fab_only["source_evidence"].get("schematic").is_none(),
+        "fabrication-only export must not attach schematic evidence: {pkg_fab_only}"
     );
 
     // Assembly enabled without a schematic reports schematic and bom as unavailable.
@@ -3131,6 +3176,85 @@ async fn stage5_export_manufacturing_package_discloses_mixed_provenance() {
         pkg_no_sch["sources"]["positions"],
         json!("kicad_cli"),
         "{pkg_no_sch}"
+    );
+    assert!(
+        pkg_no_sch["source_evidence"].get("schematic").is_none(),
+        "assembly without schematic must not attach schematic evidence: {pkg_no_sch}"
+    );
+}
+
+/// `run_design_review` discloses per-domain `source_evidence.schematic`
+/// including any KiCad schematic editor lock, both with and without `board`.
+#[tokio::test]
+async fn stage6_run_design_review_discloses_schematic_lock_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = fixture_board(dir.path());
+    let sch = write_minimal_schematic(dir.path());
+    let sch_lock = copperpour_sexp::writer::kicad_editor_lock_path(&sch).unwrap();
+    std::fs::write(&sch_lock, "locked").unwrap();
+
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: String::new(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+    let scene = Scene {
+        _dir: dir,
+        board,
+        kicad: None,
+        handler,
+    };
+
+    let sch_only = body_of(
+        &scene
+            .call_with(
+                "run_design_review",
+                json!({ "schematic": sch.to_string_lossy() }),
+            )
+            .await,
+    );
+    assert_eq!(
+        sch_only["source_evidence"]["schematic"]["schematic_state"], "saved_schematic",
+        "{sch_only}"
+    );
+    assert_eq!(
+        sch_only["source_evidence"]["schematic"]["excludes_unsaved_editor_state"], true,
+        "{sch_only}"
+    );
+    assert_eq!(
+        sch_only["source_evidence"]["schematic"]["reason"], "saved_snapshot_only_with_editor_lock",
+        "{sch_only}"
+    );
+
+    let with_board = body_of(
+        &scene
+            .call_with(
+                "run_design_review",
+                json!({
+                    "schematic": sch.to_string_lossy(),
+                    "board": scene.board.to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        with_board["source_evidence"]["board_state"], "saved_board",
+        "{with_board}"
+    );
+    assert_eq!(
+        with_board["source_evidence"]["reason"], "saved_snapshot_only",
+        "{with_board}"
+    );
+    assert_eq!(
+        with_board["source_evidence"]["schematic"]["reason"],
+        "saved_snapshot_only_with_editor_lock",
+        "{with_board}"
     );
 }
 

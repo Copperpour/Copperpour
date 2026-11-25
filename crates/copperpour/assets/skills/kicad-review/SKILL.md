@@ -142,6 +142,9 @@ Checks PCB-level rules:
 - Courtyard overlaps
 
 **Every DRC error must be resolved or explicitly justified before manufacturing.**
+Both `run_drc` and `get_drc_violations` run `kicad-cli` against the saved `.kicad_pcb` by default; pass `sync_live_board: true` (and `refill_zones: true` if zones are stale) when you need unsaved KiCad editor changes synchronized and verified before DRC.
+
+Saved-snapshot analysis tools (`run_design_review`, `audit_manufacturing`, `validate_for_manufacturing`, `get_design_rules`, `get_predefined_sizes`, `list_custom_rules`, `check_3d_models`, `estimate_cost`) inspect saved files on disk and report `sources` and `source_evidence` (including `source_evidence.schematic` on `run_design_review` to disclose any KiCad schematic editor lock). Never report saved-snapshot findings as current live editor state when `source_evidence.excludes_unsaved_editor_state` is `true`.
 
 ---
 

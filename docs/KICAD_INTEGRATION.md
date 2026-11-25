@@ -115,6 +115,72 @@ duplicate, malformed, or instance-inconsistent links return a structured
 resolve-only: it does not activate an editor or mutate selection, and pin/pad/
 net expansion remains unsupported until one stable destination can be proven.
 
+## Board-State Source Contract
+
+Every registered MCP tool accepting `board` declares an executable, test-enforced
+`BoardAccess` classification (`crates/copperpour-core/src/tools/mod.rs`, checked by
+`reliability_contract_board_access_inventory_is_complete` in `tools/board_source.rs`), and read-only board
+source selection runs through one shared module,
+`crates/copperpour-core/src/tools/board_source.rs`.
+
+### Eligible read-only tools (`board_source`)
+
+`get_board_info`, `get_board_extents`, `get_layer_list`, `get_netclasses`,
+`list_zones`, `score_placement`, `get_placement_overview`, `check_clearance`,
+`get_component_pads`, and `get_pad_position` accept an optional `board_source`
+selector:
+
+- `"auto"` (default): uses the exact requested board open in KiCad over IPC when
+  available; falls back to the saved `.kicad_pcb` file only when no live board
+  was positively identified and the board was not previously observed live during
+  the current server session.
+- `"live"`: requires the exact requested board to be open in a reachable KiCad;
+  otherwise returns a structured error (`wrong_document` / `editor_unavailable`).
+- `"saved"`: intentionally inspects the last-saved file on disk without
+  consulting KiCad IPC and discloses that unsaved editor changes are excluded.
+
+Non-negotiable rules enforced by `board_source::read_board`:
+
+- Once KiCad has positively identified the requested board as live, a failed live
+  query returns a structured error (`editor_unavailable`) instead of silently
+  substituting the saved file.
+- If this server session previously observed the board live and IPC is later lost
+  or the board is closed, `board_source: "auto"` refuses with
+  `unsafe_file_fallback` instead of presenting a possibly stale saved file as
+  current. Pass `board_source: "saved"` to inspect the saved snapshot
+  deliberately.
+- A responsive KiCad instance holding a different board is never treated as the
+  live source for the requested board.
+
+### Provenance (`sources` and `source_evidence`)
+
+Every board-reading, analysis, render, and CLI export tool reports two canonical
+provenance keys:
+
+- `sources`: maps each domain of the answer to its observed origin (`"ipc"`,
+  `"saved_board"`, `"saved_schematic"`, `"project_file"`, `"custom_rules_file"`,
+  `"kicad_cli"`, `"derived"`, `"argument"`, or `"unavailable"`).
+- `source_evidence`: records `board_state`, `excludes_unsaved_editor_state`,
+  `reason`, and `detail` for the board observation. On mixed board+schematic
+  tools (`export_manufacturing_package`, `generate_jlcpcb_order_link`, and
+  `run_design_review`), `source_evidence.schematic` additionally discloses the
+  saved-schematic state (`schematic_state: "saved_schematic"`,
+  `excludes_unsaved_editor_state: true`) and whether a KiCad schematic editor
+  lock is present on disk (`saved_snapshot_only_with_editor_lock`), even when the
+  board itself was captured from live IPC.
+
+Saved-snapshot analysis tools (`audit_manufacturing`, `validate_for_manufacturing`,
+`estimate_cost`, `check_3d_models`, `run_design_review`, `get_design_rules`,
+`get_predefined_sizes`, `list_custom_rules`) and `kicad-cli` render/export tools
+(`export_gerber`, `export_pdf`, `export_svg`, `export_3d`, `export_netlist`,
+`export_position_file`, `export_dxf`, `export_gencad`, `export_ipc2581`,
+`export_odb`, `get_board_2d_view`) always inspect saved files on disk without
+implicit KiCad saves and disclose `saved_snapshot_only`,
+`saved_snapshot_only_with_editor_lock`, or
+`saved_snapshot_only_after_live_observation` in `source_evidence.reason`.
+For DRC workflows that need live-board refill and save before `kicad-cli`, see
+[DRC source synchronization](DRC_SYNCHRONIZATION.md).
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses

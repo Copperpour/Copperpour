@@ -41,7 +41,8 @@ operations need the exact board open in KiCad with IPC enabled; saved-file \
 schematic operations do not require the GUI.\n\
 Before mutations, dependent checks, retries or completion claims, read \
 copperpour/references/reliability-contract.md through get_guidance. Bind the \
-requested document and distinguish live-editor evidence from saved files. Await \
+requested document and distinguish live-editor evidence from saved files using \
+board_source, sources, and source_evidence. Await \
 state-changing prerequisites, inspect errors and per-item outcomes, and verify \
 results by readback. A successful call alone is not proof that a change applied \
 or a check ran. After a partial or uncertain mutation, inspect what happened \
@@ -76,7 +77,8 @@ operations need the exact board open in KiCad with IPC enabled; saved-file \
 schematic operations do not require the GUI.\n\
 Before mutations, dependent checks, retries or completion claims, read \
 copperpour/references/reliability-contract.md through get_guidance. Bind the \
-requested document and distinguish live-editor evidence from saved files. Await \
+requested document and distinguish live-editor evidence from saved files using \
+board_source, sources, and source_evidence. Await \
 state-changing prerequisites, inspect errors and per-item outcomes, and verify \
 results by readback. A successful call alone is not proof that a change applied \
 or a check ran. After a partial or uncertain mutation, inspect what happened \
@@ -336,6 +338,61 @@ mod tests {
                 text.contains(marker),
                 "served kicad-schematic guidance is missing `{marker}`"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn board_source_guidance_is_served_over_mcp() {
+        let handler = handler().await;
+        for (path, markers) in [
+            (
+                "copperpour/SKILL.md",
+                &[
+                    "Board Source & Provenance",
+                    "board_source",
+                    "source_evidence.schematic",
+                    "unsafe_file_fallback",
+                ][..],
+            ),
+            (
+                "kicad-pcb/SKILL.md",
+                &[
+                    "board_source",
+                    "source_evidence",
+                    "source: \"ipc\"",
+                    "unsafe_file_fallback",
+                ][..],
+            ),
+            (
+                "kicad-review/SKILL.md",
+                &[
+                    "source_evidence",
+                    "source_evidence.schematic",
+                    "sync_live_board",
+                ][..],
+            ),
+            (
+                "kicad-manufacture/SKILL.md",
+                &["source_evidence", "source_evidence.schematic"][..],
+            ),
+        ] {
+            let via_tool = tool(&handler, json!({"path": path})).await;
+            let text = via_tool["contents"][0]["text"].as_str().unwrap();
+            let via_resource = request(
+                &handler,
+                "resources/read",
+                json!({"uri": format!("{URI_PREFIX}{path}")}),
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(via_resource["contents"][0]["text"].as_str(), Some(text));
+            for marker in markers {
+                assert!(
+                    text.contains(marker),
+                    "served {path} guidance is missing `{marker}`"
+                );
+            }
         }
     }
 

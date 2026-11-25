@@ -144,8 +144,10 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
   journal, inspect the differences, and ask the user how to reconcile. Never
   abandon or delete the journal automatically.
 - **`unsafe_file_fallback`:** Live KiCad IPC disappeared while live state may
-  differ from disk. Do not fall back to saved-file tools or hand-edits;
-  reconnect KiCad and verify live state.
+  differ from disk. For mutations, do not fall back to saved-file tools or
+  hand-edits; reconnect KiCad and verify live state. On read-only tools taking
+  `board_source`, pass `board_source: "saved"` if the user explicitly wants to
+  inspect the last-saved snapshot while disclosing excluded unsaved edits.
 - **`ipc_outcome_unknown` (`board_state: unknown`, `retry_safe: false`):** Stop
   automatic retries. Inspect the live board in KiCad and reconcile what was
   applied before repeating any mutation. Keep the full diagnostic, which

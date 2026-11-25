@@ -184,6 +184,30 @@ pub(crate) fn saved_schematic_evidence(schematic_path: &Path) -> Value {
     )
 }
 
+/// Per-domain provenance for the saved `.kicad_sch` input of a mixed-source
+/// tool whose top-level `source_evidence` describes the board domain.
+pub(crate) fn saved_schematic_domain_evidence(schematic_path: &Path) -> Value {
+    let (reason, detail) = saved_lock_fields(live_board::editor_lock(schematic_path));
+    json!({
+        "schematic_state": FROM_SAVED_SCHEMATIC,
+        "excludes_unsaved_editor_state": true,
+        "reason": reason,
+        "detail": detail,
+    })
+}
+
+/// Attach per-domain `schematic` provenance to a board `source_evidence`
+/// object when the tool also read a saved `.kicad_sch` file on disk.
+pub(crate) fn with_saved_schematic_evidence(
+    mut evidence: Value,
+    schematic_path: Option<&Path>,
+) -> Value {
+    if let Some(path) = schematic_path {
+        evidence["schematic"] = saved_schematic_domain_evidence(path);
+    }
+    evidence
+}
+
 /// Observed provenance for a mixed review run when no board path was supplied.
 pub(crate) fn schematic_only_evidence() -> Value {
     json!({
@@ -217,8 +241,8 @@ fn saved_file_evidence(
     saved_lock_evidence(board_state, lock)
 }
 
-fn saved_lock_evidence(board_state: &'static str, lock: live_board::EditorLock) -> Value {
-    let (reason, detail) = match lock {
+fn saved_lock_fields(lock: live_board::EditorLock) -> (&'static str, String) {
+    match lock {
         live_board::EditorLock::Absent => (
             "saved_snapshot_only",
             "This tool inspects the saved files on disk without consulting KiCad IPC; any \
@@ -242,7 +266,11 @@ fn saved_lock_evidence(board_state: &'static str, lock: live_board::EditorLock) 
                 display_path(&path)
             ),
         ),
-    };
+    }
+}
+
+fn saved_lock_evidence(board_state: &'static str, lock: live_board::EditorLock) -> Value {
+    let (reason, detail) = saved_lock_fields(lock);
     json!({
         "board_state": board_state,
         "excludes_unsaved_editor_state": true,
