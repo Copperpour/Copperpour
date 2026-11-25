@@ -25,9 +25,12 @@ The preview stops when no further step qualifies. If more cleanup is possible
 after 256 steps, it returns `plan_blocked` without a partial plan. Select a smaller
 region and try again.
 
-A new pin-to-pin run must be at least 2.54 mm long. Until the by-pin orientation
-update is available, a moved power symbol faces away from the connected pin's
-symbol, as `add_power_symbol` does today.
+A new pin-to-pin run must be at least 2.54 mm long. Moving a power symbol onto a
+stub uses the by-pin `add_power_symbol` rotation rule. If facing away from the
+connected symbol would take a quarter turn, cleanup keeps the library direction
+when it clears the surrounding drawing and pin corridors. It turns the power
+symbol away when the library direction is blocked or would face back across the
+connected symbol.
 
 Each step must earn `improved` from `compare_schematic_layout` and pass its
 preservation gate. Better score tiers take priority over shorter wire length.

@@ -677,7 +677,7 @@ async fn a_fixed_power_lead_with_a_shared_tip_is_not_rerouted() {
 }
 
 #[test]
-fn a_turned_power_stub_keeps_the_by_pin_facing_with_or_without_a_mirror() {
+fn a_blocked_power_stub_faces_away_with_or_without_a_mirror() {
     let tree = parse_sexp(FIELDS).unwrap();
     let sheet = Sheet::new(&tree).unwrap();
     let index = sheet.index();
@@ -688,13 +688,17 @@ fn a_turned_power_stub_keeps_the_by_pin_facing_with_or_without_a_mirror() {
         .unwrap();
     let power = &sheet.placed[pin.symbol_index].0;
     let tip = (76.2, 124.46);
-    let expected = rotation_facing(&pin.pin, 0.0);
+    let expected = copperpour_sexp::schematic::rotation_facing(&pin.pin, 0.0);
     assert_ne!(expected, 0.0);
-    assert_eq!(power_placement(power, pin, tip, 0.0), (tip, expected));
+    let blocked = |_| Ok(Some("library direction is blocked".into()));
+    assert_eq!(
+        power_placement(power, pin, tip, 0.0, blocked).unwrap(),
+        (tip, expected)
+    );
 
     let mut mirrored = power.clone();
     mirrored.mirror_y = true;
-    let (origin, rotation) = power_placement(&mirrored, pin, tip, 0.0);
+    let (origin, rotation) = power_placement(&mirrored, pin, tip, 0.0, blocked).unwrap();
     assert_ne!(rotation, expected);
     let mut transform = mirrored.pin_transform();
     (transform.comp_x, transform.comp_y, transform.rotation_deg) = (origin.0, origin.1, rotation);
@@ -702,6 +706,57 @@ fn a_turned_power_stub_keeps_the_by_pin_facing_with_or_without_a_mirror() {
     assert_eq!(
         copperpour_sexp::transform_direction(pin.pin.rotation, transform),
         0.0
+    );
+}
+
+fn horizontal_power_fixture(blocker_y: f64) -> String {
+    format!(
+        r##"(kicad_sch (version 20250114) (generator "eeschema")
+          (lib_symbols
+            (symbol "Test:Anchor"
+              (pin passive line (at 0 0 0) (length 2.54) (name "") (number "1")))
+            (symbol "power:TestGND" (power global)
+              (rectangle (start -0.5 -1) (end 0.5 -2.5) (stroke (width 0) (type default))
+                (fill (type none)))
+              (pin power_in line (at 0 0 270) (length 0) (name "") (number "1")))
+            (symbol "Test:Blocker"
+              (rectangle (start -0.25 0.25) (end 0.25 -0.25) (stroke (width 0) (type default))
+                (fill (type none)))))
+          (symbol (lib_id "Test:Anchor") (at 50 50 0) (unit 1)
+            (property "Reference" "TP1" (at 50 50 0) (hide yes))
+            (uuid "00000000-0000-4000-8000-000000000101"))
+          (symbol (lib_id "power:TestGND") (at 40 50 0) (unit 1)
+            (property "Reference" "#PWR01" (at 40 50 0) (hide yes))
+            (property "Value" "GND" (at 40 50 0) (hide yes))
+            (uuid "00000000-0000-4000-8000-000000000102"))
+          (symbol (lib_id "Test:Blocker") (at 47.46 {blocker_y} 0) (unit 1)
+            (property "Reference" "U1" (at 47.46 {blocker_y} 0) (hide yes))
+            (uuid "00000000-0000-4000-8000-000000000103"))
+          (wire (pts (xy 40 50) (xy 50 50)) (stroke (width 0) (type default))
+            (uuid "00000000-0000-4000-8000-000000000104")))"##
+    )
+}
+
+#[tokio::test]
+async fn a_clear_horizontal_power_stub_keeps_the_library_rotation() {
+    let source = horizontal_power_fixture(57.0);
+    let plan = Preview::new(&source).await.plan(&["#PWR01"]).await;
+    let stub = step(&plan, "power_stub");
+    assert_eq!(stub["route"], json!([[50.0, 50.0], [47.46, 50.0]]));
+    assert_eq!(stub["symbols_moved"][0]["reference"], "#PWR01");
+    assert_eq!(stub["symbols_moved"][0]["rotation"], 0.0, "{plan}");
+}
+
+#[tokio::test]
+async fn a_blocked_horizontal_power_stub_turns_away_from_its_pin() {
+    let source = horizontal_power_fixture(51.75);
+    let plan = Preview::new(&source).await.plan(&["#PWR01"]).await;
+    let moved = &plan["steps"][0]["symbols_moved"][0];
+    assert_eq!(moved["rotation"], 270.0, "{plan}");
+    assert_eq!(moved["reference"], "#PWR01");
+    assert_eq!(
+        plan["steps"][0]["route"],
+        json!([[50.0, 50.0], [47.46, 50.0]])
     );
 }
 

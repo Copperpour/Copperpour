@@ -9,8 +9,8 @@ use super::sch_connectivity::{
 use super::sch_layout_score::{self, collinear_overlap, Score};
 use super::sch_pin_contacts::{touches, touches_interior, wire_chains, WireChain};
 use super::sch_wiring::{
-    apply_no_connect_carries, ordered_route_paths, plan_drawn_no_connect_carry, route_paths,
-    RouteGuard,
+    apply_no_connect_carries, library_power_clearance_reason, ordered_route_paths,
+    plan_drawn_no_connect_carry, route_paths, select_power_symbol_rotation, RouteGuard,
 };
 use super::{
     drawn_symbol_pins, get_path, invalid_arg, opt_str_list, require_f64, stub_direction, ToolDef,
@@ -22,7 +22,7 @@ use copperpour_schematic_editor as cse;
 use copperpour_sexp::geometry::{points_coincident, round6};
 use copperpour_sexp::schematic::{
     extract_all_net_labels, extract_buses, extract_sheet_pins, extract_wires, parse_at,
-    pin_outward_direction, rotation_facing, Label, LabelKind, SymbolInstance, Wire,
+    pin_outward_direction, Label, LabelKind, SymbolInstance, Wire,
 };
 use copperpour_sexp::writer::find_direct_child_blocks;
 use copperpour_sexp::{apply_edits, parse_sexp, DocumentRevision, SexpEdit, SexpNode};
@@ -1036,12 +1036,30 @@ impl Planner<'_> {
         }
         let outward = self.pin_outward(fixed);
         let end = stub_direction("auto", Some(outward)).end(tip, GRID);
-        let (origin, angle) = power_placement(power, power_pin, end, outward);
-        edit.symbols.push((id(power_pin).to_owned(), origin, angle));
+        let route = [rounded(tip), end];
+        let uuid = id(power_pin);
+        let (origin, angle) = power_placement(power, power_pin, end, outward, |origin| {
+            // Inspect the proposed stub, not a second copy of the symbol on its old lead.
+            let mut trial = Edit::new(self.sheet, run_indices);
+            trial.symbols.push((uuid.to_owned(), origin, 0.0));
+            let (stripped, _, _) = match trial.prepare(self.source, self.sheet.tree) {
+                Ok(parts) => parts,
+                Err(error) => return Ok(Some(error.to_string())),
+            };
+            let source = super::sch_wiring::draw_route_with_drawn_pins(&stripped, &route)?;
+            let candidate = parse_sexp(&source)?;
+            Ok(library_power_clearance_reason(
+                self.sheet.tree,
+                &candidate,
+                uuid,
+                tip,
+            ))
+        })?;
+        edit.symbols.push((uuid.to_owned(), origin, angle));
         self.check(Proposal {
             edit,
             bend: "power stub",
-            route: &[rounded(tip), end],
+            route: &route,
             length_before,
             kind: "power_stub",
             power_ended: false,
@@ -1100,7 +1118,8 @@ fn power_placement(
     pin: &PlacedPin,
     end: Point,
     outward: f64,
-) -> (Point, f64) {
+    library_blocked: impl FnOnce(Point) -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<(Point, f64)> {
     let mut transform = power.pin_transform();
     transform.comp_x = 0.0;
     transform.comp_y = 0.0;
@@ -1111,10 +1130,19 @@ fn power_placement(
             ..transform
         },
     );
-    let angle = rotation_facing(&pin.pin, facing);
-    transform.rotation_deg = angle;
-    let offset = copperpour_sexp::schematic::pin_endpoint(&pin.pin, transform);
-    (rounded((end.0 - offset.0, end.1 - offset.1)), angle)
+    let origin = |angle| {
+        let offset = copperpour_sexp::schematic::pin_endpoint(
+            &pin.pin,
+            copperpour_sexp::PinTransform {
+                rotation_deg: angle,
+                ..transform
+            },
+        );
+        rounded((end.0 - offset.0, end.1 - offset.1))
+    };
+    let (angle, _) =
+        select_power_symbol_rotation(&pin.pin, facing, || library_blocked(origin(0.0)))?;
+    Ok((origin(angle), angle))
 }
 
 fn stub_obstruction(sheet: &Sheet<'_>, from: Point, to: Point, edit: &Edit) -> Option<String> {
