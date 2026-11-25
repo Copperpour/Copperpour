@@ -25,7 +25,8 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # register_footprint_library, get_symbol_info,
                            # set_symbol_properties
 load_toolset('library_maintenance') # upgrade_library, rename_footprint, rename_symbol,
-                                    # edit_symbol_pins, delete_symbol_pin
+                                    # edit_symbol_pins, delete_symbol_pin,
+                                    # set_symbol_graphics
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -201,7 +202,8 @@ Acceptance procedure:
 unit in body style 1, a stacked number such as `[2,3,6,7]` once per pin. A pin
 drawn in two units under one number counts twice, as in KiCad's chooser.
 `warnings` name the duplicate pins KiCad's symbol checker reports; fix a real
-duplicate with `edit_symbol_pin`.
+duplicate with `edit_symbol_pin`. `graphics` lists the drawing, item by item,
+and `revision` is the library's, for `set_symbol_graphics`.
 
 The rows below are *starting hypotheses for generic parts only*. Verify each
 against the actual symbol with `get_symbol_info` before relying on it.
@@ -301,6 +303,28 @@ number in one unit and body style; an ambiguous choice is refused before
 writing. A derived symbol is refused: remove the pin from its root. The answer
 reports the removed pin, and `derived_symbols` names the symbols that extend
 the symbol, which lose the pin too.
+
+### Edit a Symbol's Graphics
+
+`set_symbol_graphics` (toolset `library_maintenance`) changes the drawing of an
+existing symbol, for example a body rectangle that has to grow with its pins:
+
+1. `get_symbol_info` lists each graphic with its `unit`, `body_style` and
+   `index` within them, and its `item` in `create_symbol`'s vocabulary, and
+   gives the library's `revision`.
+2. `set_symbol_graphics(library_path, symbol_name, revision, unit, body_style,
+   mode, ...)`: `mode: "append"` with `graphics` adds items; `"replace"` with
+   `index` and one item in `graphics` replaces that item; `"delete"` with
+   `index` removes it. Copy the listed `item` into `graphics` and change what
+   you need. What the vocabulary cannot write (a colour or hatch fill, a
+   dashed stroke, `private`) is listed beside the `item`; a replace drops it and
+   its answer names it in `warnings`.
+
+A revision that no longer matches the file is refused, so a stale index never
+reaches another item; list again after every save, KiCad's included, since
+KiCad may order a unit's items differently when it saves. The answer gives the
+new `revision`. A derived symbol is refused: edit its root. Move the Reference
+and Value with `set_symbol_properties`' `field_placements` after the body grows.
 
 ### Symbol Layout Guidelines
 
