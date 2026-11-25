@@ -10,8 +10,10 @@ until they were moved by hand in KiCad's symbol editor.
 
 - **Coordinates** are the symbol's own, as the library file and
   `create_symbol` use them: millimetres from its origin, with y up.
-  They are rounded to KiCad's 0.0001 mm, and `rotation` is written in
-  [0, 360).
+  They are rounded to KiCad's 0.0001 mm. `rotation` is written in
+  [0, 360), rounded as KiCad keeps an angle (six significant digits: three
+  decimals from 100 degrees, four below), so `33.3333333` is written as
+  `33.3333`.
 - **Hiding** writes `(hide yes)` before the field's `(effects …)`, as KiCad 10
   writes it. **Showing** takes out every flag that hid the field, the KiCad 6
   to 8 `hide` inside `(effects …)` included.
