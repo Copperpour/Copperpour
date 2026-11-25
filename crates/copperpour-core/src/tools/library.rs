@@ -39,8 +39,8 @@ use search_and_info::{
     handle_search_symbols,
 };
 pub(crate) use symbol_ops::{
-    handle_create_symbol, handle_delete_symbol, off_grid_pin_coordinate_warning,
-    ALLOWED_PIN_ELECTRICAL_TYPES,
+    handle_create_symbol, handle_delete_symbol, is_on_symbol_grid, off_grid_pin_coordinate_warning,
+    validate_graphics, ALLOWED_PIN_ELECTRICAL_TYPES,
 };
 
 #[cfg(test)]
@@ -88,9 +88,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use symbol_ops::{
-    build_symbol_unit, graphics_primitive_keys, grow_to, is_on_symbol_grid, names_span,
-    pin_name_width, pin_root, symbol_body_rect, Axis, PinGeom, PIN_NAME_GAP, PIN_NAME_OFFSET,
-    PIN_TEXT, SYMBOL_GRID,
+    build_symbol_unit, graphics_primitive_keys, grow_to, names_span, pin_name_width, pin_root,
+    symbol_body_rect, Axis, PinGeom, PIN_NAME_GAP, PIN_NAME_OFFSET, PIN_TEXT, SYMBOL_GRID,
 };
 
 use crate::tool;
@@ -167,12 +166,8 @@ fn footprint_drill_sexp(
 /// `stroke_width_mm` — built from the same code so the two cannot drift (#501).
 /// Only `fill` differs: a footprint fills or it does not, while a symbol also
 /// has KiCad's pale `background` body fill.
-fn symbol_graphics_schema() -> serde_json::Value {
-    let mut schema = crate::tools::footprint_graphics::graphics_schema_with_fill(&[
-        "none",
-        "outline",
-        "background",
-    ]);
+pub(crate) fn symbol_graphics_schema() -> serde_json::Value {
+    let mut schema = crate::tools::footprint_graphics::graphics_schema_with_fill(&SYMBOL_FILLS);
     schema["description"] = json!(
         "Draw this body yourself instead of using a glyph. Same primitive vocabulary as \
          set_footprint_graphics (line, arc, rect, circle, poly; points as {x, y}; \
@@ -185,6 +180,9 @@ fn symbol_graphics_schema() -> serde_json::Value {
     );
     schema
 }
+
+/// The fills `create_symbol` writes on a rect, circle or poly.
+pub(crate) const SYMBOL_FILLS: [&str; 3] = ["none", "outline", "background"];
 
 fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
     let mut required = vec!["number", "name", "type"];
@@ -607,7 +605,11 @@ pub fn tools() -> Vec<ToolDef> {
              Every pin is listed with its unit and body_style, as edit_symbol_pin chooses pins; a \
              derived symbol shows its root's pins. pin_count is KiCad's (every unit, body style \
              1, a stacked number once per pin), and warnings name the duplicate pins KiCad's \
-             symbol checker reports. Name it by lib_id through the symbol library tables, or by \
+             symbol checker reports. graphics lists the drawing item by item, each with its \
+             unit, body_style, index and item in create_symbol's vocabulary, and beside the item \
+             what that vocabulary cannot write, such as a colour or hatch fill (a derived symbol \
+             shows its root's), and revision is the library's, which set_symbol_graphics takes \
+             with an index. Name it by lib_id through the symbol library tables, or by \
              library_path and symbol_name in a .kicad_sym file, registered or not.",
             json!({
                 "type": "object",

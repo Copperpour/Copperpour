@@ -120,6 +120,7 @@ mod solder_margins;
 mod stub_obstacle_tests;
 pub mod svg_import;
 mod symbol_fields;
+pub(crate) mod symbol_graphics;
 pub(crate) mod symbol_pins;
 pub(crate) mod symbol_rename;
 pub mod templates;

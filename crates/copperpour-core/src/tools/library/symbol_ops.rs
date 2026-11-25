@@ -525,7 +525,7 @@ pub(super) const SYMBOL_GRID: f64 = 1.27;
 /// Whether `coord_mm` lies on KiCad's 1.27 mm (50 mil) schematic grid, within
 /// [`POSITION_EPSILON`] (1e-6 mm, absorbing float noise while catching even a
 /// single 0.0001 mm KiCad schematic internal unit of drift).
-pub(super) fn is_on_symbol_grid(coord_mm: f64) -> bool {
+pub(crate) fn is_on_symbol_grid(coord_mm: f64) -> bool {
     if !coord_mm.is_finite() {
         return false;
     }
@@ -1110,7 +1110,7 @@ pub(super) fn graphics_primitive_keys(kind: &str) -> Option<&'static [&'static s
 /// of those has a silent wrong answer as its alternative — a typo'd `type`
 /// emits nothing at all and still reports success — which is the failure this
 /// validation exists to end (#501).
-fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
+pub(crate) fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
     fn point(g: &serde_json::Value, key: &str, at: usize, kind: &str) -> Result<(), String> {
         let p = &g[key];
         if p["x"].as_f64().is_some() && p["y"].as_f64().is_some() {

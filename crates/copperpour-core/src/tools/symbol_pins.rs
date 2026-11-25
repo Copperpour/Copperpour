@@ -1,7 +1,7 @@
 //! `edit_symbol_pin`: change one pin's electrical type, graphic style, name,
 //! number, position, angle, length or visibility in an existing `.kicad_sym`
 //! symbol, leaving everything else as written; `edit_symbol_pins`, which
-//! changes several pins of one symbol so in one write (#868); and
+//! changes several pins of one symbol in one write (#868); and
 //! `delete_symbol_pin`, which removes one pin chosen the same way (#716).
 
 use crate::mcp::error::ToolErrorKind;
@@ -1022,7 +1022,7 @@ fn read_pin(
 }
 
 /// The symbol a derived symbol's `(extends "PARENT")` names.
-fn extends(source: &str, start: usize, end: usize) -> Option<String> {
+pub(super) fn extends(source: &str, start: usize, end: usize) -> Option<String> {
     find_direct_child_blocks(&source[start..end], "symbol")
         .into_iter()
         .find_map(
@@ -1579,7 +1579,7 @@ fn prepare_delete(
 /// the chain the same way and stops at a cycle (`LIB_SYMBOL::GetRootSymbol`,
 /// `eeschema/lib_symbol.cpp`), so a symbol in a cycle that leaves the root out
 /// is not listed.
-fn derived_from(source: &str, root: usize) -> Vec<String> {
+pub(super) fn derived_from(source: &str, root: usize) -> Vec<String> {
     let symbols = symbols(source);
     let Some(root) = symbols.iter().find(|symbol| symbol.start == root) else {
         return Vec::new();

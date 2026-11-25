@@ -359,6 +359,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "set_predefined_sizes",
     "set_schematic_page",
     "set_schematic_title_block",
+    "set_symbol_graphics",
     "set_symbol_properties",
     "set_teardrop_settings",
     "set_via_positions",

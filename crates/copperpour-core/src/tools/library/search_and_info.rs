@@ -1004,7 +1004,7 @@ pub(super) async fn handle_get_symbol_info(
             })
         })
         .collect();
-    let warnings = duplicate_pin_warnings(&symbol_pins);
+    let mut warnings = duplicate_pin_warnings(&symbol_pins);
 
     // Properties are direct children of the top-level symbol.
     let mut properties = serde_json::Map::new();
@@ -1022,6 +1022,14 @@ pub(super) async fn handle_get_symbol_info(
     answer["pin_count"] = json!(kicad_pin_count(&symbol_pins));
     answer["pins"] = json!(pins);
     answer["properties"] = json!(properties);
+    // The drawing, item by item, and the revision set_symbol_graphics takes
+    // to name one of them (#867).
+    let (revision, graphics) = crate::tools::symbol_graphics::listed_graphics(&content, sym_name);
+    answer["revision"] = json!(revision);
+    match graphics {
+        Ok(graphics) => answer["graphics"] = json!(graphics),
+        Err(reason) => warnings.push(format!("the symbol's graphics are not listed: {reason}")),
+    }
     if !warnings.is_empty() {
         answer["warnings"] = json!(warnings);
     }
