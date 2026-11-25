@@ -19,10 +19,10 @@ import sys
 # the issue number or reason.
 #
 # A closing keyword or `Part of` at the start of a line, after any list marker,
-# quote or bold, then `#N`, `owner/repo#N` or the issue's URL.
+# quote or bold (closed before or after the colon), then `#N`, `owner/repo#N` or the issue's URL.
 ISSUE_LINE = re.compile(
     r"^ {0,3}(?:[-*+>][ \t]*)*(?:\*\*|__)?"
-    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|part of)[ \t]*:?[ \t]+"
+    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|part of)[ \t]*:?(?:\*\*|__)?:?[ \t]+"
     r"(?:(?:[\w.-]+/[\w.-]+)?#\d+|https://github\.com/[\w.-]+/[\w.-]+/issues/\d+)\b",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -34,8 +34,9 @@ NO_MIGRATION = re.compile(
 )
 # GitHub ignores links inside HTML comments, and the template is full of them.
 # Examples in fenced code blocks are not declarations either. An unclosed
-# comment or fence runs to the end of the body.
-HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+# comment runs to the end of the body only when it starts a line, as GitHub
+# renders it; mid-line it is text. An unclosed fence runs to the end.
+HTML_COMMENT = re.compile(r"<!--.*?-->|^ {0,3}<!--.*", re.DOTALL | re.MULTILINE)
 CODE_FENCE = re.compile(
     r"^ {0,3}(`{3,}|~{3,}).*?(?:^ {0,3}\1[`~]*[ \t]*$|\Z)",
     re.DOTALL | re.MULTILINE,
@@ -52,6 +53,8 @@ def is_test_path(path: str) -> bool:
 
 def problems(body: str, name_status: list[str]) -> list[str]:
     found = []
+    # `$` matches before `\n` only, so CRLF bodies would never close a fence.
+    body = body.replace("\r\n", "\n")
     body = CODE_FENCE.sub("", HTML_COMMENT.sub("", body))
     if not ISSUE_LINE.search(body) and not NO_ISSUE.search(body):
         found.append(

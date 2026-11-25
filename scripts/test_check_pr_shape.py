@@ -18,6 +18,8 @@ class IssueLink(unittest.TestCase):
         for body in (
             "- Closes #12\n",
             "**Closes #12**\n",
+            "**Closes:** #12\n",
+            "**Closes** #12\n",
             "> Fixes #12\n",
             "Closes: #12\n",
             "Resolves https://github.com/Copperpour/Copperpour/issues/12\n",
@@ -47,6 +49,9 @@ class IssueLink(unittest.TestCase):
     def test_declaration_after_code_block_passes(self):
         body = "Example:\n\n```\nNo issue: example\n```\n\nCloses #12\n"
         self.assertEqual(problems(body, []), [])
+
+    def test_unclosed_comment_mid_line_keeps_the_rest(self):
+        self.assertEqual(problems("See `<!--` above.\nCloses #12\n", []), [])
 
     def test_unfilled_template_line_fails(self):
         self.assertEqual(len(problems("Closes # (or Part of #)\n", [])), 1)
@@ -101,6 +106,13 @@ class MigrationNote(unittest.TestCase):
     def test_none_in_code_block_fails(self):
         body = self.BODY + "```\nAPI migration: none — internal refactor\n```\n"
         self.assertEqual(len(problems(body, [TOOL])), 1)
+
+    def test_crlf_body_after_code_block_passes(self):
+        body = (
+            "Example:\r\n\r\n```\r\ncode\r\n```\r\n\r\n"
+            "Closes #12\r\nAPI migration: none \u2014 internal\r\n"
+        )
+        self.assertEqual(problems(body, [TOOL]), [])
 
     def test_bare_none_fails(self):
         self.assertEqual(len(problems(self.BODY + "API migration: none\n", [TOOL])), 1)
