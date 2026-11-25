@@ -1,0 +1,36 @@
+name: Markdown prose wrap
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: markdown-wrap-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  markdown-wrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install rumdl
+        run: python -m pip install rumdl==0.3.6
+      - name: Test the checker
+        run: python -m unittest discover -s scripts -p test_check_markdown_wrap.py -v
+      - name: Warn about added or edited prose
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/check_markdown_wrap.py "$BASE_SHA...$HEAD_SHA"
