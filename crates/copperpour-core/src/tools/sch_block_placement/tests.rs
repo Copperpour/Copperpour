@@ -48,7 +48,7 @@ impl Sheet {
             .collect()
     }
 
-    async fn serve(&self, args: Value) -> Value {
+    async fn call(&self, args: Value) -> (Value, Value) {
         let saved = self.saved();
         let handler = McpHandler::new(ServerConfig {
             eager_toolsets: true,
@@ -66,14 +66,27 @@ impl Sheet {
             .result
             .unwrap();
         assert_eq!(self.saved(), saved);
-        assert_ne!(reply["isError"], true, "{reply}");
         let body: Value =
             serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        (reply, body)
+    }
+
+    async fn serve(&self, args: Value) -> Value {
+        let (reply, body) = self.call(args).await;
+        assert_ne!(reply["isError"], true, "{reply}");
         assert_eq!(
             body["revision"],
-            crate::hex::sha256_hex(&saved[self.path.file_name().unwrap()])
+            crate::hex::sha256_hex(&std::fs::read(&self.path).unwrap())
         );
         body
+    }
+
+    async fn refuses(&self, args: Value, kind: &str) -> Value {
+        let (reply, body) = self.call(args).await;
+        assert_eq!(reply["isError"], true, "{reply}");
+        assert_eq!(body["error"]["kind"], kind, "{body}");
+        assert!(body.get("plan").is_none(), "{body}");
+        body["error"].clone()
     }
 
     fn replay(&self, plan: &Value) -> SexpNode {
@@ -191,6 +204,83 @@ impl Sheet {
 }
 
 #[tokio::test]
+async fn missing_placed_targets_return_stale_target() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let absent = "00000000-0000-0000-0000-000000000000";
+    assert!(!std::fs::read_to_string(&sheet.path)
+        .unwrap()
+        .contains(absent));
+    for (field, value) in [
+        ("anchor", json!({"uuid": absent, "unit": 1})),
+        ("fixed_uuids", json!([absent])),
+        ("note_uuids", json!([absent])),
+    ] {
+        let mut args = sheet.opamp();
+        args[field] = value;
+        let error = sheet.refuses(args, "stale_target").await;
+        assert_eq!(error["target"], absent);
+        assert!(error["reason"].as_str().unwrap().contains(field));
+    }
+    let mut args = sheet.opamp();
+    args["assignments"][0]["member"]["uuid"] = json!(absent);
+    let error = sheet.refuses(args, "stale_target").await;
+    assert_eq!(error["target"], absent);
+    assert!(error["reason"]
+        .as_str()
+        .unwrap()
+        .contains("assignments[0].member.uuid"));
+}
+
+#[tokio::test]
+async fn duplicate_placed_uuid_returns_ambiguous_target() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let args = sheet.opamp();
+    let anchor = args["anchor"]["uuid"].as_str().unwrap();
+    let mut tree = sheet.tree.clone();
+    let duplicate = tree
+        .find_all("symbol")
+        .into_iter()
+        .find(|node| node.find_str("uuid") == Some(anchor))
+        .unwrap()
+        .clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    items.push(duplicate);
+    let sheet = sheet.with_tree(tree);
+    let error = sheet.refuses(args.clone(), "ambiguous_target").await;
+    assert_eq!(error["target"], format!("schematic UUID {anchor}"));
+    assert_eq!(error["candidates"], json!(["symbol", "symbol"]));
+}
+
+#[tokio::test]
+async fn invalid_selection_reports_the_exact_argument_path() {
+    let sheet = Sheet::fixture("opamp_stage");
+    for (path, field) in [
+        ("/anchor/unit", "anchor.unit"),
+        ("/members/0/unit", "members[0].unit"),
+        ("/assignments/0/member/unit", "assignments[0].member.unit"),
+        (
+            "/connectors/0/connector/unit",
+            "connectors[0].connector.unit",
+        ),
+        ("/connectors/0/port/unit", "connectors[0].port.unit"),
+        ("/assignments/0/anchor_pin", "assignments[0].anchor_pin"),
+        ("/connectors/0/connector_pin", "connectors[0].connector_pin"),
+        ("/connectors/0/port_pin", "connectors[0].port_pin"),
+    ] {
+        let mut args = sheet.opamp();
+        *args.pointer_mut(path).unwrap() = if path.ends_with("/unit") {
+            json!(999)
+        } else {
+            json!("no_such_pin")
+        };
+        let error = sheet.refuses(args, "invalid_argument").await;
+        assert_eq!(error["field"], field);
+    }
+}
+
+#[tokio::test]
 async fn shared_rail_is_not_membership_evidence() {
     let sheet = Sheet::fixture("shared_rail");
     let report = sheet
@@ -232,6 +322,30 @@ async fn opamp_preview_is_an_improvement_without_writing() {
     );
     assert_eq!(sheet.serve(args).await, report);
     let replay = sheet.replay(&report["plan"]);
+    let compare = |tree: &SexpNode, side, raw: f64, effective: &str| {
+        let wires = extract_wires(tree);
+        let excluded = &report["comparison"]["excluded_supply_stubs"][side];
+        let segments = excluded["segments"].as_array().unwrap();
+        assert!(!segments.is_empty());
+        let total: f64 = segments
+            .iter()
+            .map(|segment| {
+                let segment: [inventory::Point; 2] =
+                    serde_json::from_value(segment.clone()).unwrap();
+                assert!(wires.iter().any(|wire| endpoints(wire) == segment));
+                length(segment)
+            })
+            .sum();
+        assert!((excluded["length_mm"].as_f64().unwrap() - total).abs() < 1e-6);
+        let measured: f64 = wires.iter().map(|wire| length(endpoints(wire))).sum();
+        let ranked = report["comparison"][effective]["wire_length_mm"]
+            .as_f64()
+            .unwrap();
+        assert!((measured - raw).abs() < 1e-6);
+        assert!((ranked + total - measured).abs() < 1e-6);
+    };
+    compare(&sheet.tree, "baseline", 497.84, "baseline_score");
+    compare(&replay, "candidate", 160.02, "score");
     let observed = Inventory::new(&replay).unwrap();
     let bounds = |reference| {
         let part = observed
@@ -263,6 +377,163 @@ async fn opamp_preview_is_an_improvement_without_writing() {
     let next = replayed.serve(replayed.opamp()).await;
     assert_eq!(next["status"], "unchanged", "{next}");
     assert!(next["plan"].is_null(), "{next}");
+}
+
+#[tokio::test]
+async fn a_short_wire_outside_the_block_refuses_the_preview() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let mut tree = sheet.tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    items.push(parse_sexp(&format_wire(230.0, 180.0, 231.27, 180.0)).unwrap());
+    let sheet = sheet.with_tree(tree);
+    let report = sheet.serve(sheet.opamp()).await;
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null());
+    assert!(
+        report["blockers"]
+            .to_string()
+            .contains("shorter than 2.54 mm"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn aliased_rail_names_do_not_make_a_private_supply_removable() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let args = sheet.opamp();
+    let supply = sheet.id("#PWR06")["uuid"].as_str().unwrap().to_owned();
+    let mut tree = sheet.tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    let symbol = items
+        .iter_mut()
+        .find(|node| node.find_str("uuid") == Some(&supply))
+        .unwrap();
+    let SexpNode::List(children) = symbol else {
+        unreachable!()
+    };
+    let property = children
+        .iter_mut()
+        .find(|node| {
+            node.head() == Some("property")
+                && node.get(1).and_then(SexpNode::as_str) == Some("Value")
+        })
+        .unwrap();
+    let SexpNode::List(property) = property else {
+        unreachable!()
+    };
+    property[2] = SexpNode::Str("ALIAS_5V".into());
+    // The named graph now sees the same root. The two private drawn islands
+    // still carry different supply values.
+    items.push(parse_sexp(&format_wire(230.0, 180.0, 235.08, 180.0)).unwrap());
+    for (name, x) in [("+5V", 230.0), ("ALIAS_5V", 235.08)] {
+        items.push(parse_sexp(&format!(
+            r#"(label "{name}" (at {x} 180 0) (effects (font (size 1.27 1.27)) (justify left bottom)))"#,
+        )).unwrap());
+    }
+    let sheet = sheet.with_tree(tree);
+    let report = sheet.serve(args).await;
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null());
+    assert!(
+        report["blockers"]
+            .to_string()
+            .contains("not a removable duplicate"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_power_flag_on_a_private_lead_is_not_a_removable_supply() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let args = sheet.opamp();
+    let supply = sheet.id("#PWR06")["uuid"].as_str().unwrap().to_owned();
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let tip = inventory.parts[supply.as_str()].pins[0].tip;
+    let wire = inventory
+        .wires
+        .iter()
+        .map(endpoints)
+        .find(|ends| ends.contains(&tip))
+        .unwrap();
+    let (x, y) = ((wire[0].0 + wire[1].0) / 2.0, (wire[0].1 + wire[1].1) / 2.0);
+    // Name this island through the legacy graph without adding a physically
+    // attached label, so only the electrical type disqualifies the private lead.
+    let (x, y) = if wire[0].0 == wire[1].0 {
+        (x + 0.001, y)
+    } else {
+        (x, y + 0.001)
+    };
+    let mut tree = sheet.tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    let symbol = items
+        .iter_mut()
+        .find(|node| node.find_str("uuid") == Some(&supply))
+        .unwrap();
+    let SexpNode::List(children) = symbol else {
+        unreachable!()
+    };
+    let lib_id = children
+        .iter_mut()
+        .find(|node| node.head() == Some("lib_id"))
+        .unwrap();
+    *lib_id = parse_sexp(r#"(lib_id "power:PWR_FLAG")"#).unwrap();
+    items.push(parse_sexp(&format!(
+        r#"(label "+5V" (at {x} {y} 0) (effects (font (size 1.27 1.27)) (justify left bottom)))"#,
+    )).unwrap());
+    let sheet = sheet.with_tree(tree);
+    let report = sheet.serve(args).await;
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null());
+    assert!(
+        report["blockers"]
+            .to_string()
+            .contains("member supply does not have a private lead"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_fixed_wire_in_a_redrawn_island_cannot_be_replaced() {
+    let (sheet, mut args) = with_output_connector_detour().await;
+    args["members"] = json!([]);
+    args["assignments"] = json!([]);
+    let plan = sheet.serve(args.clone()).await;
+    assert_eq!(plan["status"], "improved", "{plan}");
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let request = Request::parse(&args).unwrap();
+    let pairing = &request.connectors[0];
+    let tip = inventory
+        .symbol(pairing.connector)
+        .unwrap()
+        .pin(pairing.connector_pin)
+        .unwrap()
+        .tip;
+    let wire = inventory
+        .wires
+        .iter()
+        .find(|wire| endpoints(wire).contains(&tip))
+        .unwrap();
+    let id = wire.uuid.as_deref().unwrap();
+    assert!(plan["plan"]["remove_wire_uuids"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(id)));
+    args["fixed_uuids"] = json!([id]);
+    let report = sheet.serve(args).await;
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null());
+    assert!(
+        report["blockers"]
+            .to_string()
+            .contains(&format!("candidate would change fixed item {id}")),
+        "{report}"
+    );
 }
 
 #[tokio::test]
@@ -631,6 +902,38 @@ async fn an_explicit_shared_rail_assignment_can_be_a_wire_adding_tradeoff() {
     );
     let replay = sheet.replay(&report["plan"]);
     sheet.export_fixture_pair(&replay);
+}
+
+#[tokio::test]
+async fn a_clearer_wire_adding_group_is_not_a_cleanup() {
+    let sheet = Sheet::fixture("shared_rail");
+    let mut source = std::fs::read_to_string(&sheet.path).unwrap();
+    let original = "(property \"Reference\" \"C1\"\n\t\t\t(at 145.415 128.27 0)";
+    assert_eq!(source.matches(original).count(), 1);
+    // Put only C1's Reference across its old ground lead. Moving C1 clears
+    // the crossing, so the scorer improves even though the grouping adds wire.
+    source = source.replacen(
+        original,
+        "(property \"Reference\" \"C1\"\n\t\t\t(at 143.5 135.89 0)",
+        1,
+    );
+    let sheet = sheet.with_tree(parse_sexp(&source).unwrap());
+    let report = sheet
+        .serve(json!({
+            "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [sheet.id("C1")],
+            "assignments": [{ "member": sheet.id("C1"), "anchor_pin": "5" }]
+        }))
+        .await;
+    assert_eq!(report["comparison"]["verdict"], "improved", "{report}");
+    assert_eq!(report["comparison"]["delta"]["wire_field_overlap"], -1);
+    assert!(
+        report["comparison"]["delta"]["wire_length_mm"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert_eq!(report["status"], "grouping_adds_wire", "{report}");
+    assert!(!report["plan"].is_null());
 }
 
 #[tokio::test]
@@ -1056,7 +1359,7 @@ fn feedback_search_reserves_trials_for_both_sides_of_the_anchor() {
     let anchor = inventory.symbol(request.anchor).unwrap();
     let labels = extract_labels(&sheet.tree);
     let topology = topology::Topology::new(&sheet.tree, &inventory, &labels);
-    let members = movable_parts(&sheet.tree, anchor, &inventory, &request).unwrap();
+    let members = movable_parts(anchor, &inventory, &request).unwrap();
     let id = members[0].0.id.uuid;
     let below = (0..MAX_TRIALS / 2)
         .find_map(|trial| place(anchor, &inventory, &topology, &members, &request, trial).ok())
@@ -1322,7 +1625,7 @@ fn custom_rail_route_refuses_to_pick_up_an_unrelated_label() {
     let anchor = inventory.symbol(request.anchor).unwrap();
     let labels = extract_labels(&sheet.tree);
     let topology = topology::Topology::new(&sheet.tree, &inventory, &labels);
-    let members = movable_parts(&sheet.tree, anchor, &inventory, &request).unwrap();
+    let members = movable_parts(anchor, &inventory, &request).unwrap();
     let changes = (0..MAX_TRIALS)
         .find_map(|trial| {
             let changes = place(anchor, &inventory, &topology, &members, &request, trial).ok()?;
@@ -1420,7 +1723,7 @@ fn the_preservation_gate_requires_the_removal_uuid_even_on_a_good_drawing() {
     let sheet = Sheet::fixture("opamp_stage");
     let args = sheet.opamp();
     let request = Request::parse(&args).unwrap();
-    let (_, status, reasons, _, plan) = preview(&sheet.tree, &request);
+    let (_, status, reasons, _, plan) = preview(&sheet.tree, &request).unwrap();
     assert_eq!(status, "improved", "{reasons:?}");
     let after = sheet.replay(&plan);
     let removed = vec![sheet.id("#PWR06")["uuid"].as_str().unwrap().to_owned()];
@@ -1438,7 +1741,8 @@ fn the_preservation_gate_requires_the_removal_uuid_even_on_a_good_drawing() {
 fn the_preservation_gate_rejects_a_severed_bypass_even_with_the_correct_removal_uuid() {
     let sheet = Sheet::fixture("opamp_stage");
     let args = sheet.opamp();
-    let (_, status, reasons, _, plan) = preview(&sheet.tree, &Request::parse(&args).unwrap());
+    let (_, status, reasons, _, plan) =
+        preview(&sheet.tree, &Request::parse(&args).unwrap()).unwrap();
     assert_eq!(status, "improved", "{reasons:?}");
     let mut after = sheet.replay(&plan);
     let inventory = Inventory::new(&after).unwrap();

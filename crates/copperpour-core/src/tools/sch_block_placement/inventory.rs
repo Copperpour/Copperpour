@@ -387,9 +387,6 @@ impl<'a> Inventory<'a> {
         if !part.is_support() {
             return Err("only two-pin passive supporting parts can be placed");
         }
-        if assigned.is_some_and(|number| anchor.pin(number).is_none()) {
-            return Err("the assignment names no pin of the anchor");
-        }
         let [p, q] = part.pins.as_slice() else {
             unreachable!("is_support")
         };

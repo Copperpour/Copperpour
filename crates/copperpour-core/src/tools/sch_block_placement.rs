@@ -11,6 +11,7 @@ use super::sch_analysis::{overlap_findings, OVERLAP_TOLERANCE};
 use super::sch_layout_score::{compare_layout, read_saved_sheet, LayoutComparison};
 use super::sch_pin_contacts::pin_contact_findings;
 use super::{get_path, invalid_arg, ToolContext, ToolDef};
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use candidate::Changes;
@@ -37,8 +38,11 @@ pub(super) fn definition() -> ToolDef {
         "preview_block_placement",
         "Preview clearer placement and wiring around a fixed IC on one saved schematic sheet. \
          Select movable members by UUID and unit. Assign bypass capacitors explicitly to anchor \
-         supply pins. Returns separate membership evidence, a revision, a checked plan, scores \
-         and blockers. Does not edit files or run KiCad.",
+         supply pins. Pairs connectors on the left or right only. Missing targets, duplicate \
+         UUIDs and invalid units or pins are tool errors; geometry and routing can block a valid \
+         request. Wire-length scores exclude verified supply stubs, reported with the comparison. \
+         Returns membership evidence, a revision, a checked plan, scores and blockers. Does not \
+         edit files or run KiCad.",
         json!({
             "type": "object",
             "required": ["schematic", "anchor", "members"],
@@ -85,7 +89,7 @@ struct Connector<'a> {
 struct Request<'a> {
     anchor: SymbolId<'a>,
     members: Vec<SymbolId<'a>>,
-    assigned: BTreeMap<SymbolId<'a>, &'a str>,
+    assigned: BTreeMap<SymbolId<'a>, (usize, &'a str)>,
     fixed: BTreeSet<&'a str>,
     notes: Vec<&'a str>,
     connectors: Vec<Connector<'a>>,
@@ -116,13 +120,15 @@ impl<'a> Request<'a> {
             ));
         }
         let mut assigned = BTreeMap::new();
-        for Assignment { member, anchor_pin } in
+        for (i, Assignment { member, anchor_pin }) in
             optional::<Vec<Assignment<'a>>>(args, "assignments")?
+                .into_iter()
+                .enumerate()
         {
-            if !member_ids.contains(&member) || assigned.insert(member, anchor_pin).is_some() {
+            if assigned.insert(member, (i, anchor_pin)).is_some() {
                 return Err(invalid_arg(
-                    "assignments",
-                    "each assignment must name a distinct selected member",
+                    &format!("assignments[{i}].member"),
+                    "a member may have only one assignment",
                 ));
             }
         }
@@ -134,6 +140,116 @@ impl<'a> Request<'a> {
             notes: optional(args, "note_uuids")?,
             connectors: optional(args, "connectors")?,
         })
+    }
+
+    fn validate_targets(&self, tree: &SexpNode) -> Result<(), CallToolResult> {
+        let mut items = BTreeMap::<_, Vec<_>>::new();
+        for node in tree.children().into_iter().flatten() {
+            if let Some(uuid) = node.find_str("uuid") {
+                items.entry(uuid).or_default().push(node);
+            }
+        }
+        if let Some((&uuid, nodes)) = items.iter().find(|(_, nodes)| nodes.len() > 1) {
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::AmbiguousTarget {
+                    target: format!("schematic UUID {uuid}"),
+                    candidates: nodes
+                        .iter()
+                        .map(|node| node.head().unwrap_or("item").to_owned())
+                        .collect(),
+                },
+                format!("More than one placed item has UUID '{uuid}'."),
+            ));
+        }
+        let item = |uuid: &str, field: &str| {
+            items.get(uuid).map(|nodes| nodes[0]).ok_or_else(|| {
+                let reason = format!("{field}: no placed item has UUID '{uuid}'");
+                CallToolResult::error_kind(
+                    ToolErrorKind::StaleTarget {
+                        target: uuid.to_owned(),
+                        reason: reason.clone(),
+                    },
+                    reason,
+                )
+            })
+        };
+        let symbol = |id: SymbolId<'_>, field: &str| {
+            let node = item(id.uuid, &format!("{field}.uuid"))?;
+            if node.head() != Some("symbol") {
+                return Err(invalid_arg(
+                    &format!("{field}.uuid"),
+                    "expected a placed symbol",
+                ));
+            }
+            if let Some(placed) = copperpour_sexp::schematic::symbol_instance(node) {
+                if placed.unit != id.unit {
+                    return Err(invalid_arg(
+                        &format!("{field}.unit"),
+                        &format!("symbol is placed as unit {}", placed.unit),
+                    ));
+                }
+            }
+            Ok(())
+        };
+        symbol(self.anchor, "anchor")?;
+        for (i, &member) in self.members.iter().enumerate() {
+            symbol(member, &format!("members[{i}]"))?;
+        }
+        for (&member, &(i, _)) in &self.assigned {
+            let field = format!("assignments[{i}].member");
+            symbol(member, &field)?;
+            if !self.members.contains(&member) {
+                return Err(invalid_arg(&field, "expected a selected member"));
+            }
+        }
+        for (i, pair) in self.connectors.iter().enumerate() {
+            symbol(pair.connector, &format!("connectors[{i}].connector"))?;
+            symbol(pair.port, &format!("connectors[{i}].port"))?;
+        }
+        for &uuid in &self.fixed {
+            item(uuid, "fixed_uuids")?;
+        }
+        for (i, &uuid) in self.notes.iter().enumerate() {
+            let field = format!("note_uuids[{i}]");
+            if item(uuid, &field)?.head() != Some("text") {
+                return Err(invalid_arg(&field, "expected a placed free-text note"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_pins(&self, inventory: &Inventory<'_>) -> Result<(), CallToolResult> {
+        let pin = |id, number, field: &str| {
+            let part = inventory
+                .symbol(id)
+                .map_err(|reason| invalid_arg(field, &reason))?;
+            if part.pin(number).is_none() {
+                return Err(invalid_arg(
+                    field,
+                    &format!(
+                        "{} has no pin '{number}' in the selected unit",
+                        part.inst.reference
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        for &(i, number) in self.assigned.values() {
+            pin(self.anchor, number, &format!("assignments[{i}].anchor_pin"))?;
+        }
+        for (i, pair) in self.connectors.iter().enumerate() {
+            pin(
+                pair.connector,
+                pair.connector_pin,
+                &format!("connectors[{i}].connector_pin"),
+            )?;
+            pin(
+                pair.port,
+                pair.port_pin,
+                &format!("connectors[{i}].port_pin"),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -150,7 +266,10 @@ async fn handle_preview_block_placement(
         Ok(sheet) => sheet,
         Err(error) => return Ok(error),
     };
-    let (suggestions, status, blockers, score, plan) = preview(&tree, &request);
+    let (suggestions, status, blockers, score, plan) = match preview(&tree, &request) {
+        Ok(preview) => preview,
+        Err(error) => return Ok(error),
+    };
     Ok(CallToolResult::json(&json!({
         "source": "saved_file", "schematic": path, "revision": crate::hex::sha256_hex(source.as_bytes()),
         "suggestions": suggestions, "status": status, "blockers": blockers,
@@ -160,19 +279,25 @@ async fn handle_preview_block_placement(
 
 type Preview = (Value, &'static str, Vec<String>, Value, Value);
 
-fn preview(tree: &SexpNode, request: &Request<'_>) -> Preview {
-    let refused =
-        |suggestions, blockers| (suggestions, "blocked", blockers, Value::Null, Value::Null);
+fn preview(tree: &SexpNode, request: &Request<'_>) -> Result<Preview, CallToolResult> {
+    request.validate_targets(tree)?;
     let inventory = match Inventory::new(tree) {
         Ok(inventory) => inventory,
-        Err(e) => return refused(json!([]), vec![e]),
+        Err(e) => return Ok((json!([]), "blocked", vec![e], Value::Null, Value::Null)),
     };
+    request.validate_pins(&inventory)?;
+    Ok(plan_preview(tree, request, &inventory))
+}
+
+fn plan_preview(tree: &SexpNode, request: &Request<'_>, inventory: &Inventory<'_>) -> Preview {
+    let refused =
+        |suggestions, blockers| (suggestions, "blocked", blockers, Value::Null, Value::Null);
     let anchor = match inventory.symbol(request.anchor) {
         Ok(anchor) => anchor,
         Err(e) => return refused(json!([]), vec![e]),
     };
     let suggestions = json!(inventory.membership(anchor));
-    let movable = match movable_parts(tree, anchor, &inventory, request) {
+    let movable = match movable_parts(anchor, inventory, request) {
         Ok(movable) => movable,
         Err(e) => return refused(suggestions, vec![e]),
     };
@@ -189,7 +314,7 @@ fn preview(tree: &SexpNode, request: &Request<'_>) -> Preview {
         }
     }
     let labels = extract_labels(tree);
-    let topology = topology::Topology::new(tree, &inventory, &labels);
+    let topology = topology::Topology::new(tree, inventory, &labels);
     if movable.is_empty() && request.connectors.is_empty() && request.notes.is_empty() {
         return (suggestions, "unchanged", vec![], Value::Null, Value::Null);
     }
@@ -198,7 +323,7 @@ fn preview(tree: &SexpNode, request: &Request<'_>) -> Preview {
     let mut rejected_candidate = None;
     let mut checked = None;
     for trial in 0..MAX_TRIALS {
-        let mut changes = match place(anchor, &inventory, &topology, &movable, request, trial) {
+        let mut changes = match place(anchor, inventory, &topology, &movable, request, trial) {
             Ok(changes) => changes,
             Err(e) => {
                 failures = vec![e];
@@ -225,7 +350,7 @@ fn preview(tree: &SexpNode, request: &Request<'_>) -> Preview {
                     .insert(uuid, step((x, y), vectors[(trial - 1) % 4], distance));
             }
         }
-        let mut candidate = match candidate::build(tree, &inventory, &topology, &changes) {
+        let mut candidate = match candidate::build(tree, inventory, &topology, &changes) {
             Ok(candidate) => candidate,
             Err(e) => {
                 failures = vec![e];
@@ -257,14 +382,16 @@ fn preview(tree: &SexpNode, request: &Request<'_>) -> Preview {
             continue;
         }
         let removed: Vec<_> = changes.removed.into_iter().map(str::to_owned).collect();
-        let comparison = match accept_candidate(tree, &candidate, &removed) {
+        let (comparison, excluded_supply_stubs) = match accept_candidate(tree, &candidate, &removed)
+        {
             Ok(comparison) => comparison,
             Err(e) => {
                 rejected_candidate.get_or_insert(e);
                 continue;
             }
         };
-        let score = comparison.json();
+        let mut score = comparison.json();
+        score["excluded_supply_stubs"] = excluded_supply_stubs;
         if candidate == *tree {
             return (suggestions, "unchanged", vec![], score, Value::Null);
         }
@@ -377,32 +504,10 @@ fn check_drawn_islands(
 }
 
 fn movable_parts<'s, 'a>(
-    tree: &SexpNode,
     anchor: &'s Part<'a>,
     inventory: &'s Inventory<'a>,
     request: &Request<'_>,
 ) -> Result<Vec<(&'s Part<'a>, Role<'s>)>, String> {
-    for &id in &request.fixed {
-        if !tree
-            .children()
-            .into_iter()
-            .flatten()
-            .any(|n| n.find_str("uuid") == Some(id))
-        {
-            return Err(format!("fixed item {id} is not on the sheet"));
-        }
-    }
-    for &id in &request.notes {
-        if !tree
-            .find_all("text")
-            .iter()
-            .any(|n| n.find_str("uuid") == Some(id))
-        {
-            return Err(format!(
-                "note {id} is not an editable free-text note on the sheet"
-            ));
-        }
-    }
     let mut result = Vec::new();
     for &id in &request.members {
         let part = inventory.symbol(id)?;
@@ -410,7 +515,7 @@ fn movable_parts<'s, 'a>(
             continue;
         }
         let role = inventory
-            .role(anchor, part, request.assigned.get(&id).copied())
+            .role(anchor, part, request.assigned.get(&id).map(|&(_, pin)| pin))
             .map_err(|e| format!("{}: {e}", part.inst.reference))?;
         result.push((part, role));
     }
@@ -968,6 +1073,8 @@ fn group_rail<'a>(
     let (removed, _) = topology
         .private_supply(member)
         .ok_or("the member supply does not have a private lead")?;
+    // One electrical root may have several driver names. A private lead and
+    // equal roots do not prove that removing this symbol preserves its name.
     if anchor.net != member.net
         || retained.inst.value != removed.inst.value
         || retained.lib.find("power") != removed.lib.find("power")
@@ -1087,18 +1194,12 @@ fn accept_candidate(
     before: &SexpNode,
     after: &SexpNode,
     removed: &[String],
-) -> Result<LayoutComparison, Vec<String>> {
+) -> Result<(LayoutComparison, Value), Vec<String>> {
     let before_inventory = inventory::Inventory::new(before).map_err(|e| vec![e])?;
     let after_inventory = inventory::Inventory::new(after).map_err(|e| vec![e])?;
-    let comparison = compare_layout(
-        after,
-        Some(before),
-        removed,
-        [
-            &mandatory_stubs(before, &before_inventory),
-            &mandatory_stubs(after, &after_inventory),
-        ],
-    );
+    let before_stubs = mandatory_stubs(before, &before_inventory);
+    let after_stubs = mandatory_stubs(after, &after_inventory);
+    let comparison = compare_layout(after, Some(before), removed, [&before_stubs, &after_stubs]);
     if comparison.verdict == Some("blocked") {
         return Err(comparison.reasons);
     }
@@ -1167,7 +1268,24 @@ fn accept_candidate(
         }
     }
     if blockers.is_empty() {
-        Ok(comparison)
+        let exclusions = |wires: &[copperpour_sexp::schematic::Wire], ids: &BTreeSet<String>| {
+            // New wires receive temporary UUIDs during routing. Report the
+            // endpoints instead, in the same coordinates as the plan.
+            let segments: Vec<_> = wires
+                .iter()
+                .filter(|w| w.uuid.as_ref().is_some_and(|id| ids.contains(id)))
+                .map(endpoints)
+                .collect();
+            let total: f64 = segments.iter().copied().map(length).sum();
+            json!({"segments": segments, "length_mm": (total * 1000.0).round() / 1000.0})
+        };
+        Ok((
+            comparison,
+            json!({
+                "baseline": exclusions(&before_inventory.wires, &before_stubs),
+                "candidate": exclusions(&after_inventory.wires, &after_stubs),
+            }),
+        ))
     } else {
         Err(blockers)
     }

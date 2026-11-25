@@ -151,6 +151,8 @@ impl<'s, 'a> Topology<'s, 'a> {
 
     /// The power pin must have no other attachment to redraw. Same-name
     /// islands elsewhere on the sheet do not belong to this lead.
+    /// Reject power outputs (including flags) here because this lookup also
+    /// authorizes moving a lead without passing through rail removal checks.
     pub fn private_supply(&self, pin: &Pin) -> Option<(&'s Part<'a>, &'s Pin)> {
         let island = self.islands.get(&pin.drawn)?;
         if island.terminals.len() != 2 || !island.junctions.is_empty() {
