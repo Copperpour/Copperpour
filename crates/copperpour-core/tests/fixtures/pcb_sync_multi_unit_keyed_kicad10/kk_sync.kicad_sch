@@ -1057,6 +1057,17 @@
 				)
 			)
 		)
+		(property "MPN" "RC0603FR-072K2L"
+			(at 101.6 50.8 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
 		(pin "1"
 			(uuid "b2476c3a-9e50-4a02-9648-78d92bbd90e9")
 		)
@@ -1071,16 +1082,7 @@
 				)
 			)
 		)
-	
-		(property "MPN" "RC0603FR-072K2L"
-			(at 101.6 50.8 0)
-			(hide yes)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-			)
-		))
+	)
 	(symbol
 		(lib_id "Connector_Generic:Conn_01x04")
 		(at 139.7 50.8 0)

@@ -1,8 +1,8 @@
 (export
 	(version "E")
 	(design
-		(source "Z:\\git\\github\\Copperpour.wt\\target-pcb-sync-units\\fixture\\kk_sync\\kk_sync.kicad_sch")
-		(date "2026-11-25T14:28:29")
+		(source "Z:\\git\\github\\Copperpour.wt\\pcb-sync-units\\crates\\copperpour-core\\tests\\fixtures\\pcb_sync_multi_unit_keyed_kicad10\\kk_sync.kicad_sch")
+		(date "2026-11-25T23:48:20")
 		(tool "Eeschema 10.0.8")
 		(sheet
 			(number "1")

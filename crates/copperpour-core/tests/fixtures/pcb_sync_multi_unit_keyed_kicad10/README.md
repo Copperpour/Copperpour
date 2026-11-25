@@ -47,7 +47,7 @@ found for pin 2 in schematic", on `P1`. It reports nothing about `U1`.
 | File | SHA-256 |
 | --- | --- |
 | `kk_sync.kicad_pro` | `2dbe50017a4a0162cd98e637548532d8f50a91aa6afd3d61377ad26003ccf18a` |
-| `kk_sync.kicad_sch` | `30b15ec2912105d15a935ce6d320f97fd958f7ddc720106074c267929c45ada9` |
-| `kk_sync.net` | `67299eb7288350f86530f395e2298037b896532428e97becdc5e74df39b48f32` |
+| `kk_sync.kicad_sch` | `8bcc71b7e47bbcbce44b8b38527c4887e48798de1d295bad1e1a9426602eecd2` |
+| `kk_sync.net` | `eca4ec0967509dd8fbe4e559c84f2e36f5f456d006d7c780fd3a8df8af987e7c` |
 | `fp-lib-table` | `aa053536fc9a8d3107be1390e9a4aeaa4a7ffe26e170bea73e0c3572aabfcb4e` |
 | `kk.pretty/KK254_1x04_Keyed.kicad_mod` | `ceb8dc3c910dac82b88e1e359967b4d96874313d8f5dc8b4d8da84346da30998` |
