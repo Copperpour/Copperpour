@@ -1439,6 +1439,15 @@ pub(crate) enum ClosedBoardError {
     ReferenceNotFound(String),
     /// More than one does, so "the" footprint is ambiguous.
     ReferenceAmbiguous(String),
+    /// More than one does, and the tool takes a `kiid` to choose: the
+    /// footprints' UUIDs, sorted, and the reason naming each one's position.
+    AmbiguousTarget {
+        reference: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
+    /// The caller's `kiid` names no footprint, or one with another reference.
+    StaleTarget { target: String, reason: String },
     /// The board is not a shape this tool will edit, before or after.
     Unusable(String),
     /// The board's copper stack gives the footprint's inner copper no
@@ -1475,6 +1484,22 @@ impl ClosedBoardError {
                      it does not identify one footprint. The board file was not modified — \
                      give the duplicates distinct references first."
                 ),
+            ),
+            Self::AmbiguousTarget {
+                reference,
+                candidates,
+                reason,
+            } => ambiguous_footprint_result(
+                reference,
+                candidates,
+                format!("{reason}. The board file was not modified."),
+            ),
+            Self::StaleTarget { target, reason } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target,
+                    reason: reason.clone(),
+                },
+                format!("{reason}. The board file was not modified."),
             ),
             Self::Unusable(reason) => CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::MalformedFile {
@@ -2185,15 +2210,93 @@ fn footprint_layer(footprint: &str) -> anyhow::Result<String> {
         .context("footprint layer has no name")
 }
 
+/// A footprint the closed-board flip may mean: its span, UUID, reference and
+/// position in millimetres.
+struct ClosedBoardTarget {
+    span: (usize, usize),
+    uuid: String,
+    reference: Option<String>,
+    at: (f64, f64),
+}
+
+/// The span of the footprint to flip, chosen as the live flip chooses it
+/// (`select_footprint_target` in copperpour-ipc): the one with UUID `kiid`
+/// when given, so long as it still carries `reference`, otherwise the one
+/// footprint carrying `reference`. `targets` are the footprints carrying
+/// `reference`, or with `kiid` the ones with that UUID.
+fn select_closed_board_target(
+    mut targets: Vec<ClosedBoardTarget>,
+    reference: &str,
+    kiid: Option<&str>,
+) -> Result<(usize, usize), ClosedBoardError> {
+    if let Some(kiid) = kiid {
+        return match targets.len() {
+            0 => Err(ClosedBoardError::StaleTarget {
+                target: kiid.to_string(),
+                reason: format!(
+                    "No placed footprint on the board has KIID '{kiid}' (expected reference \
+                     '{reference}')"
+                ),
+            }),
+            1 => match targets[0].reference.as_deref() {
+                Some(observed) if observed == reference => Ok(targets[0].span),
+                observed => Err(ClosedBoardError::StaleTarget {
+                    target: kiid.to_string(),
+                    reason: format!(
+                        "Footprint KIID '{kiid}' currently has reference '{}', not \
+                         '{reference}'",
+                        observed.unwrap_or_default()
+                    ),
+                }),
+            },
+            n => Err(ClosedBoardError::Unusable(format!(
+                "the board lists {n} footprints with UUID '{kiid}'"
+            ))),
+        };
+    }
+    match targets.len() {
+        0 => Err(ClosedBoardError::ReferenceNotFound(reference.to_string())),
+        1 => Ok(targets[0].span),
+        count => {
+            // Distinct UUIDs let the caller pick one with `kiid`; a UUID
+            // missing or listed twice leaves nothing to pick by.
+            targets.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+            let distinct = targets.windows(2).all(|pair| pair[0].uuid != pair[1].uuid);
+            if !distinct || targets.iter().any(|target| target.uuid.is_empty()) {
+                return Err(ClosedBoardError::ReferenceAmbiguous(reference.to_string()));
+            }
+            let listed: Vec<_> = targets
+                .iter()
+                .map(|target| {
+                    format!(
+                        "{} at ({:.3}, {:.3}) mm",
+                        target.uuid, target.at.0, target.at.1
+                    )
+                })
+                .collect();
+            Err(ClosedBoardError::AmbiguousTarget {
+                reference: reference.to_string(),
+                candidates: targets.into_iter().map(|target| target.uuid).collect(),
+                reason: format!(
+                    "Footprint reference '{reference}' matches {count} placed footprints; pass \
+                     kiid to choose one: {}",
+                    listed.join(", ")
+                ),
+            })
+        }
+    }
+}
+
 fn prepare_closed_board_footprint_side(
     content: &str,
     reference: &str,
+    kiid: Option<&str>,
     target_layer: &str,
 ) -> Result<(String, bool), ClosedBoardError> {
     if let Err(reason) = check_single_board_form(content) {
         return Err(ClosedBoardError::Unusable(reason.to_string()));
     }
-    let mut matched = None;
+    let mut targets = Vec::new();
     let mut layer_table = None;
     for (start, end, tag) in
         direct_children_with_tags(content, "kicad_pcb").map_err(ClosedBoardError::Io)?
@@ -2208,14 +2311,31 @@ fn prepare_closed_board_footprint_side(
         }
         let footprint = copperpour_sexp::parse_sexp(&content[start..end])
             .map_err(|e| ClosedBoardError::Io(e.into()))?;
-        if footprint_reference(&footprint).as_deref() == Some(reference)
-            && matched.replace((start, end)).is_some()
-        {
-            return Err(ClosedBoardError::ReferenceAmbiguous(reference.to_string()));
+        // KiCad reads a footprint's `tstamp`, in older files, as its KIID too.
+        let uuid = footprint
+            .find_str("uuid")
+            .or_else(|| footprint.find_str("tstamp"))
+            .unwrap_or_default()
+            .to_string();
+        let footprint_ref = footprint_reference(&footprint);
+        let named = match kiid {
+            Some(kiid) => uuid == kiid,
+            None => footprint_ref.as_deref() == Some(reference),
+        };
+        if named {
+            let at = footprint.find("at");
+            targets.push(ClosedBoardTarget {
+                span: (start, end),
+                uuid,
+                reference: footprint_ref,
+                at: (
+                    at.and_then(|at| at.get_f64(1)).unwrap_or_default(),
+                    at.and_then(|at| at.get_f64(2)).unwrap_or_default(),
+                ),
+            });
         }
     }
-    let (start, end) =
-        matched.ok_or_else(|| ClosedBoardError::ReferenceNotFound(reference.to_string()))?;
+    let (start, end) = select_closed_board_target(targets, reference, kiid)?;
     let block = &content[start..end];
     let current_layer = footprint_layer(block).map_err(ClosedBoardError::Io)?;
     if !matches!(current_layer.as_str(), "F.Cu" | "B.Cu") {
@@ -2266,11 +2386,12 @@ fn prepare_closed_board_footprint_side(
 fn set_closed_board_footprint_side(
     board_path: &Path,
     reference: &str,
+    kiid: Option<&str>,
     target_layer: &str,
 ) -> Result<bool, ClosedBoardError> {
     let content = read_consistent(board_path).map_err(|e| ClosedBoardError::Io(e.into()))?;
     let (updated, changed) =
-        prepare_closed_board_footprint_side(&content, reference, target_layer)?;
+        prepare_closed_board_footprint_side(&content, reference, kiid, target_layer)?;
     if changed {
         persist_board_replacement(board_path, &content, &updated)
             .map_err(|e| ClosedBoardError::Io(e.into()))?;
@@ -2458,13 +2579,16 @@ pub fn tools() -> Vec<ToolDef> {
              unsupported_capability error rather than falling back to the file. Only when no \
              live KiCad holds this board does it fall back to a guarded closed-board file edit, \
              which flips supported geometry with revision checks and refuses any footprint whose \
-             3D model would need a transform the file path cannot perform.",
+             3D model would need a transform the file path cannot perform. Optional kiid pins \
+             one footprint: without it, a reference several footprints share (such as 'REF**') \
+             is refused as ambiguous_target naming each KIID.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
-                    "layer":     { "type": "string", "enum": ["F.Cu", "B.Cu"] }
+                    "layer":     { "type": "string", "enum": ["F.Cu", "B.Cu"] },
+                    "kiid":      { "type": "string", "description": "Exact footprint KIID (UUID) to pin one instance or disambiguate duplicate references (optional)" }
                 },
                 "required": ["board", "reference", "layer"]
             }),
@@ -2558,12 +2682,15 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "find_component",
-            "Find a footprint on the board by reference designator and return its position.",
+            "Find a footprint on the board by reference designator and return its position and \
+             KIID. Optional kiid pins one footprint: without it, a reference several footprints \
+             share (such as 'REF**') is refused as ambiguous_target naming each KIID.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
-                    "reference": { "type": "string" }
+                    "reference": { "type": "string" },
+                    "kiid":      { "type": "string", "description": "Exact footprint KIID (UUID) to pin one instance or disambiguate duplicate references (optional)" }
                 },
                 "required": ["board", "reference"]
             }),
@@ -2776,7 +2903,7 @@ fn flip_new_footprint_to_back(
             "Removing the footprint created on F.Cu could not be confirmed; inspect the board."
         }
     };
-    let outcome = match client.flip_footprint(reference, "B.Cu") {
+    let outcome = match client.flip_footprint(reference, None, "B.Cu") {
         Ok(outcome) => outcome,
         Err(error) => {
             let removed = client.delete_footprint(reference).is_ok();
@@ -2813,6 +2940,14 @@ fn flip_new_footprint_to_back(
                     removal_note(removed)
                 ),
             )))
+        }
+        IpcFlipOutcome::StaleTarget { reason, .. }
+        | IpcFlipOutcome::AmbiguousTarget { reason, .. } => {
+            let removed = client.delete_footprint(reference).is_ok();
+            Err(anyhow::anyhow!(
+                "flipping new footprint '{reference}' to B.Cu was refused: {reason}. {}",
+                removal_note(removed)
+            ))
         }
         uncertain @ IpcFlipOutcome::Uncertain { .. } => Ok(Err(flip_outcome_result(uncertain))),
     }
@@ -3396,22 +3531,27 @@ async fn handle_flip_component(
         }
         Err(error) => return Ok(error),
     };
+    let kiid = match optional_kiid(args) {
+        Ok(kiid) => kiid,
+        Err(error) => return Ok(error),
+    };
 
     // KiCad 10.0.6 added a native FlipItems IPC command, so an open board now
     // flips through the same live-IPC-preferred-with-fallback shape as
     // set_component_placements, rather than refusing outright whenever KiCad
     // is reachable. The closed-board file fallback is unchanged (issue #604).
     let reference_ipc = reference.clone();
+    let kiid_ipc = kiid.clone();
     let layer_ipc = layer.clone();
     match attempt_ipc_write(ctx, &board, "footprint flip", move |client| {
-        client.flip_footprint(&reference_ipc, &layer_ipc)
+        client.flip_footprint(&reference_ipc, kiid_ipc.as_deref(), &layer_ipc)
     })
     .await?
     {
         BoardWrite::Ipc(outcome) => Ok(flip_outcome_result(outcome)),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
-            match set_closed_board_footprint_side(&board, &reference, &layer) {
+            match set_closed_board_footprint_side(&board, &reference, kiid.as_deref(), &layer) {
                 Ok(changed) => Ok(CallToolResult::json(&json!({
                     "flipped": reference,
                     "layer": layer,
@@ -3463,6 +3603,22 @@ fn flip_outcome_result(outcome: copperpour_ipc::IpcFlipOutcome) -> CallToolResul
                  a footprint on an open board over IPC. The board file was not modified."
             ),
         ),
+        IpcFlipOutcome::StaleTarget { target, reason } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target,
+                reason: reason.clone(),
+            },
+            format!("flip_component refused: {reason}. Nothing was written."),
+        ),
+        IpcFlipOutcome::AmbiguousTarget {
+            target,
+            candidates,
+            reason,
+        } => ambiguous_footprint_result(
+            target,
+            candidates,
+            format!("flip_component refused: {reason}. Nothing was written."),
+        ),
         IpcFlipOutcome::Uncertain {
             reference,
             kiid,
@@ -3509,15 +3665,9 @@ async fn handle_edit_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let kiid = match &args["kiid"] {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(value) => {
-            if value.trim().is_empty() {
-                return Ok(crate::tools::invalid_arg("kiid", "must not be empty"));
-            }
-            Some(value.clone())
-        }
-        _ => return Ok(crate::tools::invalid_arg("kiid", "must be a string")),
+    let kiid = match optional_kiid(args) {
+        Ok(kiid) => kiid,
+        Err(e) => return Ok(e),
     };
     let new_reference = match &args["new_reference"] {
         serde_json::Value::Null => None,
@@ -3576,7 +3726,11 @@ async fn handle_edit_component(
                 target,
                 candidates,
                 reason,
-            } => ambiguous_footprint_result(target, candidates, &reason),
+            } => ambiguous_footprint_result(
+                target,
+                candidates,
+                format!("edit_component refused: {reason}. Nothing was written."),
+            ),
         });
     }
     let outcome = ipc!(ctx, args, |c, document| {
@@ -3679,16 +3833,31 @@ fn edit_component_body(
     })
 }
 
+/// The optional `kiid` that pins one placed footprint, or the
+/// `invalid_argument` refusal for one that is not a non-empty string.
+fn optional_kiid(args: &serde_json::Value) -> Result<Option<String>, CallToolResult> {
+    match &args["kiid"] {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => {
+            if value.trim().is_empty() {
+                return Err(crate::tools::invalid_arg("kiid", "must not be empty"));
+            }
+            Ok(Some(value.clone()))
+        }
+        _ => Err(crate::tools::invalid_arg("kiid", "must be a string")),
+    }
+}
+
 /// `ambiguous_target` for a reference several placed footprints carry,
 /// naming their KIIDs so the caller can retry with `kiid`.
 fn ambiguous_footprint_result(
     target: String,
     candidates: Vec<String>,
-    reason: &str,
+    message: String,
 ) -> CallToolResult {
     CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::AmbiguousTarget { target, candidates },
-        format!("edit_component refused: {reason}. Nothing was written."),
+        message,
     )
 }
 
@@ -3738,7 +3907,11 @@ fn edit_component_result(
             target,
             candidates,
             reason,
-        } => ambiguous_footprint_result(target, candidates, &reason),
+        } => ambiguous_footprint_result(
+            target,
+            candidates,
+            format!("edit_component refused: {reason}. Nothing was written."),
+        ),
         IpcFootprintEditOutcome::Uncertain {
             expected,
             observed,
@@ -4409,17 +4582,43 @@ async fn handle_find_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let fp = ipc!(ctx, args, |c| {
-        c.get_footprint(&reference)?
-            .ok_or_else(|| copperpour_ipc::PreflightRefusal::missing_footprint(&reference).into())
-    });
-    Ok(CallToolResult::json(&json!({
-        "reference": fp.reference,
-        "value": fp.value,
-        "footprint": fp.footprint,
-        "x": fp.position.x, "y": fp.position.y,
-        "rotation": fp.rotation, "layer": fp.layer
-    })))
+    let kiid = match optional_kiid(args) {
+        Ok(kiid) => kiid,
+        Err(e) => return Ok(e),
+    };
+    let lookup = ipc!(ctx, args, |c, document| c.find_footprint_in(
+        document,
+        &reference,
+        kiid.as_deref()
+    ));
+    Ok(match lookup {
+        copperpour_ipc::IpcFootprintLookupOutcome::Found(fp) => CallToolResult::json(&json!({
+            "reference": fp.reference,
+            "kiid": fp.kiid,
+            "value": fp.value,
+            "footprint": fp.footprint,
+            "x": fp.position.x, "y": fp.position.y,
+            "rotation": fp.rotation, "layer": fp.layer
+        })),
+        copperpour_ipc::IpcFootprintLookupOutcome::StaleTarget { target, reason } => {
+            CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target,
+                    reason: reason.clone(),
+                },
+                format!("find_component refused: {reason}."),
+            )
+        }
+        copperpour_ipc::IpcFootprintLookupOutcome::AmbiguousTarget {
+            target,
+            candidates,
+            reason,
+        } => ambiguous_footprint_result(
+            target,
+            candidates,
+            format!("find_component refused: {reason}."),
+        ),
+    })
 }
 
 /// How many pads the saved file gives `reference`, or `None` when the file
@@ -6989,6 +7188,80 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
+    /// `kiid` reaches the live flip: a stale one is refused before any
+    /// write, and the footprint's own one flips it (#880).
+    #[tokio::test]
+    async fn flip_over_ipc_takes_kiid_and_refuses_a_stale_one() {
+        use copperpour_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        let server = spawn_flip_capable_kicad(&board, footprint.clone(), |_, held| {
+            held.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            let item =
+                copperpour_ipc::builders::pack_any(held, "kiapi.board.types.FootprintInstance");
+            kiapi::board::commands::FlipItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                }],
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+        let flip =
+            |kiid: &str| json!({"board": board, "reference": "U1", "layer": "B.Cu", "kiid": kiid});
+
+        let stale = handle_flip_component(&flip("not-on-the-board"), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&stale).as_deref(),
+            Some("stale_target"),
+            "{}",
+            result_text(&stale)
+        );
+        assert_eq!(
+            footprint.lock().unwrap().layer,
+            kiapi::board::types::BoardLayer::BlFCu as i32
+        );
+
+        let pinned = handle_flip_component(&flip("U1-kiid"), &ctx).await.unwrap();
+        assert!(!pinned.is_error, "{}", result_text(&pinned));
+        let body: serde_json::Value = serde_json::from_str(&result_text(&pinned)).unwrap();
+        assert_eq!(body["kiid"], "U1-kiid");
+        assert_eq!(body["layer"], "B.Cu");
+    }
+
+    /// A live flip refused as ambiguous names each KIID, for a retry with
+    /// `kiid`.
+    #[test]
+    fn an_ambiguous_live_flip_is_refused_naming_each_kiid() {
+        let result = flip_outcome_result(copperpour_ipc::IpcFlipOutcome::AmbiguousTarget {
+            target: "REF**".to_string(),
+            candidates: vec!["a-kiid".to_string(), "b-kiid".to_string()],
+            reason: "Footprint reference 'REF**' matches 2 placed footprints".to_string(),
+        });
+        assert!(result.is_error);
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(body["error"]["target"], "REF**", "{body}");
+        assert_eq!(
+            body["error"]["candidates"],
+            json!(["a-kiid", "b-kiid"]),
+            "{body}"
+        );
+    }
+
     #[tokio::test]
     async fn flip_over_ipc_reports_unsupported_capability_on_as_unhandled() {
         use copperpour_ipc::gen::kiapi;
@@ -7401,6 +7674,157 @@ mod tests {
         );
     }
 
+    /// The board KiCad saved with two `REF**` mounting holes, and their
+    /// UUIDs, which KiCad's API reports as their KIIDs; the first is the one
+    /// in `board_only_shared_reference.ipc.bin`.
+    const SHARED_REFERENCE_BOARD: &str = include_str!(
+        "../../../copperpour-ipc/tests/fixtures/board_only_shared_reference.kicad_pcb"
+    );
+    pub(super) const SHARED_FIRST_UUID: &str = "5445eb98-9048-4c1b-8705-b478ce789fc4";
+    pub(super) const SHARED_SECOND_UUID: &str = "df6ca34f-ba1b-40d0-939c-98e09a9466bc";
+
+    /// With KiCad closed, a shared reference is refused as `ambiguous_target`
+    /// naming both UUIDs, a stale `kiid` as `stale_target`, and `kiid` flips
+    /// that one footprint alone (#880).
+    #[tokio::test]
+    async fn closed_board_flip_refuses_a_shared_reference_and_flips_one_by_kiid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("shared-reference.kicad_pcb");
+        std::fs::write(&board, SHARED_REFERENCE_BOARD).unwrap();
+        let flip = |kiid: Option<&str>| {
+            let mut args = json!({
+                "board": board.to_string_lossy(),
+                "reference": "REF**",
+                "layer": "B.Cu",
+            });
+            if let Some(kiid) = kiid {
+                args["kiid"] = json!(kiid);
+            }
+            args
+        };
+        let layer_of = |board: &str, uuid: &str| {
+            copperpour_sexp::parse_sexp(board)
+                .unwrap()
+                .find_all("footprint")
+                .into_iter()
+                .find(|footprint| footprint.find_str("uuid") == Some(uuid))
+                .and_then(|footprint| footprint.find_str("layer"))
+                .unwrap()
+                .to_string()
+        };
+
+        let ambiguous = handle_flip_component(&flip(None), &test_ctx())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&result_text(&ambiguous)).unwrap();
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(
+            body["error"]["candidates"],
+            json!([SHARED_FIRST_UUID, SHARED_SECOND_UUID]),
+            "{body}"
+        );
+        assert!(result_text(&ambiguous).contains("pass kiid"), "{body}");
+
+        let stale = handle_flip_component(&flip(Some("not-on-the-board")), &test_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&stale).as_deref(),
+            Some("stale_target"),
+            "{}",
+            result_text(&stale)
+        );
+        let mut renamed = flip(Some(SHARED_SECOND_UUID));
+        renamed["reference"] = json!("MH1");
+        let renamed = handle_flip_component(&renamed, &test_ctx()).await.unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&renamed).as_deref(),
+            Some("stale_target"),
+            "{}",
+            result_text(&renamed)
+        );
+        assert!(
+            result_text(&renamed).contains("REF**"),
+            "{}",
+            result_text(&renamed)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            SHARED_REFERENCE_BOARD
+        );
+
+        let pinned = handle_flip_component(&flip(Some(SHARED_SECOND_UUID)), &test_ctx())
+            .await
+            .unwrap();
+        assert!(!pinned.is_error, "{}", result_text(&pinned));
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(layer_of(&written, SHARED_SECOND_UUID), "B.Cu");
+        assert_eq!(layer_of(&written, SHARED_FIRST_UUID), "F.Cu");
+    }
+
+    /// KiCad reads a footprint's `tstamp` as its KIID, so `kiid` finds it in
+    /// an older file too. KiCad 10 writes `uuid`, so the board is varied
+    /// inline to the older form.
+    #[test]
+    fn closed_board_flip_reads_a_footprints_tstamp_as_its_kiid() {
+        let older = SHARED_REFERENCE_BOARD.replace(
+            &format!("(uuid \"{SHARED_SECOND_UUID}\")"),
+            &format!("(tstamp \"{SHARED_SECOND_UUID}\")"),
+        );
+        assert_ne!(older, SHARED_REFERENCE_BOARD);
+        let (flipped, changed) =
+            prepare_closed_board_footprint_side(&older, "REF**", Some(SHARED_SECOND_UUID), "B.Cu")
+                .unwrap();
+        assert!(changed);
+        let layers: Vec<_> = copperpour_sexp::parse_sexp(&flipped)
+            .unwrap()
+            .find_all("footprint")
+            .into_iter()
+            .map(|footprint| footprint.find_str("layer").unwrap().to_string())
+            .collect();
+        assert_eq!(layers, ["F.Cu", "B.Cu"]);
+    }
+
+    /// Two footprints with one UUID, which KiCad never writes, leave `kiid`
+    /// nothing to choose by: the board is refused as malformed. The board is
+    /// varied inline for it.
+    #[test]
+    fn closed_board_flip_refuses_a_kiid_two_footprints_carry() {
+        let twice = SHARED_REFERENCE_BOARD.replace(SHARED_SECOND_UUID, SHARED_FIRST_UUID);
+        assert!(matches!(
+            prepare_closed_board_footprint_side(&twice, "REF**", Some(SHARED_FIRST_UUID), "B.Cu"),
+            Err(ClosedBoardError::Unusable(reason)) if reason.contains("2 footprints")
+        ));
+    }
+
+    /// `kiid` must be a non-empty string, on flip and find alike.
+    #[tokio::test]
+    async fn flip_and_find_refuse_a_kiid_that_is_not_a_non_empty_string() {
+        for kiid in [json!(5), json!(" ")] {
+            let flip = handle_flip_component(
+                &json!({"board": "x.kicad_pcb", "reference": "U1", "layer": "B.Cu", "kiid": kiid}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            let find = handle_find_component(
+                &json!({"board": "x.kicad_pcb", "reference": "U1", "kiid": kiid}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            for result in [flip, find] {
+                assert_eq!(
+                    crate::mcp::error::extract_error_kind(&result).as_deref(),
+                    Some("invalid_argument"),
+                    "{kiid}: {}",
+                    result_text(&result)
+                );
+                assert!(result_text(&result).contains("kiid"), "{kiid}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn closed_board_flip_preserves_crlf_line_endings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7437,7 +7861,7 @@ mod tests {
         let board = tmp.path().join("stale-flip.kicad_pcb");
         let expected = flip_board(&[FLIP_FOOTPRINT], "\n");
         let (replacement, changed) =
-            prepare_closed_board_footprint_side(&expected, "U1", "B.Cu").unwrap();
+            prepare_closed_board_footprint_side(&expected, "U1", None, "B.Cu").unwrap();
         assert!(changed);
         let newer = expected.replace("(net 0 \"\")", "(net 0 \"\")\n  (net 1 \"GND\")");
         std::fs::write(&board, &newer).unwrap();
@@ -7637,7 +8061,8 @@ mod tests {
             "(net 0 \"\")",
             "(layers (0 \"F.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))\n  (net 0 \"\")",
         );
-        let error = prepare_closed_board_footprint_side(&irregular, "U1", "B.Cu").unwrap_err();
+        let error =
+            prepare_closed_board_footprint_side(&irregular, "U1", None, "B.Cu").unwrap_err();
         let result = error.into_result(Path::new("board.kicad_pcb")).unwrap();
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
@@ -7655,7 +8080,7 @@ mod tests {
              (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal))\n  (net 0 \"\")",
         );
         assert!(matches!(
-            prepare_closed_board_footprint_side(&repeated, "U1", "B.Cu"),
+            prepare_closed_board_footprint_side(&repeated, "U1", None, "B.Cu"),
             Err(ClosedBoardError::Unusable(reason)) if reason.contains("more than one")
         ));
     }
@@ -12961,6 +13386,103 @@ mod edit_component_tests {
             );
             assert!(text(&result).contains(field), "{args}: {}", text(&result));
         }
+    }
+
+    use super::tests::{SHARED_FIRST_UUID, SHARED_SECOND_UUID};
+
+    /// One of `board_only_shared_reference.kicad_pcb`'s two `REF**` footprints, as KiCad's IPC API sent
+    /// it, with only its KIID varied (see the capture's README).
+    fn ref_star(kiid: &str) -> kiapi::board::types::FootprintInstance {
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/board_only_shared_reference.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        footprint.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        footprint
+    }
+
+    async fn find(board: &Path, address: String, arguments: serde_json::Value) -> CallToolResult {
+        let mut args = json!({ "board": board.to_string_lossy(), "reference": "REF**" });
+        for (key, value) in arguments.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_find_component(&args, &context(address))
+            .await
+            .unwrap()
+    }
+
+    /// A reference two footprints share is refused as `ambiguous_target`
+    /// naming both KIIDs, sorted; `kiid` finds each, and a KIID no footprint
+    /// carries is `stale_target` (#880).
+    #[tokio::test]
+    async fn find_component_refuses_a_shared_reference_and_finds_each_by_kiid() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let footprints = vec![ref_star(SHARED_SECOND_UUID), ref_star(SHARED_FIRST_UUID)];
+        let (server, _) = spawn_many(&board, footprints, Kicad::Keeps);
+        let address = server.address().to_string();
+
+        let ambiguous = find(&board, address.clone(), json!({})).await;
+        assert!(ambiguous.is_error, "{}", text(&ambiguous));
+        let body: serde_json::Value = serde_json::from_str(&text(&ambiguous)).unwrap();
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(body["error"]["target"], "REF**", "{body}");
+        assert_eq!(
+            body["error"]["candidates"],
+            json!([SHARED_FIRST_UUID, SHARED_SECOND_UUID]),
+            "{body}"
+        );
+        assert!(text(&ambiguous).contains("pass kiid"), "{body}");
+
+        for kiid in [SHARED_FIRST_UUID, SHARED_SECOND_UUID] {
+            let found = find(&board, address.clone(), json!({ "kiid": kiid })).await;
+            assert!(!found.is_error, "{}", text(&found));
+            let body: serde_json::Value = serde_json::from_str(&text(&found)).unwrap();
+            assert_eq!(body["kiid"], kiid, "{body}");
+            assert_eq!(body["reference"], "REF**", "{body}");
+            assert_eq!(
+                body["footprint"], "MountingHole:MountingHole_2.7mm_M2.5_DIN965",
+                "{body}"
+            );
+        }
+
+        let stale = find(&board, address, json!({ "kiid": "not-on-the-board" })).await;
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&stale).as_deref(),
+            Some("stale_target"),
+            "{}",
+            text(&stale)
+        );
+    }
+
+    /// A reference one footprint carries is found without `kiid`, and the
+    /// answer now carries its KIID.
+    #[tokio::test]
+    async fn find_component_reports_the_kiid_of_a_unique_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let (server, _) = spawn_many(
+            &board,
+            vec![
+                c_0603_with("fp-1", "C1", false),
+                ref_star(SHARED_FIRST_UUID),
+            ],
+            Kicad::Keeps,
+        );
+        let result = handle_find_component(
+            &json!({ "board": board.to_string_lossy(), "reference": "C1" }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["reference"], "C1", "{body}");
+        assert_eq!(body["kiid"], "fp-1", "{body}");
     }
 }
 
