@@ -1109,8 +1109,7 @@ fn format_build_version(pkg_version: &str, dev_commit: Option<&str>) -> String {
 }
 
 /// A dev build is one whose commit `build.rs` read from `.git/HEAD`. Release
-/// builders pass `COPPERPOUR_BUILD_COMMIT` (local CI's release jobs,
-/// `macos.yml`), and a build without Git metadata (Nix) has no commit, so
+/// builders pass `COPPERPOUR_BUILD_COMMIT` (`release.yml`), and a build without Git metadata (Nix) has no commit, so
 /// both keep the bare `<version>`.
 fn dev_build_commit<'a>(source: Option<&str>, commit: Option<&'a str>) -> Option<&'a str> {
     if source == Some("git_head") {

@@ -1,28 +1,14 @@
 name: macOS
 
-# The macOS jobs of ci.yml and release.yml (#392). release.yml runs on local
-# CI, which can't run macOS: Apple's licence allows macOS virtual machines only
-# on Apple hardware. On PRs and main this runs only Check & Test
-# (macos-latest), beside ci.yml; it is not a required check, because macOS
-# runners are often busy. The build jobs run only for a release. It publishes nothing; the maintainer cutting a release downloads its
-# artifacts.
+# Check & Test on macos-latest (#392), kept out of ci.yml so it has its own
+# concurrency group and is not a required check: macOS runners are often busy.
+# The macOS release builds are in release.yml.
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
-  # Test and build a release candidate before tagging it
-  # (`gh workflow run macos.yml --ref main`), or rebuild a tag's artifacts
-  # (`--ref v1.2.3`). Any ref other than a v* tag is a dry run under a
-  # synthetic version.
   workflow_dispatch:
-    inputs:
-      version:
-        description: Package version for a ref that is not a v* tag
-        required: false
-        default: '0.0.0'
-        type: string
 
 # A new push to the same PR or ref supersedes the previous run.
 concurrency:
@@ -34,10 +20,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: copperpour
-  RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.version || '0.0.0' }}
-  RELEASE_ARTIFACT_LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}-smoke', inputs.version || '0.0.0') }}
-  COPPERPOUR_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
   check:
@@ -58,144 +40,3 @@ jobs:
         run: cargo test --workspace --locked --lib --tests
       - name: Doctests
         run: cargo test --workspace --locked --doc
-
-  build:
-    name: Build ${{ matrix.target }}
-    # Release only: a v* tag, or a maintainer's manual run.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-latest
-    timeout-minutes: 60
-    strategy:
-      matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # rust-toolchain.toml overrides the action-installed stable with the
-      # pinned toolchain, which only has the host target.
-      - name: Add matrix target to the pinned toolchain
-        run: rustup target add ${{ matrix.target }}
-
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
-        with:
-          tool: protoc@3.23.4
-          fallback: none
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p copperpour
-
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: ${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz
-
-  pcm-package:
-    name: KiCAD PCM plugin package (macos)
-    # Release only: a v* tag, or a maintainer's manual run.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # A universal binary, so one download serves Apple Silicon and Intel:
-      # PCM has a platform dimension but no architecture one.
-      - name: Add the universal targets
-        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
-
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
-        with:
-          tool: protoc@3.23.4
-          fallback: none
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: pcm-package-macos
-
-      - name: Build universal binaries
-        run: |
-          set -euo pipefail
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --locked -p copperpour --target "$target"
-          done
-          mkdir -p dist/universal
-          lipo -create -output dist/universal/copperpour \
-            target/aarch64-apple-darwin/release/copperpour \
-            target/x86_64-apple-darwin/release/copperpour
-          lipo -info dist/universal/copperpour
-          # The linker signs only the arm64 slice, so the merged binary had no
-          # designated requirement and macOS TCC re-prompted for Documents
-          # access on every launch. Sign both slices, then check them.
-          codesign --force --sign - --identifier copperpour dist/universal/copperpour
-          for arch in arm64 x86_64; do
-            codesign --verify --strict --arch "$arch" dist/universal/copperpour
-          done
-          # Without a signature codesign exits non-zero; keep its message so the
-          # log says why the check below fails.
-          requirement="$(codesign -d -r- dist/universal/copperpour 2>&1)" || true
-          echo "$requirement"
-          grep -q 'designated =>' <<<"$requirement"
-
-      - name: Assemble PCM package
-        run: |
-          version="${RELEASE_VERSION#v}"
-          ./packaging/build-pcm.sh --version "$version" \
-            --binary dist/universal/copperpour \
-            --platform macos --out dist
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Validate PCM package against KiCAD schema (release gate)
-        run: |
-          set -euo pipefail
-          python -m pip install jsonschema
-          version="${RELEASE_VERSION#v}"
-          python packaging/validate-pcm.py --zip "dist/copperpour-pcm-v$version-macos.zip"
-
-      # The binary's own version is checked only on a tag: a dispatched dry run's
-      # version need not be Cargo.toml's. No bash arrays here: macOS's bash 3.2
-      # fails on an empty one under set -u.
-      - name: Assemble and validate Claude Desktop (.mcpb) package
-        run: |
-          set -euo pipefail
-          version="${RELEASE_VERSION#v}"
-          python packaging/build-mcpb.py --version "$version" \
-            --binary dist/universal/copperpour --platform macos --out dist-mcpb
-          bundle="dist-mcpb/copperpour-v$version-macos-universal.mcpb"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            python packaging/validate-mcpb.py --bundle "$bundle" \
-              --expected-version "$version" --smoke-test --check-binary-version
-          else
-            python packaging/validate-mcpb.py --bundle "$bundle" \
-              --expected-version "$version" --smoke-test
-          fi
-
-      - name: Upload PCM artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: copperpour-pcm-macos
-          path: dist/copperpour-pcm-*.zip
-
-      - name: Upload Claude Desktop (.mcpb) artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: copperpour-mcpb-macos
-          path: dist-mcpb/copperpour-*.mcpb

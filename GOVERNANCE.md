@@ -46,12 +46,10 @@ which run Check & Test on `windows-latest` and `macos-latest`. All three run on
 each PR and each push to `main`; a new push to a PR cancels its older runs.
 The required checks are the GitHub Actions app's `ci.yml` checks.
 
-`release.yml` and `e2e-kicad.yml` are disabled on GitHub and run on a
-maintainer's machine instead, as the **Copperpour Local CI** app: the Linux and
-Windows release builds and the real-KiCad gate, which needs KiCad installed.
-`macos.yml` builds the macOS release artifacts on each `v*` tag, and when a
-maintainer starts it on a release candidate, because Apple's licence allows
-macOS virtual machines only on Apple hardware.
+`release.yml` builds every platform's release artifacts on GitHub Actions too,
+and `e2e-kicad.yml` installs KiCad on `windows-latest` and runs the real-KiCad
+gate: weekly, as part of `release.yml`, on demand, and on a PR when a
+maintainer applies the `run:e2e-kicad` label.
 
 - A contributor's first PR waits for a maintainer to approve its workflow runs
   (GitHub's setting for first-time contributors). Fork PRs run with a read-only
@@ -115,9 +113,11 @@ expansion is deferred.
   on — are a **patch**.
 - Release notes state behaviour changes **and** known limitations. A reader who
   sees "fixed" and stops checking has been failed by the notes.
-- Before creating the tag, run local CI's release job against the exact
-  candidate ref. It builds the Linux and Windows release binaries and PCM
-  packages and runs the real-KiCad gate, without publishing anything.
+- Before creating the tag, run `release.yml` on the exact candidate ref
+  (`gh workflow run release.yml --ref <candidate> -f version=X.Y.Z`). It
+  builds every release binary and package and runs the real-KiCad gate,
+  without publishing anything. The tag's own run creates a draft release,
+  which a maintainer publishes once the written notes replace GitHub's list.
 - The pre-release gate is CI, the real-KiCad E2E job, the live IPC tests,
   and an end-to-end benchmark run against the candidate. The benchmark has
   twice found what CI could not; it is a step, not a nicety.
