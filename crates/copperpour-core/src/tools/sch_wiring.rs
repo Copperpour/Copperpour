@@ -224,7 +224,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_power_symbol",
-            "Add a power symbol (VCC, GND, etc.) to the schematic. Name the pin it ties to \
+            "Add a power symbol (VCC, GND, etc.) to the schematic. For a custom global rail name, \
+             use add_schematic_component with lib_id: power:VCC and value: +24V_ISO, for example. \
+             The placed symbol's Value names the net. Name the pin it ties to \
              with reference + pin_number, or give x + y. A named pin gets a straight outward \
              stub (2.54 mm by default); a blocked stub refuses with plan_blocked without writing. \
              The symbol keeps its library direction where clear, or faces away from the pin's body. \
@@ -245,7 +247,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "verbose": { "type": "boolean", "description": "Return the full saved readback per part (fields, field placements, instance paths, units) instead of the compact entry. Default false." },
                     "schematic": { "type": "string" },
-                    "power_net": { "type": "string", "description": "Net name (e.g. 'VCC', 'GND')" },
+                    "power_net": { "type": "string", "description": "Name of a symbol in KiCad's power library (e.g. 'VCC', 'GND')" },
                     "reference": { "type": "string",
                         "description": "Component reference, e.g. 'U1'. Use with pin_number instead of x/y." },
                     "pin_number": { "type": "string", "description": "Pin number, e.g. '3'" },

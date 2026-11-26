@@ -213,9 +213,8 @@ connect_to_net(schematic, reference, pin_number, net)
 
 ### add_power_symbol
 
-Use for all power connections, in preference to labelling a pin with the rail name.
-The one exception is a rail that must stay separate per instance of a repeated
-sheet — see below.
+Use for rails named by a symbol in KiCad's power library. For a custom name,
+see [Custom global power rails](#custom-global-power-rails).
 
 ```
 add_power_symbol(schematic, power_net, reference, pin_number, rotation?)
@@ -245,6 +244,26 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
   `already_connected: true` with `existing_reference`, and nothing is written.
   This holds whether the existing symbol sits on the pin or is reached through
   a wire, and it covers stacked pins such as an MCU's VSS pins.
+
+### Custom global power rails
+
+Use `add_schematic_component` with a stock global power symbol and set its
+`value` to the rail name. The placed symbol's Value names the global net across
+all sheets and instances. For example, place `power:VCC` on the rail's pin or
+wire at the desired schematic coordinates:
+
+```json
+{
+  "schematic": "/path/to/design.kicad_sch",
+  "lib_id": "power:VCC",
+  "value": "+24V_ISO",
+  "x": 73.66,
+  "y": 100.33
+}
+```
+
+Run `annotate_schematic` to number the default `#PWR?` reference. Check the
+saved connection with `get_net_connections` for `+24V_ISO`.
 
 ### batch_add_power_symbol
 
@@ -415,7 +434,9 @@ production-ready claim.
 3. **Always verify after changes** — run validation tools after placing and wiring
 4. **Use the grid** — all placements on 1.27mm grid
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
-6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels; the exception is a rail that must stay separate per instance of a repeated sheet, which takes a local label because power symbols are global
+6. **Power rails** — use `add_power_symbol` for stock rail names and
+   `add_schematic_component` with a Value override for custom global rail names.
+   Use a local label for a rail that stays separate per instance of a repeated sheet.
 7. **Net labels for named signals** — keeps schematics readable
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
