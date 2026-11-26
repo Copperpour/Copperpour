@@ -169,6 +169,36 @@ async fn changing_native_simulation_membership() {
 const PATH: &str = "/b7704a08-6d46-4716-b137-fec3fc7158cf";
 
 #[tokio::test]
+async fn root_uuid_change_can_select_a_different_saved_variant() {
+    let was = native_sheet("variant-dnp");
+    let second = "51a1b7a4-05e0-4a28-ad40-188cb4a0bd76";
+    let start = format!("(path {PATH:?}\n\t\t\t\t\t(reference \"R1\")");
+    replace_once(
+        &was,
+        &start,
+        &format!("(path \"/{second}\" (reference \"R1\") (unit 1))\n{start}"),
+    );
+    let now = was.fork();
+    replace_once(
+        &now,
+        &format!("\n\t(uuid {:?})", &PATH[1..]),
+        &format!("\n\t(uuid {second:?})"),
+    );
+    let result = compare(&handler().await, &was, &now, &[]).await;
+    assert_verdict(&result, "blocked");
+    assert!(
+        result["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!(
+                "symbol {} (R1) changed the root UUID used to select saved instances",
+                symbol_uuid(&was, "R1"),
+            ))),
+        "{result}"
+    );
+}
+
+#[tokio::test]
 async fn competing_instance_records_keep_their_order_and_multiplicity() {
     let handler = handler().await;
     let was = native_sheet("variant-dnp");
@@ -267,6 +297,81 @@ async fn legacy_and_default_instance_export_inputs_are_guarded() {
 }
 
 #[tokio::test]
+async fn variant_overrides_cannot_be_normalized_against_a_superseded_default_value() {
+    let was = native_sheet("variant-dnp");
+    let start = "(instances\n\t\t\t(project \"sparse\"\n\t\t\t\t(path";
+    let body = fs::read_to_string(&was.path).unwrap();
+    let r1 = body.find("(property \"Reference\" \"R1\"").unwrap();
+    let at = r1 + body[r1..].find(start).unwrap();
+    let mut with_default = body;
+    with_default.insert_str(at, "(default_instance (value \"22k\"))\n\t\t");
+    fs::write(&was.path, with_default).unwrap();
+    let now = was.fork();
+    replace_once(
+        &now,
+        "(name \"Lite\")\n\t\t\t\t\t\t(dnp yes)",
+        "(name \"Lite\")\n\t\t\t\t\t\t(dnp yes) (field (name \"Value\") (value \"10k\"))",
+    );
+    assert_property_change(&was, &now, &handler().await, "its saved default instance").await;
+}
+
+#[tokio::test]
+async fn older_simulation_flag_and_legacy_flag_order_are_guarded() {
+    let handler = handler().await;
+    let was = native_sheet("variant-dnp");
+    let marker = "(reference \"R1\")";
+    let insert = |sheet: &Sheet, name: &str, value: &str, before: bool| {
+        let mut body = fs::read_to_string(&sheet.path).unwrap();
+        let at = body.find(marker).unwrap();
+        let offset = if before {
+            body[..at].rfind("(instances").unwrap()
+        } else {
+            at + body[at..].find("\n\t)\n").unwrap()
+        };
+        body.insert_str(offset, &format!("\n\t\t(property private {name:?} {value:?} (at 38.1 38.1 0) (effects (font (size 1 1))))\n\t\t"));
+        fs::write(&sheet.path, body).unwrap();
+    };
+    let now = was.fork();
+    insert(&now, "Spice_Netlist_Enabled", "N", true);
+    assert_property_change(
+        &was,
+        &now,
+        &handler,
+        "legacy simulation attribute Spice_Netlist_Enabled",
+    )
+    .await;
+
+    let now = was.fork();
+    insert(&now, "Sim.Enable", "0", false);
+    insert(&was, "Sim.Enable", "0", true);
+    assert_property_change(
+        &was,
+        &now,
+        &handler,
+        "legacy simulation attribute Sim.Enable",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_repeated_saved_instance_value_can_contain_an_exported_expression() {
+    let was = native_sheet("base");
+    replace_once(
+        &was,
+        "(reference \"R1\")",
+        "(reference \"R1\") (value \"10k\") (value \"Page ${#}\")",
+    );
+    let now = was.fork();
+    replace_once(&now, "(page \"1\")", "(page \"2\")");
+    let result = compare(&handler().await, &was, &now, &[]).await;
+    assert_verdict(&result, "blocked");
+    assert_eq!(result["reasons"], json!([format!(
+        "symbol {} (R1) cannot establish unchanged field \"value\": exported text uses a substitution",
+        symbol_uuid(&was, "R1"),
+    )]));
+}
+
+#[tokio::test]
 async fn duplicate_field_suffixes_cannot_hide_reordered_exports() {
     let handler = handler().await;
     let was = native_sheet("base");
@@ -286,6 +391,12 @@ async fn duplicate_field_suffixes_cannot_hide_reordered_exports() {
     fs::write(&was.path, body).unwrap();
     let now = was.fork();
     replace_once(&now, &ordered, &format!("{a}{suffix}{b}"));
+    assert_property_change(&was, &now, &handler, "ambiguous saved field records").await;
+
+    replace_once(&was, &a, &field("MPN", "~"));
+    replace_once(&was, "(version 20260306)", "(version 20250317)");
+    let now = was.fork();
+    replace_once(&now, "(version 20250317)", "(version 20260306)");
     assert_property_change(&was, &now, &handler, "ambiguous saved field records").await;
 }
 

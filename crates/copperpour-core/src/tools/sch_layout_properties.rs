@@ -271,6 +271,16 @@ pub(super) fn changes(
     reasons: &mut Vec<String>,
 ) {
     let is_sheet = before.head() == Some("sheet");
+    if old.tree.find_all("uuid") != new.tree.find_all("uuid")
+        && [before, after]
+            .into_iter()
+            .any(|item| item.find("instances").is_some())
+    {
+        reasons.push(format!(
+            "{subject} changed the root UUID used to select saved instances"
+        ));
+        return;
+    }
     if repeated_instance_paths(before) != repeated_instance_paths(after)
         || !instance_order(before).eq(instance_order(after))
             && instance_identity(before) == instance_identity(after)
@@ -286,24 +296,29 @@ pub(super) fn changes(
         reasons.push(format!("{subject} changed its saved instance paths"));
     }
     if (!repeated_fields(before).is_empty() || !repeated_fields(after).is_empty())
-        && !ordered_fields(before).eq(ordered_fields(after))
+        && (old.version != new.version || !ordered_fields(before).eq(ordered_fields(after)))
     {
         reasons.push(format!("{subject} changed ambiguous saved field records"));
         return;
     }
-    if (before.find("default_instance").is_some() || after.find("default_instance").is_some())
-        && !default_inputs(before).eq(default_inputs(after))
+    // KiCad can take legacy defaults instead of the placed property.
+    // Do not normalize variant overrides against the placed value in that case.
+    if [before, after]
+        .into_iter()
+        .any(has_legacy_instance_defaults)
+        && (old.version != new.version || !default_inputs(before).eq(default_inputs(after)))
     {
         reasons.push(format!("{subject} changed its saved default instance"));
     }
-    if !legacy_sim_inputs(before).eq(legacy_sim_inputs(after))
-        && [before, after].iter().any(|item| {
-            ordered_fields(item).any(|(name, _, _)| name.eq_ignore_ascii_case("Sim.Enable"))
-        })
+    if let Some(name) = [before, after]
+        .into_iter()
+        .find_map(|item| ordered_fields(item).find_map(|(name, _, _)| legacy_sim_property(name)))
     {
-        reasons.push(format!(
-            "{subject} changed legacy simulation attribute Sim.Enable"
-        ));
+        if old.version != new.version || !legacy_sim_inputs(before).eq(legacy_sim_inputs(after)) {
+            reasons.push(format!(
+                "{subject} changed legacy simulation attribute {name}"
+            ));
+        }
     }
     // Conflicting repeated flags must not disappear behind the normalized view.
     if FLAGS.into_iter().any(|(name, _)| {
@@ -374,12 +389,18 @@ enum DefaultInput<'a> {
     Field(&'a str, &'a str, bool),
 }
 
+fn has_legacy_instance_defaults(item: &SexpNode) -> bool {
+    item.find("default_instance").is_some()
+        || instance_records(item)
+            .any(|(_, path)| path.find("value").is_some() || path.find("footprint").is_some())
+}
+
 fn default_inputs(item: &SexpNode) -> impl Iterator<Item = DefaultInput<'_>> {
     item.children()
         .unwrap_or_default()
         .iter()
         .filter_map(|node| match node.head() {
-            Some("default_instance") => Some(DefaultInput::Record(node)),
+            Some("default_instance" | "instances") => Some(DefaultInput::Record(node)),
             Some("property") => {
                 let (name, value, private) = property(node)?;
                 Some(DefaultInput::Field(name, value, private))
@@ -388,16 +409,25 @@ fn default_inputs(item: &SexpNode) -> impl Iterator<Item = DefaultInput<'_>> {
         })
 }
 
-fn legacy_sim_inputs(item: &SexpNode) -> impl Iterator<Item = (&str, &str)> {
+fn legacy_sim_property(name: &str) -> Option<&'static str> {
+    ["Sim.Enable", "Spice_Netlist_Enabled"]
+        .into_iter()
+        .find(|legacy| name.eq_ignore_ascii_case(legacy))
+}
+
+fn legacy_sim_inputs(item: &SexpNode) -> impl Iterator<Item = DefaultInput<'_>> {
     item.children()
         .unwrap_or_default()
         .iter()
         .filter_map(|node| match node.head()? {
-            name @ "exclude_from_sim" => Some((name, node.get(1)?.as_str()?)),
+            "exclude_from_sim" | "instances" => Some(DefaultInput::Record(node)),
             "property" => {
-                let (name, value, _) = property(node)?;
-                name.eq_ignore_ascii_case("Sim.Enable")
-                    .then_some(("Sim.Enable", value))
+                let (name, value, private) = property(node)?;
+                Some(DefaultInput::Field(
+                    legacy_sim_property(name)?,
+                    value,
+                    private,
+                ))
             }
             _ => None,
         })
@@ -468,17 +498,14 @@ fn expression_field(item: &SexpNode, version: u32) -> Option<&str> {
         .chain(instance_records(item).flat_map(|(_, record)| {
             ["reference", "value", "footprint"]
                 .into_iter()
-                .filter_map(|name| record.find_str(name).map(|value| (name, value)))
+                .flat_map(|name| record_values(record, name).map(move |value| (name, value)))
         }))
         .chain(
             item.find_all("default_instance")
                 .into_iter()
                 .flat_map(|record| {
                     ["value", "footprint"].into_iter().flat_map(|name| {
-                        record
-                            .find_all(name)
-                            .into_iter()
-                            .filter_map(move |node| Some((name, node.get(1)?.as_str()?)))
+                        record_values(record, name).map(move |value| (name, value))
                     })
                 }),
         )
@@ -486,12 +513,20 @@ fn expression_field(item: &SexpNode, version: u32) -> Option<&str> {
             instance_records(item)
                 .flat_map(|(_, path)| path.find_all("variant"))
                 .flat_map(|variant| {
-                    variant.find_all("field").into_iter().filter_map(|field| {
-                        Some((field.find_str("name")?, field.find_str("value")?))
+                    variant.find_all("field").into_iter().flat_map(|field| {
+                        let name = field.find_str("name").unwrap_or("variant field");
+                        record_values(field, "value").map(move |value| (name, value))
                     })
                 }),
         )
         .find_map(|(name, value)| has_expression(value).then_some(name))
+}
+
+fn record_values<'a>(record: &'a SexpNode, name: &str) -> impl Iterator<Item = &'a str> {
+    record
+        .find_all(name)
+        .into_iter()
+        .filter_map(|node| node.get(1)?.as_str())
 }
 
 fn class_field(item: &SexpNode) -> bool {
@@ -538,9 +573,7 @@ pub(super) fn uncertain_changes((old, new): (&Source<'_>, &Source<'_>), reasons:
     // above; otherwise any saved edit could have changed its expansion.
     for source in [old, new] {
         for item in placements(source.tree) {
-            let Some(uuid) = item.find_str("uuid") else {
-                continue;
-            };
+            let uuid = item.find_str("uuid").unwrap_or("?");
             if let Some(field) = expression_field(item, source.version) {
                 reasons.push(format!(
                     "{} cannot establish unchanged field {field:?}: exported text uses a substitution",
