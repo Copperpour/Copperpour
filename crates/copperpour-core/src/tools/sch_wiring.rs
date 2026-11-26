@@ -150,7 +150,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_net_label",
-            "Delete a net label by net name and position.",
+            "Delete a net label by `net` name and `x`/`y` position.",
             json!({
                 "type": "object",
                 "properties": {

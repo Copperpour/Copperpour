@@ -121,7 +121,7 @@ and Windows servers do not.
 | `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). With `schematic_scope: "hierarchy"` on the project's root it annotates every sheet instance at once, in eeschema's page order, finding duplicates across sheets, in one transaction. Copperpour's own implementation; kicad-cli has no annotate command. |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm` and each placement's `mirror_x`/`mirror_y`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same fields. |
-| `add_component_annotation` | Add or update a custom property across every placed unit of a component. A key named `DNP` is refused: set the native attribute with `edit_schematic_component`'s `dnp`. |
+| `add_component_annotation` | Add or update a custom property supplied as `key` and `value` across every placed unit of a component. A key named `DNP` is refused: set the native attribute with `edit_schematic_component`'s `dnp`. |
 | `group_components` | Add or update a group property across every placed unit of multiple components. |
 | `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library", and embed one the sheet lacks (reported in `added`). Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
@@ -140,7 +140,7 @@ and Windows servers do not.
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
 | `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
-| `delete_schematic_net_label` | Delete a net label by net name and position. |
+| `delete_schematic_net_label` | Delete a net label by `net` name and `x`/`y` position. |
 | `rotate_schematic_label` | Rotate a net label, by uuid or position, to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
 | `batch_rotate_labels` | Rotate multiple labels, each by uuid or position, in a single file read/write cycle. |
@@ -442,7 +442,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 
 | Tool | Description |
 |------|-------------|
-| `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description, in the KiCad 10 format KiCad writes, with courtyard, silk and fab outlines around the pads and the body. |
+| `create_footprint` | Create a new footprint (`.kicad_mod`) file at `output` using footprint `name` and a `pads` layout, in the KiCad 10 format KiCad writes, with courtyard, silk and fab outlines around the pads and the body. |
 | `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect/custom shape transitions, a roundrect pad's corner ratio, a custom pad's anchor and primitives (`custom_shape`, replacing the whole list), independent dimensions, the pad's layers (written as KiCad writes them), the pad's zone connection override, its fabrication property (castellated, heatsink, testpoint, …), and its own solder mask and paste margins, each reported with its previous and current value. |
 | `set_footprint_graphics` | Atomically append, replace, or delete `line`, `arc`, `rect`, `circle` and `poly` primitives on one footprint layer; `rect`, `circle` and `poly` require `fill`. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, supported attributes, Value text, or its own solder mask and paste margins while preserving unrelated source. Empty tags or attributes remove their block. Reports each changed field's previous and current value, and warns when attributes drop the footprint type or an attribute it does not accept. |
