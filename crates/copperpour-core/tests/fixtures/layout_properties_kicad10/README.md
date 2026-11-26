@@ -41,6 +41,8 @@ independent KiCad export result.
 | `edit_with_a_possible_component_class_dependency_blocks` | Served-only coarse refusal. No claim that moving Reference text changes a literal class. |
 | `changed_saved_input_to_exported_expression_blocks` | Served-only coarse refusal for changed saved page input. |
 | `field_move_with_a_substituted_variant_override_is_not_proven_layout` | Served-only coarse refusal. No claim that the move changes the expansion. |
+| `competing_instance_records_keep_their_order_and_multiplicity` and `repeated_child_instances_do_not_hide_an_order_change` | Served-only instance ambiguity cases from the split review. The guard does not guess which record KiCad uses. |
+| `legacy_and_default_instance_export_inputs_are_guarded` and `duplicate_field_suffixes_cannot_hide_reordered_exports` | Served-only cases from the split review. No native result is claimed for these exact edits. |
 
 XML comparison ignores the source path and export timestamp. The standard and
 fitted BOMs match byte-for-byte. KiCad wrote a project-local settings sidecar in

@@ -168,6 +168,127 @@ async fn changing_native_simulation_membership() {
 
 const PATH: &str = "/b7704a08-6d46-4716-b137-fec3fc7158cf";
 
+#[tokio::test]
+async fn competing_instance_records_keep_their_order_and_multiplicity() {
+    let handler = handler().await;
+    let was = native_sheet("variant-dnp");
+    let old_path = format!("(path {PATH:?}\n\t\t\t\t\t(reference \"R1\")");
+    let stale = r#"(path "/51a1b7a4-05e0-4a28-ad40-188cb4a0bd76" (reference "R1") (unit 1))"#;
+    let other = r#"(path "/63c64c07-7a85-4f6f-9775-b085c7fbd912""#;
+    let selected = format!("{other}\n\t\t\t\t\t(reference \"R1\")");
+    replace_once(&was, &old_path, &format!("{stale}\n{selected}"));
+    let now = was.fork();
+    replace_once(&now, &format!("{stale}\n{selected}"), &selected);
+    replace_once(
+        &now,
+        "(dnp yes)\n\t\t\t\t\t)\n\t\t\t\t)",
+        &format!("(dnp yes)\n\t\t\t\t\t)\n\t\t\t\t)\n{stale}",),
+    );
+    assert_property_change(
+        &was,
+        &now,
+        &handler,
+        "ambiguous saved instance-path records",
+    )
+    .await;
+
+    let was = native_sheet("base");
+    let now = was.fork();
+    replace_once(&now, &old_path, &format!("{old_path} (reference \"R9\")"));
+    assert_property_change(
+        &was,
+        &now,
+        &handler,
+        "ambiguous saved instance-path records",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repeated_child_instances_do_not_hide_an_order_change() {
+    let was = Sheet::input(PARENT);
+    let mut saved = fs::read_to_string(&was.path).unwrap();
+    let anchor = saved.find("(page \"2\")").unwrap();
+    let start = saved[..anchor].rfind("(instances").unwrap();
+    let end = anchor + saved[anchor..].find("\n\t)").unwrap();
+    let block = saved[start..end].to_owned();
+    saved.replace_range(start..end, &format!("{block}\n\t\t(instances)"));
+    fs::write(&was.path, saved).unwrap();
+    let now = was.fork();
+    replace_once(
+        &now,
+        &format!("{block}\n\t\t(instances)"),
+        &format!("(instances)\n\t\t{block}"),
+    );
+    let result = compare(&handler().await, &was, &now, &[]).await;
+    assert_verdict(&result, "blocked");
+    assert_eq!(
+        result["reasons"],
+        json!([format!(
+            "{SOUTH} changed ambiguous saved instance-path records"
+        )])
+    );
+}
+
+#[tokio::test]
+async fn legacy_and_default_instance_export_inputs_are_guarded() {
+    let handler = handler().await;
+    let was = native_sheet("base");
+    let now = was.fork();
+    let marker = "(reference \"R1\")";
+    let insert = |sheet: &Sheet, text: &str| {
+        let mut body = fs::read_to_string(&sheet.path).unwrap();
+        let at = body.find(marker).unwrap();
+        let before_instances = body[..at].rfind("(instances").unwrap();
+        body.insert_str(before_instances, text);
+        fs::write(&sheet.path, body).unwrap();
+    };
+    insert(&now, "(default_instance (value \"22k\"))\n\t\t");
+    assert_property_change(&was, &now, &handler, "its saved default instance").await;
+    let now = was.fork();
+    insert(&now, "(property private \"Sim.Enable\" \"0\" (at 38.1 38.1 0) (effects (font (size 1 1))))\n\t\t");
+    assert_property_change(
+        &was,
+        &now,
+        &handler,
+        "legacy simulation attribute Sim.Enable",
+    )
+    .await;
+
+    insert(&was, "(default_instance (value \"Page ${#}\"))\n\t\t");
+    let now = was.fork();
+    replace_once(&now, "(page \"1\")", "(page \"2\")");
+    let result = compare(&handler, &was, &now, &[]).await;
+    assert_verdict(&result, "blocked");
+    assert_eq!(result["reasons"], json!([format!(
+        "symbol {} (R1) cannot establish unchanged field \"value\": exported text uses a substitution",
+        symbol_uuid(&was, "R1"),
+    )]));
+}
+
+#[tokio::test]
+async fn duplicate_field_suffixes_cannot_hide_reordered_exports() {
+    let handler = handler().await;
+    let was = native_sheet("base");
+    let mut body = fs::read_to_string(&was.path).unwrap();
+    let r1 = body.find("(property \"Reference\" \"R1\"").unwrap();
+    let at = r1 + body[r1..].find("\n\t\t(pin ").unwrap();
+    let field = |name, value| {
+        format!(
+            "\n\t\t(property \"{name}\" \"{value}\" (at 38.1 38.1 0) (effects (font (size 1 1))))"
+        )
+    };
+    let a = field("MPN", "A");
+    let b = field("MPN", "B");
+    let suffix = field("MPN_1", "C");
+    let ordered = format!("{a}{b}{suffix}");
+    body.insert_str(at, &ordered);
+    fs::write(&was.path, body).unwrap();
+    let now = was.fork();
+    replace_once(&now, &ordered, &format!("{a}{suffix}{b}"));
+    assert_property_change(&was, &now, &handler, "ambiguous saved field records").await;
+}
+
 async fn assert_variant_change(fixture: &str, expected: &str) {
     let was = native_sheet("base");
     let now = native_sheet(fixture);

@@ -101,6 +101,23 @@ fn repeated_fields(item: &SexpNode) -> RepeatedFields<'_> {
     by_name
 }
 
+fn ordered_fields(item: &SexpNode) -> impl Iterator<Item = (&str, &str, bool)> {
+    item.find_all("property").into_iter().filter_map(property)
+}
+
+fn ambiguous_instance_records(item: &SexpNode) -> bool {
+    item.find_all("instances").len() > 1
+        || instance_records(item).any(|(_, path)| {
+            ["reference", "unit", "value", "footprint"]
+                .into_iter()
+                .any(|tag| path.find_all(tag).len() > 1)
+        })
+}
+
+fn instance_order(item: &SexpNode) -> impl Iterator<Item = (&str, &str)> {
+    instance_records(item).map(|(key, _)| key)
+}
+
 fn fields(item: &SexpNode, version: u32) -> Fields<'_> {
     let is_sheet = item.head() == Some("sheet");
     let mandatory: &[&str] = if is_sheet {
@@ -254,7 +271,12 @@ pub(super) fn changes(
     reasons: &mut Vec<String>,
 ) {
     let is_sheet = before.head() == Some("sheet");
-    if repeated_instance_paths(before) != repeated_instance_paths(after) {
+    if repeated_instance_paths(before) != repeated_instance_paths(after)
+        || !instance_order(before).eq(instance_order(after))
+            && instance_identity(before) == instance_identity(after)
+        || before.find_all("instances") != after.find_all("instances")
+            && (ambiguous_instance_records(before) || ambiguous_instance_records(after))
+    {
         reasons.push(format!(
             "{subject} changed ambiguous saved instance-path records"
         ));
@@ -263,9 +285,25 @@ pub(super) fn changes(
     if is_sheet && instance_identity(before) != instance_identity(after) {
         reasons.push(format!("{subject} changed its saved instance paths"));
     }
-    if repeated_fields(before) != repeated_fields(after) {
+    if (!repeated_fields(before).is_empty() || !repeated_fields(after).is_empty())
+        && !ordered_fields(before).eq(ordered_fields(after))
+    {
         reasons.push(format!("{subject} changed ambiguous saved field records"));
         return;
+    }
+    if (before.find("default_instance").is_some() || after.find("default_instance").is_some())
+        && !default_inputs(before).eq(default_inputs(after))
+    {
+        reasons.push(format!("{subject} changed its saved default instance"));
+    }
+    if !legacy_sim_inputs(before).eq(legacy_sim_inputs(after))
+        && [before, after].iter().any(|item| {
+            ordered_fields(item).any(|(name, _, _)| name.eq_ignore_ascii_case("Sim.Enable"))
+        })
+    {
+        reasons.push(format!(
+            "{subject} changed legacy simulation attribute Sim.Enable"
+        ));
     }
     // Conflicting repeated flags must not disappear behind the normalized view.
     if FLAGS.into_iter().any(|(name, _)| {
@@ -330,6 +368,41 @@ pub(super) fn changes(
     }
 }
 
+#[derive(PartialEq)]
+enum DefaultInput<'a> {
+    Record(&'a SexpNode),
+    Field(&'a str, &'a str, bool),
+}
+
+fn default_inputs(item: &SexpNode) -> impl Iterator<Item = DefaultInput<'_>> {
+    item.children()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|node| match node.head() {
+            Some("default_instance") => Some(DefaultInput::Record(node)),
+            Some("property") => {
+                let (name, value, private) = property(node)?;
+                Some(DefaultInput::Field(name, value, private))
+            }
+            _ => None,
+        })
+}
+
+fn legacy_sim_inputs(item: &SexpNode) -> impl Iterator<Item = (&str, &str)> {
+    item.children()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|node| match node.head()? {
+            name @ "exclude_from_sim" => Some((name, node.get(1)?.as_str()?)),
+            "property" => {
+                let (name, value, _) = property(node)?;
+                name.eq_ignore_ascii_case("Sim.Enable")
+                    .then_some(("Sim.Enable", value))
+            }
+            _ => None,
+        })
+}
+
 fn sheets(tree: &SexpNode) -> Option<BTreeMap<&str, &SexpNode>> {
     let mut sheets = BTreeMap::new();
     for sheet in tree.find_all("sheet") {
@@ -389,11 +462,26 @@ fn expression_field(item: &SexpNode, version: u32) -> Option<&str> {
     let has_expression = |value: &str| value.contains("${");
     fields(item, version)
         .into_iter()
-        .chain(repeated_fields(item).into_values().flatten().filter_map(
-            |(name, value, private)| {
-                (!private || item.head() == Some("sheet")).then_some((name, value))
-            },
-        ))
+        .chain(ordered_fields(item).filter_map(|(name, value, private)| {
+            (!private || item.head() == Some("sheet")).then_some((name, value))
+        }))
+        .chain(instance_records(item).flat_map(|(_, record)| {
+            ["reference", "value", "footprint"]
+                .into_iter()
+                .filter_map(|name| record.find_str(name).map(|value| (name, value)))
+        }))
+        .chain(
+            item.find_all("default_instance")
+                .into_iter()
+                .flat_map(|record| {
+                    ["value", "footprint"].into_iter().flat_map(|name| {
+                        record
+                            .find_all(name)
+                            .into_iter()
+                            .filter_map(move |node| Some((name, node.get(1)?.as_str()?)))
+                    })
+                }),
+        )
         .chain(
             instance_records(item)
                 .flat_map(|(_, path)| path.find_all("variant"))
