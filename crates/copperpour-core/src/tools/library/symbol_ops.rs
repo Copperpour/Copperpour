@@ -6,7 +6,9 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tools::footprint_metadata::quote_string;
 use crate::tools::{get_path, require_str, ToolContext};
 use copperpour_schematic_editor::types::fmt_f64;
+pub(crate) use copperpour_sexp::geometry::is_on_schematic_pin_grid as is_on_symbol_grid;
 use copperpour_sexp::geometry::round6;
+pub(super) use copperpour_sexp::geometry::SCHEMATIC_PIN_GRID_MM as SYMBOL_GRID;
 #[cfg(test)]
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
 use copperpour_sexp::writer::{
@@ -519,20 +521,6 @@ pub(super) const PIN_NAME_GAP: f64 = 2.54;
 /// Gap KiCad leaves between the body outline and the start of a pin name,
 /// emitted as `(pin_names (offset …))`.
 pub(super) const PIN_NAME_OFFSET: f64 = 1.016;
-/// Schematic grid. Body edges land on it so pins pushed out to meet them do too.
-pub(super) const SYMBOL_GRID: f64 = 1.27;
-
-/// Whether `coord_mm` lies on KiCad's 1.27 mm (50 mil) schematic grid, within
-/// [`POSITION_EPSILON`] (1e-6 mm, absorbing float noise while catching even a
-/// single 0.0001 mm KiCad schematic internal unit of drift).
-pub(crate) fn is_on_symbol_grid(coord_mm: f64) -> bool {
-    if !coord_mm.is_finite() {
-        return false;
-    }
-    let snapped = (coord_mm / SYMBOL_GRID).round() * SYMBOL_GRID;
-    (coord_mm - snapped).abs() <= POSITION_EPSILON
-}
-
 /// Warning when a single pin's written connection point `(x, y)` is off KiCad's
 /// 1.27 mm schematic grid, or `None` when both axes align to the grid.
 pub(crate) fn off_grid_pin_coordinate_warning(pin_number: &str, x: f64, y: f64) -> Option<String> {

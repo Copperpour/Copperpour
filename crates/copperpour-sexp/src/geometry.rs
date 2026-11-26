@@ -27,6 +27,18 @@
 
 use std::f64::consts::PI;
 
+/// KiCad's nominal 50 mil schematic pin grid.
+pub const SCHEMATIC_PIN_GRID_MM: f64 = 1.27;
+
+/// Compare with the nominal pin grid, allowing 1e-6 mm of floating-point noise.
+pub fn is_on_schematic_pin_grid(coord_mm: f64) -> bool {
+    if !coord_mm.is_finite() {
+        return false;
+    }
+    let snapped = (coord_mm / SCHEMATIC_PIN_GRID_MM).round() * SCHEMATIC_PIN_GRID_MM;
+    (coord_mm - snapped).abs() <= 1e-6
+}
+
 /// Parameters for a pin coordinate transform.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PinTransform {
