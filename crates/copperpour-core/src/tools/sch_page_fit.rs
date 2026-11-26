@@ -14,7 +14,7 @@ use copperpour_sexp::{
     },
     text_bounds::{
         check_text_extent, free_note_bounds, label_placement, pin_text_bounds, saved_field_bounds,
-        symbol_field_extent, unwrapped_text_box_bounds, LabelPlacement, TextExtent,
+        symbol_field_extent, unwrapped_text_box_bounds, LabelPlacement, PinNameChoice, TextExtent,
     },
     transform_pin,
     writer::read_consistent,
@@ -568,10 +568,10 @@ fn measure_symbol(
                 style,
                 plot.pen,
                 plot.text_offset_ratio,
-                move |number| !alternates.contains(number),
+                move |number| (!alternates.contains(number)).then_some(PinNameChoice::Base),
                 plot.overbar_ratio == 1.23,
             ) {
-                let result = text.and_then(|b| measured.include_box(b, title));
+                let result = text.and_then(|text| measured.include_box(text.run, title));
                 measured.record(result);
             }
         } else {

@@ -324,7 +324,8 @@ async fn the_coverage_fixture_retains_its_legacy_answers() {
     assert_box(&layout["bounding_box"], [100.584, 85.09, 102.616, 92.71]);
     assert_eq!(
         sheet.setup("check_schematic_overlaps", json!({})).await,
-        json!({"overlap_count": 0, "overlaps": [], "bounds_resolved": 1, "bounds_unresolved": []})
+        json!({"overlap_count": 0, "overlaps": [], "bounds_resolved": 1, "bounds_unresolved": [],
+               "pin_text_unresolved": []})
     );
 
     // Add positive witnesses for the legacy text and shape readers. Neither

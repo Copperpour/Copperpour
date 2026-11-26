@@ -166,11 +166,12 @@ async fn single_saved_score_and_gateway_report_the_same_read_only_result() {
     let expected = json!({
         "component_overlap": 0, "label_overlap": 0, "wire_overlap": 0,
         "dangling_wire_end": 0, "floating_label": 0, "unconnected_pin": 0,
-        "text_overlap_text": 2, "text_overlap_body": 1, "wire_field_overlap": 0, "pin_contact": 7,
+        "text_overlap_text": 2, "text_overlap_body": 1, "wire_field_overlap": 0,
+        "wire_pin_text_overlap": 0, "pin_contact": 7,
         "short_pin_wire": 0, "diagonal_wires": 0, "collinear_overlaps": 0,
         "wire_bends": 5, "split_runs": 0, "redundant_power_symbols": 0,
         "wire_length_mm": 130.81, "wire_segments": 9, "power_symbols": 10,
-        "bounds_unresolved": []
+        "bounds_unresolved": [], "pin_text_unresolved": []
     });
     assert_eq!(result["score"], expected);
     assert_eq!(result["not_compared"], json!([]));

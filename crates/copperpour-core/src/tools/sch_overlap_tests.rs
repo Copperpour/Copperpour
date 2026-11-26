@@ -951,7 +951,20 @@ mod wire_overlap_tests {
             ],
             "{body}"
         );
-        assert_eq!(body["overlap_count"], found.len() + fields.len(), "{body}");
+        // The wire from pin 1's tip also crosses the pin's drawn name (#842);
+        // `wire_pin_text_tests.rs` checks that finding.
+        let pin_texts = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "wire_pin_text_overlap")
+            .count();
+        assert_eq!(pin_texts, 1, "{body}");
+        assert_eq!(
+            body["overlap_count"],
+            found.len() + fields.len() + pin_texts,
+            "{body}"
+        );
 
         let through = body["overlaps"]
             .as_array()

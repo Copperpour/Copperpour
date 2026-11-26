@@ -33,10 +33,12 @@ fn overlap_tool_def() -> ToolDef {
              conflicting labels at the same location, colliding label and field text \
              (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), \
              wires crossing label text or visible power symbol Value text (`wire_label_overlap`), \
-             and wires crossing visible Reference or Value text on ordinary symbols \
-             (`wire_field_overlap`). \
+             wires crossing visible Reference or Value text on ordinary symbols \
+             (`wire_field_overlap`), and wires crossing a drawn pin name or number \
+             (`wire_pin_text_overlap`). \
              Reports any symbol whose embedded \
-             geometry could not be resolved and used the origin fallback instead.",
+             geometry could not be resolved and used the origin fallback instead, and in \
+             `pin_text_unresolved` any symbol whose pin text could not be measured.",
         json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -55,7 +57,8 @@ pub(super) fn compare_tool_def() -> ToolDef {
     tool!(
         "compare_schematic_layout",
         "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
-         Counts wires crossing visible Reference or Value text on ordinary symbols. \
+         Counts wires crossing visible Reference or Value text on ordinary symbols \
+         and wires crossing drawn pin names or numbers. \
          Check pin connectivity and symbol identity before ranking layout changes. \
          No writes, editor access, or ERC.",
         json!({ "type": "object",
@@ -76,6 +79,10 @@ pub(super) fn compare_tool_def() -> ToolDef {
 #[cfg(test)]
 #[path = "sch_overlap_tests.rs"]
 mod overlap_tests;
+
+#[cfg(test)]
+#[path = "wire_pin_text_tests.rs"]
+mod wire_pin_text_tests;
 
 #[cfg(test)]
 async fn request(

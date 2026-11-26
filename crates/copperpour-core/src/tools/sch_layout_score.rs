@@ -1,6 +1,8 @@
 //! Compare two snapshots of one saved sheet, independent of the editor.
 
-use super::sch_analysis::{orphan_findings, overlap_findings, ORPHAN_TOLERANCE, OVERLAP_TOLERANCE};
+use super::sch_analysis::{
+    orphan_findings, overlap_findings, pin_text_findings, ORPHAN_TOLERANCE, OVERLAP_TOLERANCE,
+};
 use super::sch_block_move::{snapshot_net_changes, NetComparison};
 use super::sch_connectivity::{drawn_net_graph_for, ConnectivityIndex, COINCIDENT_TOLERANCE};
 use super::sch_pin_contacts::default_contact_counts;
@@ -33,6 +35,7 @@ const TIERS: [&[&str]; 4] = [
         "text_overlap_text",
         "text_overlap_body",
         "wire_field_overlap",
+        "wire_pin_text_overlap",
         "pin_contact",
         "short_pin_wire",
     ],
@@ -65,6 +68,7 @@ fn term_json(key: &str, number: Option<i64>) -> Value {
 pub(super) struct Score {
     terms: Terms,
     bounds_unresolved: Vec<String>,
+    pin_text_unresolved: Vec<Value>,
     wire_segments: usize,
     power_symbols: Option<usize>,
 }
@@ -73,6 +77,7 @@ impl Score {
     fn json(&self) -> Value {
         let mut result = json!({
             "bounds_unresolved": self.bounds_unresolved,
+            "pin_text_unresolved": self.pin_text_unresolved,
             "wire_segments": self.wire_segments,
             "power_symbols": self.power_symbols,
         });
@@ -99,7 +104,9 @@ fn measure_with_stub_exclusions(tree: &SexpNode, required_stubs: &BTreeSet<Strin
     let labels = extract_all_net_labels(tree);
     let index = ConnectivityIndex::build(tree, &wires, &buses, &labels, ORPHAN_TOLERANCE);
     let pins = resolved_placed_pins_by_reference(tree);
-    let (overlaps, _, bounds_unresolved) = overlap_findings(tree, &wires, OVERLAP_TOLERANCE);
+    let (mut overlaps, _, bounds_unresolved) = overlap_findings(tree, &wires, OVERLAP_TOLERANCE);
+    let pin_text = pin_text_findings(tree, &wires);
+    overlaps.extend(pin_text.findings);
 
     let mut score: Terms = terms().map(|key| (key, Some(0))).collect();
     let contact_counts = default_contact_counts(tree, &wires);
@@ -115,6 +122,11 @@ fn measure_with_stub_exclusions(tree: &SexpNode, required_stubs: &BTreeSet<Strin
         for key in ["component_overlap", "wire_overlap", "text_overlap_body"] {
             score.insert(key, None);
         }
+    }
+    // Pin text that could not be measured leaves only its own term unknown:
+    // the body terms rest on the symbol drawings, which it does not change.
+    if !pin_text.unresolved.is_empty() {
+        score.insert("wire_pin_text_overlap", None);
     }
     if pins.is_none() {
         for key in [
@@ -190,6 +202,7 @@ fn measure_with_stub_exclusions(tree: &SexpNode, required_stubs: &BTreeSet<Strin
     Score {
         terms: score,
         bounds_unresolved,
+        pin_text_unresolved: pin_text.unresolved,
         wire_segments: wires.len(),
         power_symbols,
     }
