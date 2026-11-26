@@ -2,6 +2,7 @@ use crate::mcp::handler::McpHandler;
 use crate::tools::project_file_writer_tests::{served_call, text_of};
 use crate::tools::ServerConfig;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const TOOL: &str = "check_placement";
@@ -359,16 +360,37 @@ async fn kicads_own_off_grid_pin_is_reported() {
     let sheet = Sheet::new("hv_converter.kicad_sch", OFF_GRID_DEMO).await;
     let report = sheet.ok(TOOL).await;
     let pins = report["off_grid_pins"].as_array().unwrap();
-    // C4 is rotated. D2 uses the sheet-local lib_name, not its base lib_id.
-    for (reference, x, y) in [("C4", 149.352, 84.328), ("D2", 131.572, 96.52)] {
+    // KiCad 10.0.8 ERC (endpoint_off_grid, default 50 mil grid) flags
+    // these 30 symbols; D5 is the only symbol it does not flag.
+    let references: BTreeSet<_> = pins
+        .iter()
+        .map(|pin| pin["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        references,
+        BTreeSet::from([
+            "#PWR1", "#PWR2", "#PWR3", "#PWR4", "#PWR5", "#PWR6", "C1", "C2", "C3", "C4", "C5",
+            "C6", "C7", "C8", "C9", "C10", "D1", "D2", "D3", "D4", "D6", "D7", "D8", "D9", "L1",
+            "Q1", "R1", "RESR1", "V1", "V2",
+        ])
+    );
+    // C2.1 is off-grid only in Y; D2.2 only in X, from its sheet-local
+    // lib_name. C4.2 is a rotated pin off-grid on both axes.
+    for (reference, number, x, y) in [
+        ("C2", "1", 116.84, 84.328),
+        ("D2", "2", 131.572, 96.52),
+        ("C4", "2", 149.352, 84.328),
+    ] {
         assert!(
             pins.iter().any(|p| p["reference"] == reference
-                && p["pin_number"] == "2"
+                && p["pin_number"] == number
                 && p["x"] == x
                 && p["y"] == y),
-            "{reference}.2 missing: {report}"
+            "{reference}.{number} missing: {report}"
         );
     }
+    assert_eq!(report["off_grid_pin_count"], 55, "{report}");
+    assert_eq!(pins.len(), 55);
 }
 
 /// One source for overlaps: the placement check returns exactly what
