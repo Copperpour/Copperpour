@@ -136,8 +136,8 @@ struct SymbolField {
     value: String,
 }
 
-/// The sheet a symbol is placed on and its library symbol's footprint
-/// filters, which KiCad's Update PCB sets on the footprint together. Rule
+/// The sheet a symbol is placed on, its library symbol's footprint filters
+/// and its units' pins, which KiCad's Update PCB sets on the footprint. Rule
 /// areas generated from sheets, and Repeat Layout with them, find a sheet's
 /// footprints by `sheet_name` (#237).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -145,6 +145,17 @@ struct SymbolSheet {
     sheet_name: String,
     sheet_file: String,
     footprint_filters: String,
+    /// Which pins belong to each unit, in the netlist's order, as KiCad's
+    /// Update PCB compares and sets them (`updateComponentUnits`). KiCad's API
+    /// carries them from 10.0.8 (#682).
+    symbol_units: Vec<SymbolUnit>,
+}
+
+/// One unit of a symbol and the numbers of its pins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct SymbolUnit {
+    name: String,
+    pin_numbers: Vec<String>,
 }
 
 impl SymbolSheet {
@@ -153,13 +164,29 @@ impl SymbolSheet {
             sheet_name: footprint.symbol_sheet_name.clone(),
             sheet_file: footprint.symbol_sheet_filename.clone(),
             footprint_filters: footprint.symbol_footprint_filters.clone(),
+            symbol_units: footprint
+                .symbol_units
+                .iter()
+                .map(|unit| SymbolUnit {
+                    name: unit.name.clone(),
+                    pin_numbers: unit.pin_numbers.clone(),
+                })
+                .collect(),
         }
     }
 
     fn listed(&self) -> String {
+        let units = self
+            .symbol_units
+            .iter()
+            .map(|unit| format!("{:?} {:?}", unit.name, unit.pin_numbers))
+            .collect::<Vec<_>>();
         format!(
-            "sheet name {:?}, sheet file {:?}, footprint filters {:?}",
-            self.sheet_name, self.sheet_file, self.footprint_filters
+            "sheet name {:?}, sheet file {:?}, footprint filters {:?}, symbol units [{}]",
+            self.sheet_name,
+            self.sheet_file,
+            self.footprint_filters,
+            units.join(", ")
         )
     }
 }
@@ -328,7 +355,8 @@ enum PlannedChange {
         /// The sheet the footprint takes, whether or not it differs (#237).
         #[serde(flatten)]
         sheet: SymbolSheet,
-        /// The footprint differs from its symbol in its sheet alone (#237).
+        /// The footprint differs from its symbol in its sheet or its units
+        /// alone (#237, #682).
         #[serde(skip)]
         sheet_only: bool,
         /// The schematic names another footprint: the placed one is rebuilt
@@ -710,9 +738,33 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
+            let mut asked_version = None;
+            // KiCad before 10.0.8 neither serves a footprint's units over its
+            // API nor takes them, so the plan leaves them as the board has
+            // them and notes each footprint it adds or updates (#682).
+            let units_not_carried = if design
+                .components
+                .iter()
+                .any(|component| !component.sheet.symbol_units.is_empty())
+            {
+                let kicad = kicad_version(client, &mut asked_version)?;
+                (!carries_symbol_units(&kicad)).then_some(kicad)
+            } else {
+                None
+            };
+            let planned = match units_not_carried {
+                None => Cow::Borrowed(&design),
+                Some(_) => {
+                    let mut without = design.clone();
+                    for component in &mut without.components {
+                        component.sheet.symbol_units.clear();
+                    }
+                    Cow::Owned(without)
+                }
+            };
             let mut plan = plan_sync_acknowledging(
                 &netlist_source,
-                &design,
+                &planned,
                 &snapshot.state,
                 &acknowledged,
                 delete_without_symbols,
@@ -740,7 +792,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 matches!(change, PlannedChange::Update { replace_footprint: Some(_), .. })
             });
             let (replacements, copper_layers) = if replacing {
-                let kicad = client.get_kicad_version()?;
+                let kicad = kicad_version(client, &mut asked_version)?;
                 let (replacements, refused) =
                     prepare_replacements(&library_board, &plan, &snapshot.state, &kicad);
                 preflight.extend(refused);
@@ -821,7 +873,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             });
             let has_net_ties = prepared.values().any(|part| !part.net_ties.is_empty());
             let carried = if needs_10_0_7 || has_net_ties {
-                let kicad = client.get_kicad_version()?;
+                let kicad = kicad_version(client, &mut asked_version)?;
                 let carried = CarriedByKiCad {
                     fields_10_0_7: needs_10_0_7 && carries_kicad_10_0_7_fields(&kicad),
                     net_ties: carries_net_ties(&kicad),
@@ -849,6 +901,10 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             } else {
                 CarriedByKiCad::default()
             };
+            if let Some(kicad) = &units_not_carried {
+                plan.diagnostics
+                    .extend(symbol_units_not_carried(&plan, &design, kicad));
+            }
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -2279,11 +2335,11 @@ fn symbol_fields(component_node: &SexpNode) -> Vec<SymbolField> {
     fields
 }
 
-/// The sheet name, sheet file and footprint filters KiCad's Update PCB gives a
-/// `(comp …)`'s footprint: the sheet path's `names`, or the `Sheetname`
-/// property when they are empty, the `Sheetfile` property and the
-/// `ki_fp_filters` property. A property named twice keeps its last value, as
-/// KiCad's reader does.
+/// The sheet name, sheet file, footprint filters and units KiCad's Update PCB
+/// gives a `(comp …)`'s footprint: the sheet path's `names`, or the
+/// `Sheetname` property when they are empty, the `Sheetfile` property, the
+/// `ki_fp_filters` property and the `(units …)` node. A property named twice
+/// keeps its last value, as KiCad's reader does.
 fn symbol_sheet(component_node: &SexpNode) -> SymbolSheet {
     let property = |name: &str| {
         component_node
@@ -2303,7 +2359,30 @@ fn symbol_sheet(component_node: &SexpNode) -> SymbolSheet {
         sheet_name: names.map_or_else(|| property("Sheetname"), str::to_owned),
         sheet_file: property("Sheetfile"),
         footprint_filters: property("ki_fp_filters"),
+        symbol_units: symbol_units(component_node),
     }
+}
+
+/// Each `(unit (name …) (pins (pin (num …)) …))` of a `(comp …)`'s
+/// `(units …)`, in order; a component without the node has no units.
+fn symbol_units(component_node: &SexpNode) -> Vec<SymbolUnit> {
+    let Some(units) = component_node.find("units") else {
+        return Vec::new();
+    };
+    units
+        .find_all("unit")
+        .into_iter()
+        .map(|unit| SymbolUnit {
+            name: unit.find_str("name").unwrap_or_default().to_string(),
+            pin_numbers: unit
+                .find_all("pins")
+                .into_iter()
+                .flat_map(|pins| pins.find_all("pin"))
+                .filter_map(|pin| pin.find_str("num"))
+                .map(str::to_string)
+                .collect(),
+        })
+        .collect()
 }
 
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
@@ -3744,15 +3823,25 @@ pub(super) fn apply_library_fields(
     Ok(())
 }
 
-/// Give a footprint its symbol's sheet name, sheet file and footprint filters,
-/// as KiCad's Update PCB does (#237).
+/// Give a footprint its symbol's sheet name, sheet file, footprint filters and
+/// units, as KiCad's Update PCB does (#237, #682).
 fn apply_symbol_sheet(
     footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
     sheet: &SymbolSheet,
 ) {
+    use copperpour_ipc::gen::kiapi::board::types::FootprintUnitInfo;
+
     footprint.symbol_sheet_name = sheet.sheet_name.clone();
     footprint.symbol_sheet_filename = sheet.sheet_file.clone();
     footprint.symbol_footprint_filters = sheet.footprint_filters.clone();
+    footprint.symbol_units = sheet
+        .symbol_units
+        .iter()
+        .map(|unit| FootprintUnitInfo {
+            name: unit.name.clone(),
+            pin_numbers: unit.pin_numbers.clone(),
+        })
+        .collect();
 }
 
 /// Copy the schematic's fields onto a footprint as KiCad's Update PCB does by
@@ -4013,6 +4102,64 @@ fn net_ties_not_carried(
                 footprint_id,
                 references,
             ))
+        })
+        .collect()
+}
+
+/// KiCad's version, asked at most once per call.
+fn kicad_version(
+    client: &copperpour_ipc::KiCadIpcClient,
+    asked: &mut Option<copperpour_ipc::IpcKiCadVersion>,
+) -> Result<copperpour_ipc::IpcKiCadVersion> {
+    if let Some(kicad) = asked {
+        return Ok(kicad.clone());
+    }
+    let kicad = client.get_kicad_version()?;
+    *asked = Some(kicad.clone());
+    Ok(kicad)
+}
+
+/// KiCad's API serves and takes a footprint's units from 10.0.8
+/// (`FootprintInstance.symbol_units`, `FOOTPRINT::Deserialize`).
+fn carries_symbol_units(kicad: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (kicad.major, kicad.minor, kicad.patch) >= (10, 0, 8)
+}
+
+/// Each footprint the plan adds or updates whose symbol has units, on a KiCad
+/// before 10.0.8: it is synced as before, without them, and an update can drop
+/// the ones it has, as any whole-footprint IPC edit can there (#682).
+fn symbol_units_not_carried(
+    plan: &SyncPlan,
+    design: &ExportedDesign,
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> Vec<SyncDiagnostic> {
+    let with_units = design
+        .components
+        .iter()
+        .filter(|component| !component.sheet.symbol_units.is_empty())
+        .map(|component| component.reference.as_str())
+        .collect::<HashSet<_>>();
+    plan.changes
+        .iter()
+        .filter_map(|change| {
+            let (reference, done) = match change {
+                PlannedChange::Add { reference, .. } => (reference, "added"),
+                PlannedChange::Update { reference, .. } => (reference, "updated"),
+                PlannedChange::Delete { .. } => return None,
+            };
+            with_units.contains(reference.as_str()).then(|| {
+                conflict(
+                    "symbol_units_not_carried",
+                    format!(
+                        "{reference} is {done} without its symbol-unit mapping, which requires \
+                         KiCad 10.0.8 or newer (connected KiCad is {}); whole-footprint IPC \
+                         edits before it can also drop the one a footprint has. KiCad's Update \
+                         PCB from Schematic sets it. See https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit",
+                        kicad.full_version
+                    ),
+                    Some(reference),
+                )
+            })
         })
         .collect()
 }
@@ -4522,9 +4669,10 @@ fn updates_not_carried(
                         "footprint_sheet_not_updated",
                         format!(
                             "{reference} differs from the schematic only in its sheet name, \
-                             sheet file or footprint filters, and owns {}, which KiCad drops \
-                             when its API updates a footprint; it is left out of this sync, \
-                             and KiCad's Update PCB from Schematic sets its sheet in place",
+                             sheet file, footprint filters or symbol-unit mapping, and owns {}, \
+                             which KiCad drops when its API updates a footprint; it is left out \
+                             of this sync, and KiCad's Update PCB from Schematic sets them in \
+                             place",
                             found.described()
                         ),
                         footprint_id(kiid),
@@ -5756,6 +5904,67 @@ mod tests {
 
         assert_eq!(design.components[0].sheet.footprint_filters, "CP_*");
         assert_eq!(design.components[1].sheet.footprint_filters, "C_*");
+    }
+
+    /// Real `kicad-cli sch export netlist` output: an LM358 placed as its
+    /// three units, and a resistor. Provenance in
+    /// `tests/fixtures/pcb_sync_symbol_units_kicad10.README.md`.
+    const SYMBOL_UNITS: &str =
+        include_str!("../../tests/fixtures/pcb_sync_symbol_units_kicad10.net");
+
+    fn unit(name: &str, pin_numbers: &[&str]) -> SymbolUnit {
+        SymbolUnit {
+            name: name.to_string(),
+            pin_numbers: pin_numbers.iter().map(|pin| pin.to_string()).collect(),
+        }
+    }
+
+    /// #682: each component carries its units, with their pins, in the order
+    /// KiCad writes them and its Update PCB compares them.
+    #[test]
+    fn each_component_carries_its_units_as_update_pcb_reads_them() {
+        let design = parse_exported_netlist(SYMBOL_UNITS).unwrap();
+
+        let units = design
+            .components
+            .iter()
+            .map(|component| {
+                (
+                    component.reference.as_str(),
+                    component.sheet.symbol_units.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            units,
+            vec![
+                ("R1", vec![unit("A", &["1", "2"])]),
+                (
+                    "U1",
+                    vec![
+                        unit("A", &["3", "2", "1"]),
+                        unit("B", &["5", "6", "7"]),
+                        unit("C", &["8", "4"]),
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// KiCad 10 writes a `units` node for every component, so R1's is removed
+    /// to reach the case KiCad's reader also covers: a component without the
+    /// node has no units.
+    #[test]
+    fn a_component_without_units_has_none() {
+        let without = ONE_RESISTOR.replace(
+            "(units (unit (name \"A\") (pins (pin (num \"1\")) (pin (num \"2\")))))",
+            "",
+        );
+        assert_ne!(without, ONE_RESISTOR);
+
+        let design = parse_exported_netlist(&without).unwrap();
+
+        assert_eq!(design.components[0].sheet.symbol_units, Vec::new());
     }
 
     /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
@@ -9175,6 +9384,19 @@ mod tests {
                         "kiapi.common.commands.EndCommitResponse",
                     ));
                 }
+                if command.type_url.ends_with("GetVersion") {
+                    return Some(copperpour_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetVersionResponse {
+                            version: Some(kiapi::common::types::KiCadVersion {
+                                major: 10,
+                                minor: 0,
+                                patch: 8,
+                                full_version: "10.0.8".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.GetVersionResponse",
+                    ));
+                }
                 None
             },
         );
@@ -9888,6 +10110,9 @@ mod tests {
         /// What was sent without its sheet name, sheet file and footprint
         /// filters: the board the sync built before #237.
         WithoutSheet,
+        /// What was sent without its symbol units, as KiCad before 10.0.8
+        /// reads it (#682).
+        WithoutSymbolUnits,
     }
 
     impl ServedSync {
@@ -10643,6 +10868,18 @@ mod tests {
                 footprint.symbol_sheet_name.clear();
                 footprint.symbol_sheet_filename.clear();
                 footprint.symbol_footprint_filters.clear();
+                copperpour_ipc::builders::pack_any(
+                    &footprint,
+                    "kiapi.board.types.FootprintInstance",
+                )
+            }
+            Readback::WithoutSymbolUnits => {
+                let mut footprint =
+                    copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .expect("a footprint");
+                footprint.symbol_units.clear();
                 copperpour_ipc::builders::pack_any(
                     &footprint,
                     "kiapi.board.types.FootprintInstance",
@@ -11939,11 +12176,36 @@ mod tests {
         assert!(
             messages[1].contains(
                 "C2: sent sheet name \"/CH1/\", sheet file \"channel.kicad_sch\", \
-                 footprint filters \"C_*\", board now has sheet name \"\", sheet file \"\", \
-                 footprint filters \"\""
+                 footprint filters \"C_*\", symbol units [\"A\" [\"1\", \"2\"]], board now has \
+                 sheet name \"\", sheet file \"\", footprint filters \"\", symbol units \
+                 [\"A\" [\"1\", \"2\"]]"
             ),
             "{}",
             messages[1]
+        );
+    }
+
+    /// A board that did not keep a footprint's units is reported for that
+    /// footprint, as one that did not keep its sheet is (#682).
+    #[tokio::test]
+    async fn the_readback_names_units_the_board_did_not_keep() {
+        let served = ServedSync::reading_back(Readback::WithoutSymbolUnits).await;
+        let applied = served
+            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let diagnostics = applied["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{applied:#}");
+        assert_eq!(diagnostics[0]["code"], "board_readback_differs");
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("symbol units [\"A\" [\"1\", \"2\"]], board now has")
+                && message.ends_with(
+                    "symbol units []. No pad was invented, so this is reported rather than \
+                     refused; check the footprint before relying on it."
+                ),
+            "{message}"
         );
     }
 
@@ -13363,8 +13625,8 @@ mod tests {
     }
 
     /// A footprint an earlier sync placed is linked to its symbol but has no
-    /// sheet name, sheet file or filters. Its sheet alone differs from the
-    /// schematic's, and that is an update, as in KiCad's Update PCB: the
+    /// sheet name, sheet file, filters or units. Its sheet alone differs from
+    /// the schematic's, and that is an update, as in KiCad's Update PCB: the
     /// footprint keeps its place and takes the sheet, and the next dry run has
     /// nothing to do.
     #[tokio::test]
@@ -13408,6 +13670,7 @@ mod tests {
             SymbolSheet::of(&held),
             SymbolSheet {
                 sheet_name: "/Power/".to_string(),
+                symbol_units: vec![unit("A", &["1", "2"])],
                 ..SymbolSheet::default()
             }
         );
@@ -13710,7 +13973,7 @@ mod tests {
 
         for response in [&plan, &applied] {
             let diagnostics = response["diagnostics"].as_array().unwrap();
-            assert_eq!(diagnostics.len(), 1, "{response:#}");
+            assert_eq!(diagnostics.len(), 2, "{response:#}");
             assert_eq!(diagnostics[0]["code"], "not_carried");
             assert_eq!(diagnostics[0]["footprint_id"], THERMAL_DFN);
             assert_eq!(diagnostics[0]["references"], serde_json::json!(["U1"]));
@@ -13718,6 +13981,8 @@ mod tests {
             for part in ["pad 15: heatsink (8 pads)", "10.0.7", "10.0.6", "U1"] {
                 assert!(message.contains(part), "{part} missing from: {message}");
             }
+            // Nor can it take the symbol units (#682).
+            assert_eq!(diagnostics[1]["code"], "symbol_units_not_carried");
         }
         assert_eq!(applied["status"], "applied", "{applied:#}");
         // Sent as before: KiCad 10.0.6 has no field to read.
@@ -13803,14 +14068,20 @@ mod tests {
     }
 
     /// A sync whose footprints have no pad property never asks KiCad its
-    /// version, so it sends what it sent before #149.
+    /// version, so it sends what it sent before #149. Nor does one whose
+    /// netlist has no units (#682); KiCad 10 writes them for every component,
+    /// so they are removed here.
     #[tokio::test]
     async fn a_footprint_without_pad_properties_never_asks_the_kicad_version() {
         let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+        let without_units = netlist.replace(
+            "\n      (units (unit (name \"A\") (pins (pin (num \"1\"))(pin (num \"2\")))))",
+            "",
+        );
+        assert_ne!(without_units, netlist);
 
-        let applied = served
-            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
-            .await;
+        let applied = served.apply(&without_units).await;
 
         assert_eq!(applied["status"], "applied", "{applied:#}");
         assert_eq!(served.sent("GetVersion"), 0);
@@ -14063,17 +14334,29 @@ mod tests {
     }
 
     /// KiCad holding the captured R1 at `value` under `kiid`, a KIID of
-    /// [`FOOTPRINT_CHILDREN`], with the sheet name KiCad's Update PCB gives it
-    /// (#237).
+    /// [`FOOTPRINT_CHILDREN`], with the sheet name and units KiCad's Update
+    /// PCB gives it (#237, #682).
     async fn served_r1(kiid: &str, value: &str) -> ServedSync {
-        served_children(vec![captured_resistor(
+        served_children(vec![with_r1_units(captured_resistor(
             kiid,
             "R1",
             "symbol-uuid",
             value,
             "/Power/",
-        )])
+        ))])
         .await
+    }
+
+    /// `item`, a footprint, with the units [`ONE_RESISTOR`]'s R1 has (#682).
+    fn with_r1_units(item: prost_types::Any) -> prost_types::Any {
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, FootprintUnitInfo};
+
+        let mut footprint = FootprintInstance::decode(item.value.as_slice()).unwrap();
+        footprint.symbol_units = vec![FootprintUnitInfo {
+            name: "A".to_string(),
+            pin_numbers: vec!["1".to_string(), "2".to_string()],
+        }];
+        copperpour_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
     }
 
     /// The schematic's R1, at 10k, on the captured footprint and its nets.
@@ -14297,8 +14580,9 @@ mod tests {
         let message = diagnostics[0]["message"].as_str().unwrap();
         assert!(
             message.starts_with(
-                "R1 differs from the schematic only in its sheet name, sheet file or \
-                 footprint filters, and owns 1 group, 1 point and variant 'NoTimer'"
+                "R1 differs from the schematic only in its sheet name, sheet file, \
+                 footprint filters or symbol-unit mapping, and owns 1 group, 1 point and \
+                 variant 'NoTimer'"
             ),
             "{message}"
         );
@@ -14345,6 +14629,204 @@ mod tests {
             );
         }
         assert_eq!(served.sent("BeginCommit"), 0);
+    }
+
+    /// #682: a footprint an earlier sync placed has its sheet but not its
+    /// symbol's units, or has them in another order. Either alone is an
+    /// update, as KiCad's Update PCB makes it (`updateComponentUnits`
+    /// compares them in order): the footprint keeps its place and takes the
+    /// units, and the next dry run has nothing to do.
+    #[tokio::test]
+    async fn a_footprint_without_its_units_is_updated_to_them() {
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, FootprintUnitInfo};
+
+        let reordered = vec![FootprintUnitInfo {
+            name: "A".to_string(),
+            pin_numbers: vec!["2".to_string(), "1".to_string()],
+        }];
+        for held_units in [Vec::new(), reordered] {
+            let mut footprint = FootprintInstance::decode(
+                captured_resistor(OWNS_NONE, "R1", "symbol-uuid", "10k", "/Power/")
+                    .value
+                    .as_slice(),
+            )
+            .unwrap();
+            footprint.symbol_units = held_units;
+            let served = served_children(vec![copperpour_ipc::builders::pack_any(
+                &footprint,
+                "kiapi.board.types.FootprintInstance",
+            )])
+            .await;
+            let netlist = r1_at_10k();
+
+            let plan = served.dry_run(&netlist).await;
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            assert_eq!(plan["coverage"]["footprints_updated"]["planned"], 1);
+            assert_eq!(plan["coverage"]["pads_reassigned"]["planned"], 0);
+            assert_eq!(plan["changes"][0]["kind"], "update", "{plan:#}");
+            assert_eq!(
+                plan["changes"][0]["symbol_units"],
+                serde_json::json!([{ "name": "A", "pin_numbers": ["1", "2"] }]),
+                "{plan:#}"
+            );
+
+            let applied = served.apply(&netlist).await;
+            assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+            let held =
+                FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+            assert_eq!(
+                SymbolSheet::of(&held).symbol_units,
+                vec![unit("A", &["1", "2"])]
+            );
+            assert_eq!(held.position, footprint.position);
+            assert_eq!(served.dry_run(&netlist).await["status"], "noop");
+        }
+    }
+
+    /// A footprint that owns a group, a point and a variant and lacks only
+    /// its units is left out, as one that lacks only its sheet is (#237).
+    #[tokio::test]
+    async fn a_footprint_that_owns_them_and_lacks_only_its_units_is_left_out() {
+        let served = served_children(vec![captured_resistor(
+            OWNS_ALL_THREE,
+            "R1",
+            "symbol-uuid",
+            "10k",
+            "/Power/",
+        )])
+        .await;
+
+        let plan = served.dry_run(&r1_at_10k()).await;
+
+        assert_eq!(plan["status"], "noop", "{plan:#}");
+        assert_eq!(
+            plan["diagnostics"][0]["code"],
+            "footprint_sheet_not_updated"
+        );
+        assert_eq!(plan["diagnostics"][0]["reference"], "R1");
+    }
+
+    /// Each added footprint carries its symbol's units, and the plan lists
+    /// them with the addition (#682).
+    #[tokio::test]
+    async fn an_added_footprint_carries_its_symbol_units() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(
+            plan["changes"][0]["symbol_units"],
+            serde_json::json!([{ "name": "A", "pin_numbers": ["1", "2"] }]),
+            "{plan:#}"
+        );
+        let applied = served.apply(&netlist).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        assert_eq!(
+            SymbolSheet::of(&served.sent_footprints()[0]).symbol_units,
+            vec![unit("A", &["1", "2"])]
+        );
+    }
+
+    /// KiCad before 10.0.8 neither serves a footprint's units nor takes them
+    /// (#682). The sync is as before: a footprint that lacks only its units
+    /// plans nothing, and a footprint added or updated is sent without them,
+    /// each with a note that refuses nothing.
+    #[tokio::test]
+    async fn symbol_units_an_older_kicad_cannot_take_are_noted() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+
+        let unchanged = served_children(vec![captured_resistor(
+            OWNS_NONE,
+            "R1",
+            "symbol-uuid",
+            "10k",
+            "/Power/",
+        )])
+        .await;
+        unchanged.report_kicad_version(10, 0, 7);
+        let plan = unchanged.dry_run(&r1_at_10k()).await;
+        assert_eq!(plan["status"], "noop", "{plan:#}");
+        assert_eq!(plan["diagnostics"], serde_json::json!([]), "{plan:#}");
+
+        let updated = served_children(vec![captured_resistor(
+            OWNS_NONE,
+            "R1",
+            "symbol-uuid",
+            "1k",
+            "/Power/",
+        )])
+        .await;
+        updated.report_kicad_version(10, 0, 7);
+        let added = ServedSync::reading_back(Readback::AsSent).await;
+        added.report_kicad_version(10, 0, 7);
+        for (served, netlist, done) in [
+            (&updated, r1_at_10k(), "updated"),
+            (
+                &added,
+                exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]),
+                "added",
+            ),
+        ] {
+            let plan = served.dry_run(&netlist).await;
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            assert_eq!(plan["changes"][0]["symbol_units"], serde_json::json!([]));
+            let applied = served.apply(&netlist).await;
+            assert_eq!(applied["status"], "applied", "{applied:#}");
+            for body in [&plan, &applied] {
+                let diagnostics = body["diagnostics"].as_array().unwrap();
+                assert_eq!(diagnostics.len(), 1, "{body:#}");
+                assert_eq!(diagnostics[0]["code"], "symbol_units_not_carried");
+                assert_eq!(diagnostics[0]["reference"], "R1");
+                let message = diagnostics[0]["message"].as_str().unwrap();
+                for part in [
+                    &format!("R1 is {done} without its symbol-unit mapping"),
+                    "10.0.8",
+                    "10.0.7",
+                    "TROUBLESHOOTING.md#footprint-unit-metadata-disappears",
+                ] {
+                    assert!(message.contains(part), "{part} missing from: {message}");
+                }
+            }
+        }
+        let held =
+            FootprintInstance::decode(updated.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        assert!(held.symbol_units.is_empty());
+        assert!(added.sent_footprints()[0].symbol_units.is_empty());
+    }
+
+    /// A plan made on one side of KiCad 10.0.8 is stale on the other: the
+    /// apply would send units the dry run didn't describe, or leave out ones
+    /// it did.
+    #[tokio::test]
+    async fn a_plan_is_stale_across_the_kicad_version_that_carries_symbol_units() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+        for (planned_on, applied_on) in [(7, 8), (8, 7)] {
+            served.report_kicad_version(10, 0, planned_on);
+            let plan = served.dry_run(&netlist).await;
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            served.report_kicad_version(10, 0, applied_on);
+            let (_, applied) = served
+                .sync(
+                    &netlist,
+                    serde_json::json!({
+                        "dry_run": false,
+                        "expected_plan_revision": plan["plan_revision"],
+                    }),
+                )
+                .await;
+            assert_eq!(applied["status"], "conflict", "{applied:#}");
+            let codes = applied["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(codes.contains(&"stale_plan_revision"), "{applied:#}");
+        }
+        assert!(served.sent_footprints().is_empty());
     }
 
     /// The dry run planned R1's sheet; it owns a group, a point and a variant
@@ -14863,12 +15345,14 @@ mod tests {
         let older_applied = older.apply(&dip_only).await;
         assert_eq!(older_applied["status"], "applied", "{older_applied:#}");
         let older_diags = older_applied["diagnostics"].as_array().unwrap();
-        assert_eq!(older_diags.len(), 1, "{older_applied:#}");
+        assert_eq!(older_diags.len(), 2, "{older_applied:#}");
         assert_eq!(older_diags[0]["code"], "not_carried");
         assert!(older_diags[0]["message"]
             .as_str()
             .unwrap()
             .contains("reference point"));
+        // Nor can it take the symbol units (#682).
+        assert_eq!(older_diags[1]["code"], "symbol_units_not_carried");
     }
 
     // ─── #85: net-tie pad groups ────────────────────────────────────────────
@@ -15026,7 +15510,7 @@ mod tests {
         let applied = older.apply(&netlist).await;
         assert_eq!(applied["status"], "applied", "{applied:#}");
         let diagnostics = applied["diagnostics"].as_array().unwrap();
-        assert_eq!(diagnostics.len(), 1, "{applied:#}");
+        assert_eq!(diagnostics.len(), 2, "{applied:#}");
         assert_eq!(diagnostics[0]["code"], "not_carried");
         assert_eq!(diagnostics[0]["footprint_id"], NET_TIE_3_THT);
         assert!(
@@ -15036,6 +15520,8 @@ mod tests {
                 .contains("require KiCad 10.0.1 or newer (connected KiCad is 10.0.0)"),
             "{applied:#}"
         );
+        // Nor can it take the symbol units (#682).
+        assert_eq!(diagnostics[1]["code"], "symbol_units_not_carried");
         assert!(older.sent_footprints()[0]
             .definition
             .as_ref()
