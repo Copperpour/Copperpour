@@ -10,7 +10,7 @@ use crate::tool;
 use crate::tools::sch_connectivity::COINCIDENT_TOLERANCE as TOLERANCE;
 use crate::tools::{
     get_path, opt_f64, opt_str, require_array, require_f64, require_str, NamedPin, PlacedPins,
-    ToolContext, ToolDef,
+    StubDirection, ToolContext, ToolDef,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_schematic_editor::types::fmt_f64;
@@ -370,6 +370,8 @@ pub fn tools() -> Vec<ToolDef> {
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
              Name the pin with reference + pin_number, or give its coordinates directly. \
+             Returns the stub_length used, text_overlaps added by the wire and label, \
+             and bounds_unresolved for symbols whose bounds could not be checked. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
              A rail shared by every instance needs add_power_symbol or a global_label, \
              which are one net across all sheets and instances.",
@@ -388,15 +390,16 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Direction to route the wire stub. 'auto' (default) points it \
                                         away from the symbol body so the label text does not run back \
                                         across the pin names; it falls back to 'right' on a bare point. \
-                                        An 'auto' stub that would join another net turns across instead; \
-                                        when every direction, or the one named, would, the call refuses \
-                                        with plan_blocked.",
+                                        The tool tries permitted lengths outward before turning across. \
+                                        If none clear, it uses the first electrically safe stub, or \
+                                        refuses with plan_blocked if none is electrically safe.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54, "minimum": 0,
-                        "description": "Length of the wire stub in mm. 0 draws no wire and \
-                                        puts the label on the point itself." },
+                    "stub_length": { "type": "number", "minimum": 0,
+                        "description": "Length of the wire stub in mm. When omitted, the tool \
+                                        tries 2.54, 5.08, and 7.62 mm for clearance. An explicit \
+                                        length stays fixed; 0 puts the label on the point with no wire." },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
@@ -1175,9 +1178,12 @@ impl RouteGuard {
     /// Why the `candidate` sheet in `after` is refused, or `None` when it joins
     /// nothing [`Self::foreign_joins`] reports.
     pub(super) fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
-        let joined = self.foreign_joins(&parse_sexp(after)?);
-        Ok((!joined.is_empty())
-            .then(|| format!("the {candidate} would join {}", joined.join(", "))))
+        Ok(self.refusal_in(candidate, &parse_sexp(after)?))
+    }
+
+    fn refusal_in(&self, candidate: &str, after: &copperpour_sexp::SexpNode) -> Option<String> {
+        let joined = self.foreign_joins(after);
+        (!joined.is_empty()).then(|| format!("the {candidate} would join {}", joined.join(", ")))
     }
 
     /// Each point whose items `after` puts on `a`'s net although they were on
@@ -5254,10 +5260,10 @@ async fn handle_connect_to_net(
         Err(e) => return Ok(e),
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
-    let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    let fixed_length = opt_f64(args, "stub_length");
     // A negative length would flip the stub's direction; 0 is a label on the
     // point with no wire, as in batch_connect_to_net.
-    if stub_length < 0.0 || !stub_length.is_finite() {
+    if fixed_length.is_some_and(|length| length < 0.0 || !length.is_finite()) {
         return Ok(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
                 field: "stub_length".to_string(),
@@ -5268,7 +5274,7 @@ async fn handle_connect_to_net(
     }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
-    let (_, tree) = read_schematic(&sch_path)?;
+    let (source, tree) = read_schematic(&sch_path)?;
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
@@ -5314,70 +5320,126 @@ async fn handle_connect_to_net(
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
     let outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    let pin = (pin_x, pin_y);
     let dirs = crate::tools::stub_directions(direction, outward);
-    let mut sch = cse::Schematic::load(&sch_path)?;
     let exits = crate::tools::junction_exit_points(&tree);
-    // A zero-length stub is a label on the pin, which joins only the net asked for.
-    let dir = if stub_length > 0.0 {
-        match clear_stub_direction(
-            &sch,
-            &exits,
-            (pin_x, pin_y),
-            &dirs,
-            stub_length,
-            label_type,
-            &net,
-            &[],
-        )? {
-            Ok(dir) => dir,
-            Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
-        }
+    const LENGTHS: [f64; 3] = [2.54, 5.08, 7.62];
+    let lengths = fixed_length
+        .as_ref()
+        .map_or(LENGTHS.as_slice(), std::slice::from_ref);
+    let scratch = || cse::Schematic::from_source(&sch_path, source.as_str());
+    // A label on the anchor introduces no extra joins through a wire.
+    let guard = if fixed_length == Some(0.0) {
+        None
     } else {
-        crate::tools::stub_direction(direction, outward)
+        let guard = match stub_route_guard(scratch()?, pin, label_type, &net, &[])? {
+            Ok(guard) => guard,
+            Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
+        };
+        Some(guard)
     };
-    let (label_x, label_y, label_rot) = add_net_stub(
-        &mut sch,
-        &exits,
-        (pin_x, pin_y),
-        &dir,
-        stub_length,
-        label_type,
-        &net,
-    );
 
-    sch.overwrite()?;
+    let mut selected = None;
+    let mut refused = Vec::new();
+    'directions: for dir in dirs {
+        for &length in lengths {
+            let mut candidate = scratch()?;
+            let (label_uuid, wire_uuid) =
+                add_net_stub(&mut candidate, &exits, pin, &dir, length, label_type, &net);
+            let content = candidate.to_source();
+            let after = parse_sexp(&content)?;
+            if let Some(reason) = guard
+                .as_ref()
+                .and_then(|guard| guard.refusal_in(&format!("{} stub", dir.name), &after))
+            {
+                // A pin at the end of a short stub can block longer tries too.
+                if !refused.contains(&reason) {
+                    refused.push(reason);
+                }
+                continue;
+            }
+            let mut changed_uuids = vec![label_uuid.as_str()];
+            changed_uuids.extend(wire_uuid.as_deref());
+            let clearance =
+                super::sch_analysis::added_clearance_findings(&tree, &after, &changed_uuids);
+            let clear = clearance.findings.is_empty();
+            if selected.is_none() || clear {
+                selected = Some((content, after, dir, label_uuid, wire_uuid, clearance));
+                if clear {
+                    break 'directions;
+                }
+            }
+        }
+    }
+    let Some((content, after, dir, label_uuid, wire_uuid, clearance)) = selected else {
+        return Ok(route_blocked("connect_to_net", refused));
+    };
+    let tag = if label_type == "global_label" {
+        "global_label"
+    } else {
+        "label"
+    };
+    let (label_x, label_y, label_rot) = after
+        .find_all(tag)
+        .into_iter()
+        .find(|node| node.find_str("uuid") == Some(label_uuid.as_str()))
+        .and_then(parse_at)
+        .ok_or_else(|| anyhow::anyhow!("prepared stub label has no saved position"))?;
+    let wire = wire_uuid
+        .map(|uuid| {
+            extract_wires(&after)
+                .into_iter()
+                .find(|wire| wire.uuid.as_deref() == Some(uuid.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("prepared stub wire has no saved endpoints"))
+        })
+        .transpose()?;
+    write_atomic_if_unchanged(&sch_path, &source, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
-        "wire": if stub_length > 0.0 {
-            json!({ "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y })
-        } else {
-            serde_json::Value::Null
-        },
-        "label": { "x": label_x, "y": label_y, "rotation": label_rot }
+        "wire": wire.as_ref().map(|w| json!({ "x1": pin_x, "y1": pin_y, "x2": w.x2, "y2": w.y2 })),
+        "label": { "x": label_x, "y": label_y, "rotation": label_rot },
+        "stub_length": wire.map_or(0.0, |w| round6((w.x2 - w.x1).hypot(w.y2 - w.y1))),
+        "text_overlaps": clearance.findings,
+        "bounds_unresolved": clearance.bounds_unresolved,
     })))
+}
+
+fn stub_route_guard(
+    mut asked: cse::Schematic,
+    pin: (f64, f64),
+    label_type: &str,
+    net: &str,
+    requested: &[(f64, f64)],
+) -> anyhow::Result<Result<RouteGuard, Vec<String>>> {
+    add_stub_label(&mut asked, label_type, net, pin, 0.0);
+    let before = parse_sexp(&asked.to_source())?;
+    Ok(RouteGuard::new(&before, pin, requested).ok_or_else(|| {
+        vec![format!(
+            "cannot check what the stub would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]
+    }))
 }
 
 /// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
 /// with the junctions it needs, and a net or global label at its end. Returns
-/// the label's position and rotation.
-pub(crate) fn add_net_stub(
+/// the UUIDs of the label and the optional wire.
+fn add_net_stub(
     sch: &mut cse::Schematic,
     exits: &[(f64, f64)],
     pin: (f64, f64),
-    dir: &crate::tools::StubDirection,
+    dir: &StubDirection,
     stub_length: f64,
     label_type: &str,
     net: &str,
-) -> (f64, f64, f64) {
+) -> (String, Option<String>) {
     let end = dir.end(pin, stub_length);
     // A zero-length stub is a label on the point: no degenerate wire.
-    if stub_length > 0.0 {
-        add_stub_wire(sch, exits, pin, end);
-    }
-    add_stub_label(sch, label_type, net, end, dir.label_rotation);
-    (end.0, end.1, dir.label_rotation)
+    let wire = (stub_length > 0.0).then(|| add_stub_wire(sch, exits, pin, end));
+    let label = add_stub_label(sch, label_type, net, end, dir.label_rotation);
+    (label, wire)
 }
 
 /// The first of `dirs` along which [`add_net_stub`] from `pin` joins nothing
@@ -5392,21 +5454,17 @@ pub(crate) fn clear_stub_direction(
     sch: &cse::Schematic,
     exits: &[(f64, f64)],
     pin: (f64, f64),
-    dirs: &[crate::tools::StubDirection],
+    dirs: &[StubDirection],
     stub_length: f64,
     label_type: &str,
     net: &str,
     requested: &[(f64, f64)],
-) -> anyhow::Result<Result<crate::tools::StubDirection, Vec<String>>> {
+) -> anyhow::Result<Result<StubDirection, Vec<String>>> {
     let source = sch.to_source();
     let scratch = || cse::Schematic::from_source(sch.filepath(), source.as_str());
-    let mut asked = scratch()?;
-    add_stub_label(&mut asked, label_type, net, pin, 0.0);
-    let Some(guard) = RouteGuard::new(&parse_sexp(&asked.to_source())?, pin, requested) else {
-        return Ok(Err(vec![format!(
-            "cannot check what the stub would join: {}",
-            crate::tools::UNRESOLVED_PIN_GEOMETRY
-        )]));
+    let guard = match stub_route_guard(scratch()?, pin, label_type, net, requested)? {
+        Ok(guard) => guard,
+        Err(reasons) => return Ok(Err(reasons)),
     };
     let mut refused = Vec::new();
     for dir in dirs {
@@ -5427,7 +5485,7 @@ pub(crate) fn add_stub_wire(
     exits: &[(f64, f64)],
     (x1, y1): (f64, f64),
     (x2, y2): (f64, f64),
-) {
+) -> String {
     // T-junction detection for the wire stub
     let mut existing_wires = cse_wires_to_sexp(sch);
     existing_wires.push(copperpour_sexp::schematic::Wire {
@@ -5439,8 +5497,9 @@ pub(crate) fn add_stub_wire(
     });
     let junctions = new_wire_junctions(&existing_wires, exits, (x1, y1), (x2, y2));
 
-    sch.add_wire(x1, y1, x2, y2);
+    let uuid = sch.add_wire(x1, y1, x2, y2).uuid.clone();
     add_missing_junctions(sch, &junctions);
+    uuid
 }
 
 /// The label half of [`add_net_stub`].
@@ -5450,19 +5509,21 @@ pub(crate) fn add_stub_label(
     net: &str,
     (x, y): (f64, f64),
     rotation: f64,
-) {
+) -> String {
     // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
     // unset, and KiCad then centres the text on the anchor (#43).
     match label_type {
         "global_label" => {
             sch.add_global_label(net, "input", x, y);
             let idx = sch.global_labels.len() - 1;
-            if let Some(gl) = sch.global_labels.get_mut(idx) {
-                gl.set_rotation(rotation);
-            }
+            let gl = sch.global_labels.get_mut(idx).expect("just pushed");
+            gl.set_rotation(rotation);
+            gl.uuid.clone()
         }
         _ => {
-            sch.add_label(net, x, y).set_rotation(rotation);
+            let label = sch.add_label(net, x, y);
+            label.set_rotation(rotation);
+            label.uuid.clone()
         }
     }
 }
