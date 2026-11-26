@@ -704,7 +704,7 @@ fn native_flip_round_trip_preserves_models_and_unrelated_footprint_content() {
 
     let (front_layer, original_models) = confirmed_flip(
         client
-            .flip_footprint(&reference, "F.Cu")
+            .flip_footprint(&reference, None, "F.Cu")
             .expect("initial model readback failed"),
     );
     assert_eq!(front_layer, "F.Cu", "fixture footprint must start on F.Cu");
@@ -724,7 +724,7 @@ fn native_flip_round_trip_preserves_models_and_unrelated_footprint_content() {
 
     let (back_layer, back_models) = confirmed_flip(
         client
-            .flip_footprint(&reference, "B.Cu")
+            .flip_footprint(&reference, None, "B.Cu")
             .expect("front-to-back flip failed"),
     );
     assert_eq!(back_layer, "B.Cu");
@@ -736,7 +736,7 @@ fn native_flip_round_trip_preserves_models_and_unrelated_footprint_content() {
 
     let (restored_layer, restored_models) = confirmed_flip(
         client
-            .flip_footprint(&reference, "F.Cu")
+            .flip_footprint(&reference, None, "F.Cu")
             .expect("back-to-front flip failed"),
     );
     assert_eq!(restored_layer, "F.Cu");

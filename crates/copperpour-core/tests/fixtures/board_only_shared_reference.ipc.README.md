@@ -61,7 +61,10 @@ not assumed.
 `pcb_sync`'s tests decode this one message twice and give the second copy a
 different KIID, because the planner keys on KIID and a board needs two distinct
 objects. **Nothing else is varied — in particular not the reference**, which is
-the shared value the tests are about and is exactly what KiCad sent.
+the shared value the tests are about and is exactly what KiCad sent. The
+`flip_component` and `find_component` tests (`pcb_components.rs`,
+`flip_footprint_test.rs`) do the same, giving the second copy the KIID of the
+board's other `REF**` footprint, `df6ca34f-ba1b-40d0-939c-98e09a9466bc`.
 
 An undocumented variation is a hand-built fixture wearing a capture's name, so:
 one field, named here and in the helper's doc comment, backed by the guard test

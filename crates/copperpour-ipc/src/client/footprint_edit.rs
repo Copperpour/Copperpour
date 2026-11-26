@@ -70,7 +70,7 @@ pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootpr
 
 /// Select the one target footprint from `inventory`, pinning by `kiid` when
 /// provided or requiring `reference` to be unique otherwise.
-enum SelectedTarget<'a> {
+pub(super) enum SelectedTarget<'a> {
     Found(&'a board::FootprintInstance),
     StaleTarget {
         target: String,
@@ -83,7 +83,31 @@ enum SelectedTarget<'a> {
     },
 }
 
-fn select_footprint_target<'a>(
+impl SelectedTarget<'_> {
+    /// The lookup outcome, with `found` reading the selected footprint.
+    fn lookup<T>(
+        self,
+        found: impl FnOnce(&board::FootprintInstance) -> T,
+    ) -> IpcFootprintLookupOutcome<T> {
+        match self {
+            Self::Found(footprint) => IpcFootprintLookupOutcome::Found(found(footprint)),
+            Self::StaleTarget { target, reason } => {
+                IpcFootprintLookupOutcome::StaleTarget { target, reason }
+            }
+            Self::Ambiguous {
+                target,
+                candidates,
+                reason,
+            } => IpcFootprintLookupOutcome::AmbiguousTarget {
+                target,
+                candidates,
+                reason,
+            },
+        }
+    }
+}
+
+pub(super) fn select_footprint_target<'a>(
     inventory: &'a [board::FootprintInstance],
     reference: &str,
     kiid: Option<&str>,
@@ -308,25 +332,24 @@ impl KiCadIpcClient {
         kiid: Option<&str>,
     ) -> Result<IpcFootprintLookupOutcome> {
         let inventory = self.footprint_inventory_in(document)?;
-        Ok(
-            match select_footprint_target(&inventory, reference, kiid)? {
-                SelectedTarget::Found(footprint) => {
-                    IpcFootprintLookupOutcome::Found(footprint_state(footprint))
-                }
-                SelectedTarget::StaleTarget { target, reason } => {
-                    IpcFootprintLookupOutcome::StaleTarget { target, reason }
-                }
-                SelectedTarget::Ambiguous {
-                    target,
-                    candidates,
-                    reason,
-                } => IpcFootprintLookupOutcome::AmbiguousTarget {
-                    target,
-                    candidates,
-                    reason,
-                },
-            },
-        )
+        Ok(select_footprint_target(&inventory, reference, kiid)?.lookup(footprint_state))
+    }
+
+    /// The one placed footprint with `reference` (and optional exact `kiid`)
+    /// on `document`, as `list_footprints` reads and reports it: a footprint
+    /// that does not decode is skipped.
+    pub fn find_footprint_in(
+        &self,
+        document: common::DocumentSpecifier,
+        reference: &str,
+        kiid: Option<&str>,
+    ) -> Result<IpcFootprintLookupOutcome<IpcFootprint>> {
+        let inventory: Vec<board::FootprintInstance> = self
+            .get_items_in(document, common::KiCadObjectType::KotPcbFootprint)?
+            .into_iter()
+            .filter_map(|item| unpack_any(&item).ok())
+            .collect();
+        Ok(select_footprint_target(&inventory, reference, kiid)?.lookup(Self::ipc_footprint))
     }
 
     /// Change the reference (for board-owned footprints), value, assembly

@@ -277,6 +277,7 @@ pub struct IpcPadDrill {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcFootprint {
+    pub kiid: String,
     pub reference: String,
     pub value: String,
     pub footprint: String,
@@ -993,6 +994,16 @@ pub enum IpcFlipOutcome {
     Unsupported {
         kicad_version: Option<IpcKiCadVersion>,
     },
+    /// Refused before any write because the caller's KIID is absent or no
+    /// longer carries the named reference.
+    StaleTarget { target: String, reason: String },
+    /// Refused before any write: no `kiid` was given and several footprints
+    /// carry the reference. `candidates` are their KIIDs, sorted.
+    AmbiguousTarget {
+        target: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
     /// The mutation appeared to succeed, but a fresh post-flip readback
     /// disagreed with it or could not be resolved. The board may or may not
     /// have changed; the caller must reconcile before retrying rather than
@@ -1344,8 +1355,8 @@ pub struct IpcFootprintState {
 
 /// Outcome of reading a single placed footprint by reference and optional KIID.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IpcFootprintLookupOutcome {
-    Found(IpcFootprintState),
+pub enum IpcFootprintLookupOutcome<T = IpcFootprintState> {
+    Found(T),
     /// The caller pinned a KIID that is absent or no longer carries the named
     /// reference.
     StaleTarget {
