@@ -18,6 +18,7 @@ pub fn tools() -> Vec<ToolDef> {
         compare_tool_def(),
         sch_pin_contacts::definition(),
         super::sch_cleanup::definition(),
+        super::sch_block_placement::definition(),
     ]
 }
 
@@ -168,5 +169,13 @@ mod tests {
     #[tokio::test]
     async fn page_fit_belongs_to_readability() {
         assert_readability_route("check_schematic_page_fit").await;
+    }
+
+    #[tokio::test]
+    async fn block_placement_belongs_only_to_readability() {
+        assert!(crate::tools::sch_analysis::tools()
+            .iter()
+            .all(|tool| tool.name != "preview_block_placement"));
+        assert_readability_route("preview_block_placement").await;
     }
 }

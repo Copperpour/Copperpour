@@ -7,7 +7,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::sch_connectivity::COINCIDENT_TOLERANCE as TOLERANCE;
+use crate::tools::sch_connectivity::{kicad_schematic_mm, COINCIDENT_TOLERANCE as TOLERANCE};
 use crate::tools::{
     get_path, opt_f64, opt_str, require_array, require_f64, require_str, NamedPin, PlacedPins,
     StubDirection, ToolContext, ToolDef,
@@ -692,7 +692,7 @@ fn insert_wire_with_exits(
 /// The proposed schematic and the points the wire runs through, corner included.
 pub(crate) struct Routed {
     pub(crate) content: String,
-    path: Vec<(f64, f64)>,
+    pub(super) path: Vec<(f64, f64)>,
 }
 
 pub(crate) enum ConnectionRefusal {
@@ -736,14 +736,6 @@ impl ConnectionRefusal {
             message,
         )
     }
-}
-
-fn kicad_schematic_mm(mm: f64) -> f64 {
-    // KiCad's schematic parser clamps to its displayable range, then rounds
-    // to integer 100 nm units (SCH_IO_KICAD_SEXPR_PARSER::parseInternalUnits).
-    const IU_PER_MM: f64 = 10_000.0;
-    const LIMIT: f64 = i32::MAX as f64 * 7071.0 / 10_000.0;
-    (mm * IU_PER_MM).clamp(-LIMIT, LIMIT).round() / IU_PER_MM
 }
 
 fn saved_pin_tip(pin: &NamedPin) -> (f64, f64) {
@@ -877,7 +869,7 @@ pub(crate) fn route_between_pins(
 ///
 /// The inner `Err` holds one reason per bend in horizontal-first, vertical-first
 /// order, or why no candidate could be drawn or checked.
-fn route_between(
+pub(super) fn route_between(
     content: &str,
     x1: f64,
     y1: f64,
@@ -1066,7 +1058,7 @@ struct Terminal {
 impl RouteGuard {
     /// `None` when a placed symbol's pins cannot be resolved: the guard would
     /// not see them, and a route over them would join them unchecked.
-    fn new(
+    pub(super) fn new(
         before: &copperpour_sexp::SexpNode,
         from: (f64, f64),
         also: &[(f64, f64)],

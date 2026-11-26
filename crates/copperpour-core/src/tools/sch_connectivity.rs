@@ -45,6 +45,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// `find_orphan_items` takes its own as an argument; the rest use this.
 pub(crate) const COINCIDENT_TOLERANCE: f64 = 0.01;
 
+// Less than one KiCad schematic internal unit (0.0001 mm).
+pub(super) const DRAWN_ATTACHMENT_TOLERANCE: f64 = 0.00001;
+const DRAWN_UNITS_PER_MM: f64 = 10_000.0;
+
 // ─── Spatial indices ──────────────────────────────────────────────────────────
 
 fn bucket(value: f64, tolerance: f64) -> i64 {
@@ -112,6 +116,7 @@ impl PointIndex {
 /// `point_on_segment`, which answers `false` for anything diagonal.
 pub(super) struct WireIndex<'a> {
     tol: f64,
+    normalize: fn(f64) -> f64,
     rows: HashMap<i64, Vec<&'a Wire>>,
     columns: HashMap<i64, Vec<&'a Wire>>,
 }
@@ -122,24 +127,22 @@ impl<'a> WireIndex<'a> {
     }
 
     pub(super) fn build(wires: &'a [Wire], tol: f64) -> Self {
+        Self::with_coordinates(wires, tol, std::convert::identity)
+    }
+
+    fn with_coordinates(wires: &'a [Wire], tol: f64, normalize: fn(f64) -> f64) -> Self {
         let mut index = WireIndex {
             tol,
+            normalize,
             rows: HashMap::new(),
             columns: HashMap::new(),
         };
         for wire in wires {
-            if (wire.x1 - wire.x2).abs() < tol {
-                index
-                    .columns
-                    .entry(bucket(wire.x1, tol))
-                    .or_default()
-                    .push(wire);
-            } else if (wire.y1 - wire.y2).abs() < tol {
-                index
-                    .rows
-                    .entry(bucket(wire.y1, tol))
-                    .or_default()
-                    .push(wire);
+            let [x1, y1, x2, y2] = [wire.x1, wire.y1, wire.x2, wire.y2].map(normalize);
+            if (x1 - x2).abs() < tol {
+                index.columns.entry(bucket(x1, tol)).or_default().push(wire);
+            } else if (y1 - y2).abs() < tol {
+                index.rows.entry(bucket(y1, tol)).or_default().push(wire);
             }
         }
         index
@@ -165,8 +168,10 @@ impl<'a> WireIndex<'a> {
 
     /// Every wire that actually passes through `(x, y)`.
     fn hits(&self, x: f64, y: f64) -> impl Iterator<Item = &&'a Wire> {
+        let [x, y] = [x, y].map(self.normalize);
         self.candidates(x, y).filter(move |wire| {
-            point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol)
+            let [x1, y1, x2, y2] = [wire.x1, wire.y1, wire.x2, wire.y2].map(self.normalize);
+            point_on_segment(x, y, x1, y1, x2, y2, self.tol)
         })
     }
 
@@ -672,6 +677,35 @@ pub(super) fn drawn_net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Lab
         &extract_junctions(tree),
         &extract_sheet_pins(tree),
         &WireIndex::build(wires, COINCIDENT_TOLERANCE),
+    )
+}
+
+pub(super) fn redraw_point_key(x: f64, y: f64) -> NetRoot {
+    let to_iu = |mm| (kicad_schematic_mm(mm) * DRAWN_UNITS_PER_MM).round() as i64;
+    (to_iu(x), to_iu(y))
+}
+
+pub(super) fn kicad_schematic_mm(mm: f64) -> f64 {
+    // SCH_IO_KICAD_SEXPR_PARSER::parseInternalUnits clamps the coordinate
+    // to the drawable range before rounding to 100 nm units.
+    const LIMIT: f64 = i32::MAX as f64 * 7071.0 / 10_000.0;
+    (mm * DRAWN_UNITS_PER_MM).clamp(-LIMIT, LIMIT).round() / DRAWN_UNITS_PER_MM
+}
+
+/// Use saved-coordinate equality for redraws without changing legacy queries.
+pub(super) fn redraw_net_graph(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
+    let index = WireIndex::with_coordinates(wires, DRAWN_ATTACHMENT_TOLERANCE, kicad_schematic_mm);
+    seed_drawn_graph_with(
+        wires,
+        labels,
+        &extract_junctions(tree),
+        &extract_sheet_pins(tree),
+        redraw_point_key,
+        |graph, x, y, _| {
+            for wire in index.hits(x, y) {
+                graph.union(redraw_point_key(x, y), redraw_point_key(wire.x1, wire.y1));
+            }
+        },
     )
 }
 
