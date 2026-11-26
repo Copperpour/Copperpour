@@ -1,7 +1,7 @@
 //! Advisory checks for the drawn route, not the electrically merged net.
 
 use super::{
-    drawn_symbol_pin_inventory, get_path, opt_positive_f64,
+    drawn_pins_for_power_drivers, get_path, opt_positive_f64,
     sch_connectivity::{
         bus_entry_wire_ends, wire_run_net_graph, PinNetNames, UnitNotation, WireIndex,
         COINCIDENT_TOLERANCE,
@@ -302,7 +302,7 @@ pub(crate) fn measure_wire_runs(tree: &SexpNode) -> Result<WireRuns, &'static st
         .into_iter()
         .map(|(x, y)| point(x, y))
         .collect();
-    let pin_inventory = drawn_symbol_pin_inventory(tree);
+    let pin_inventory = drawn_pins_for_power_drivers(tree);
     let mut pins_resolved = pin_inventory.iter().all(Option::is_some);
     let lib_symbols = tree
         .find("lib_symbols")
