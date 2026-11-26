@@ -355,7 +355,7 @@ pub struct SymbolBounds {
 }
 
 impl SymbolBounds {
-    pub(crate) fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
+    pub fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
         let mut bounds = Self::point(x1, y1);
         bounds.include(x2, y2);
         bounds
@@ -370,7 +370,7 @@ impl SymbolBounds {
         }
     }
 
-    pub(crate) fn include(&mut self, x: f64, y: f64) {
+    pub fn include(&mut self, x: f64, y: f64) {
         if !x.is_finite() || !y.is_finite() {
             return;
         }
@@ -504,8 +504,17 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     let (Some(start), Some(mid), Some(end)) = (point("start"), point("mid"), point("end")) else {
         return;
     };
+    if let Some(arc) = arc_bounds(start, mid, end) {
+        include_point(bounds, arc.min_x, arc.min_y);
+        include_point(bounds, arc.max_x, arc.max_y);
+    }
+}
+
+/// Bounds of a circular arc through the three saved points.
+pub fn arc_bounds(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> Option<SymbolBounds> {
+    let mut bounds = None;
     for (x, y) in [start, mid, end] {
-        include_point(bounds, x, y);
+        include_point(&mut bounds, x, y);
     }
 
     let (x1, y1) = start;
@@ -513,7 +522,7 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     let (x3, y3) = end;
     let divisor = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
     if divisor.abs() < 1e-12 {
-        return;
+        return bounds;
     }
     let square = |x: f64, y: f64| x * x + y * y;
     let center_x =
@@ -524,7 +533,7 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
             / divisor;
     let radius = (x1 - center_x).hypot(y1 - center_y);
     if !center_x.is_finite() || !center_y.is_finite() || !radius.is_finite() {
-        return;
+        return bounds;
     }
 
     let angle = |(x, y): (f64, f64)| (y - center_y).atan2(x - center_x);
@@ -545,12 +554,13 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
         };
         if on_arc {
             include_point(
-                bounds,
+                &mut bounds,
                 center_x + radius * candidate.cos(),
                 center_y + radius * candidate.sin(),
             );
         }
     }
+    bounds
 }
 
 fn collect_direct_symbol_geometry(node: &SexpNode, geometry: &mut SymbolGeometry) {
@@ -637,6 +647,23 @@ fn local_geometry_for_unit(sym_node: &SexpNode, unit: u32) -> SymbolGeometry {
     geometry
 }
 
+/// Library parts in the requested unit and body style, plus common parts.
+pub fn symbol_parts_for_body_style(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Vec<&SexpNode> {
+    let mut parts = vec![sym_node];
+    for sub in unit_body_children(sym_node, unit, body_style) {
+        let mut stack = vec![sub];
+        while let Some(part) = stack.pop() {
+            parts.push(part);
+            stack.extend(part.find_all("symbol").into_iter().rev());
+        }
+    }
+    parts
+}
+
 /// Bounds of the selected unit's drawings and pins in library-local, Y-up
 /// coordinates.
 pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
@@ -658,6 +685,13 @@ fn place_bounds(local: SymbolBounds, transform: PinTransform) -> SymbolBounds {
         placed.include(x, y);
     }
     placed
+}
+
+impl SymbolBounds {
+    /// Carry a library-local bounding box into the placed symbol's sheet.
+    pub fn placed(self, transform: PinTransform) -> Self {
+        place_bounds(self, transform)
+    }
 }
 
 /// Transform a selected library unit's bounds into schematic coordinates for
