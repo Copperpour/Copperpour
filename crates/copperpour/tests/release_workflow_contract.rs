@@ -41,6 +41,22 @@ fn release_publication_requires_real_kicad_acceptance() {
 }
 
 #[test]
+fn a_tag_creates_a_draft_release() {
+    let release = workflow("release.yml");
+    let create = release["jobs"]["release"]["steps"]
+        .as_array()
+        .expect("release steps must be an array")
+        .iter()
+        .find(|step| step["name"] == "Create draft GitHub Release")
+        .expect("the release job must create the GitHub release");
+
+    assert_eq!(
+        create["with"]["draft"], true,
+        "a tag must not publish generated notes before a maintainer writes them"
+    );
+}
+
+#[test]
 fn release_workflow_has_a_non_publishing_pre_tag_entry_point() {
     let release = workflow("release.yml");
 

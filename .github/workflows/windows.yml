@@ -2,8 +2,8 @@ name: Windows
 
 # Check & Test on windows-latest, kept out of ci.yml so it has its own
 # concurrency group and is not a required check yet (GOVERNANCE.md, "Where CI
-# runs"). The Windows release build and the real-KiCad gate (release.yml,
-# e2e-kicad.yml) run on local CI.
+# runs"). The Windows release build and the real-KiCad gate are in release.yml
+# and e2e-kicad.yml.
 on:
   push:
     branches: [main]
