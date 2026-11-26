@@ -199,8 +199,13 @@ pub fn tools() -> Vec<ToolDef> {
             "Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. \
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
              Preserves placement, routing, board-only footprints, and footprint artwork. \
+             A footprint linked to any unit of a multi-unit symbol is that symbol's, as \
+             KiCad's Update PCB matches it, and keeps its link. \
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
-             and the sync proceeds for every other component. A part the dry run finds \
+             and the sync proceeds for every other component. A pin KiCad left \
+             unconnected, alone on an `unconnected-…` net or with a no-connect pin type, \
+             needs no pad: a keyed header's footprint, with no pad at the key, takes \
+             every other net. A part the dry run finds \
              cannot be built is skipped and every other part is still synced, as KiCad's \
              Update PCB reports its errors and commits the rest: a library footprint that \
              cannot be placed, a connected pad its footprint does not have, an update of a \

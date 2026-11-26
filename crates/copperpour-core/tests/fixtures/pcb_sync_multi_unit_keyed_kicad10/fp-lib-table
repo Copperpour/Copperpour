@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "kk")(type "KiCad")(uri "${KIPRJMOD}/kk.pretty")(options "")(descr "Keyed KK-254 headers: no pad at the key"))
+)

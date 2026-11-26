@@ -97,17 +97,35 @@ struct DesignComponent {
     reference: String,
     value: String,
     footprint_id: String,
+    /// The first unit's path, the one an added footprint is linked to.
     symbol_path: String,
+    /// The path of each other unit of a multi-unit symbol, in the order the
+    /// netlist's `tstamps` lists them. A board footprint linked to any unit
+    /// is this component's, as KiCad's Update PCB matches it.
+    other_unit_paths: Vec<String>,
     dnp: bool,
     /// The symbol's Exclude from BOM: the part stays on the board, its
     /// footprint marked, as KiCad's Update PCB marks it (#875).
     exclude_from_bom: bool,
     pad_nets: BTreeMap<String, String>,
+    /// The pins KiCad left unconnected: each alone on its net, which is an
+    /// `unconnected-…` net or has a no-connect pin type. They connect
+    /// nothing, so a footprint with no pad for one (a keyed header's key)
+    /// takes every other net (`nets_for_pads`).
+    unconnected_pins: BTreeSet<String>,
     /// The symbol fields KiCad's Update PCB copies onto the footprint, in the
     /// order the netlist lists them (#788).
     fields: Vec<SymbolField>,
     /// The sheet KiCad's Update PCB gives the footprint (#237).
     sheet: SymbolSheet,
+}
+
+impl DesignComponent {
+    /// The path of each unit, the first unit's first.
+    fn unit_paths(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.symbol_path.as_str())
+            .chain(self.other_unit_paths.iter().map(String::as_str))
+    }
 }
 
 /// A symbol field to copy onto the footprint. An empty value is still a field:
@@ -281,6 +299,10 @@ enum PlannedChange {
         dnp: bool,
         exclude_from_bom: bool,
         pad_nets: BTreeMap<String, String>,
+        /// The component's `unconnected_pins`, which the library footprint
+        /// need not have (`leave_out_unconnected_pins`).
+        #[serde(skip)]
+        unconnected_pins: BTreeSet<String>,
         position: Point,
         /// Every symbol field the footprint receives.
         fields: Vec<SymbolField>,
@@ -296,6 +318,10 @@ enum PlannedChange {
         dnp: bool,
         exclude_from_bom: bool,
         pad_nets: BTreeMap<String, String>,
+        /// The component's `unconnected_pins`, which a replacement footprint
+        /// need not have (`leave_out_unconnected_pins`).
+        #[serde(skip)]
+        unconnected_pins: BTreeSet<String>,
         preserve: PreservedBoardState,
         /// Only the symbol fields whose value the footprint lacks or differs on.
         fields: Vec<SymbolField>,
@@ -433,6 +459,12 @@ struct SyncPlan {
     /// the preflight's own diagnostic. Part of the plan's identity: what was
     /// left out is part of what was reviewed.
     skipped: Vec<SyncDiagnostic>,
+    /// The footprints on the board `plan_sync` found it cannot update, each
+    /// with why. The handler skips them with the parts its own preflight
+    /// refuses (`skip_parts`), so one of them does not stop the sync of
+    /// every other part.
+    #[serde(skip)]
+    refused_updates: Vec<SyncDiagnostic>,
     /// The footprints no symbol matched that the plan keeps, apart from those
     /// with the board-only attribute (#861). Those it deletes are `Delete`
     /// changes instead.
@@ -692,11 +724,15 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             // the parts that need it, and each connected pad a prepared
             // footprint does not have. So is each updated footprint that would
             // lose what it owns, which the apply would not report. The parts
-            // these name are skipped (`skip_parts`), not applied.
-            let mut preflight = unprepared
-                .into_iter()
-                .map(UnpreparedFootprint::into_diagnostic)
-                .collect::<Vec<_>>();
+            // these name are skipped (`skip_parts`), not applied, and so is
+            // each footprint on the board that lacks a connected pad, which
+            // `plan_sync` found.
+            let mut preflight = std::mem::take(&mut plan.refused_updates);
+            preflight.extend(
+                unprepared
+                    .into_iter()
+                    .map(UnpreparedFootprint::into_diagnostic),
+            );
             preflight.extend(additions_missing_pads(&plan, &prepared));
             // Each replacement's new footprint is read and checked the same
             // way, so `ready` means the apply can build it.
@@ -721,6 +757,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             } else {
                 (BTreeMap::new(), 0)
             };
+            leave_out_unconnected_pins(&mut plan, &prepared, &replacements, &snapshot.state);
             let mut left_out = Vec::new();
             if plan
                 .changes
@@ -1291,6 +1328,8 @@ fn plan_sync_acknowledging(
     // Reported beside the plan without refusing it, as KiCad's Update PCB
     // reports a warning.
     let mut notes = Vec::new();
+    // Parts skipped rather than refusing the plan (`SyncPlan::refused_updates`).
+    let mut refused_updates = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
     let mut board_by_path = HashMap::new();
@@ -1451,7 +1490,37 @@ fn plan_sync_acknowledging(
             continue;
         }
 
-        let matched_index = board_by_path.get(normalized_path).copied().or_else(|| {
+        // A footprint linked to any unit of the symbol is its footprint, as
+        // KiCad's Update PCB matches it against the sheet path and each of
+        // the component's unit UUIDs (`BOARD_NETLIST_UPDATER::UpdateNetlist`,
+        // KiCad 10.0.8). KiCad then relinks it to the first unit; the sync
+        // keeps its link, as it keeps every matched footprint's.
+        let unit_matches = component
+            .unit_paths()
+            .filter_map(|path| {
+                board_by_path
+                    .get(normalize_symbol_path(path, root_uuid))
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
+        if unit_matches.len() > 1 {
+            matched.extend(unit_matches.iter().copied());
+            diagnostics.push(conflict(
+                "duplicate_board_identity",
+                format!(
+                    "board footprints {} are each linked to a unit of {}",
+                    unit_matches
+                        .iter()
+                        .map(|index| board.footprints[*index].reference.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    component.reference
+                ),
+                Some(&component.reference),
+            ));
+            continue;
+        }
+        let matched_index = unit_matches.first().copied().or_else(|| {
             board_by_reference
                 .get(component.reference.as_str())
                 .copied()
@@ -1515,6 +1584,7 @@ fn plan_sync_acknowledging(
                 dnp: component.dnp,
                 exclude_from_bom: component.exclude_from_bom,
                 pad_nets: component.pad_nets.clone(),
+                unconnected_pins: component.unconnected_pins.clone(),
                 position,
                 fields: component.fields.clone(),
                 sheet: component.sheet.clone(),
@@ -1570,13 +1640,26 @@ fn plan_sync_acknowledging(
                 to: component.footprint_id.clone(),
             })
         };
+        // A pin KiCad left unconnected needs no pad on the footprint kept;
+        // a replacement is given its pads in the handler, from its library
+        // footprint (`leave_out_unconnected_pins`).
+        let pad_nets = if replace_footprint.is_none() {
+            nets_for_pads(
+                &component.pad_nets,
+                &component.unconnected_pins,
+                &footprint.pad_numbers,
+            )
+        } else {
+            component.pad_nets.clone()
+        };
         // A pad the schematic connects and the live footprint lacks used to
         // reach `apply_footprint_fields` and fail the apply, after a dry run
-        // that said `ready` (#657). A replacement is checked against its new
-        // footprint instead.
-        let missing = missing_pads(&component.pad_nets, &footprint.pad_numbers);
+        // that said `ready` (#657). The part is skipped instead, as an added
+        // part is that lacks one, and the rest is still synced. A replacement
+        // is checked against its new footprint.
+        let missing = missing_pads(&pad_nets, &footprint.pad_numbers);
         if replace_footprint.is_none() && !missing.is_empty() {
-            diagnostics.push(pad_missing_conflict(
+            refused_updates.push(pad_missing_conflict(
                 &component.reference,
                 &footprint.footprint_id,
                 &missing,
@@ -1585,17 +1668,12 @@ fn plan_sync_acknowledging(
         }
 
         let mut changed_pads = 0usize;
-        let pad_numbers = component
-            .pad_nets
+        let pad_numbers = pad_nets
             .keys()
             .chain(footprint.pad_nets.keys())
             .collect::<std::collections::BTreeSet<_>>();
         for number in pad_numbers {
-            let new_net = component
-                .pad_nets
-                .get(number)
-                .map(String::as_str)
-                .unwrap_or("");
+            let new_net = pad_nets.get(number).map(String::as_str).unwrap_or("");
             let old_net = footprint
                 .pad_nets
                 .get(number)
@@ -1682,7 +1760,8 @@ fn plan_sync_acknowledging(
                 symbol_path: preserved_symbol_path.to_string(),
                 dnp: component.dnp,
                 exclude_from_bom: component.exclude_from_bom,
-                pad_nets: component.pad_nets.clone(),
+                pad_nets,
+                unconnected_pins: component.unconnected_pins.clone(),
                 preserve: PreservedBoardState {
                     position: footprint.position,
                     rotation: footprint.rotation,
@@ -1790,6 +1869,7 @@ fn plan_sync_acknowledging(
         unassigned,
         // Set by the handler's preflight, which reads the library.
         skipped: Vec::new(),
+        refused_updates,
         without_symbols,
         // Set by the handler, from the vias and zones the snapshot read.
         copper_net_changes: Vec::new(),
@@ -1874,6 +1954,24 @@ fn missing_pads<'a>(
         .keys()
         .filter(|number| !available.contains(*number))
         .map(String::as_str)
+        .collect()
+}
+
+/// The pad nets a footprint with the pads `available` takes: every pin's but
+/// those of the pins KiCad left unconnected that it has no pad for. Such a
+/// pin connects nothing, so the footprint of a keyed header, which has no pad
+/// at the key, is synced, and its pad nets name only pads it has. KiCad's
+/// Update PCB likewise sets the nets of the pads a footprint has
+/// (`updateComponentPadConnections`, KiCad 10.0.8).
+fn nets_for_pads(
+    pad_nets: &BTreeMap<String, String>,
+    unconnected_pins: &BTreeSet<String>,
+    available: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    pad_nets
+        .iter()
+        .filter(|(number, _)| available.contains(*number) || !unconnected_pins.contains(*number))
+        .map(|(number, net)| (number.clone(), net.clone()))
         .collect()
 }
 
@@ -1997,15 +2095,35 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             .find("sheetpath")
             .and_then(|sheet| sheet.find_str("tstamps"))
             .context("KiCad netlist component has no sheet timestamp")?;
-        let symbol_stamp = component_node
-            .find_str("tstamps")
+        // One UUID per unit of a multi-unit symbol, every one of which KiCad
+        // matches a footprint by (`KICAD_NETLIST_PARSER::parseComponent`).
+        let symbol_stamps = component_node
+            .find("tstamps")
+            .and_then(SexpNode::children)
+            .map(|children| {
+                children
+                    .iter()
+                    .skip(1)
+                    .filter_map(SexpNode::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let (symbol_stamp, other_stamps) = symbol_stamps
+            .split_first()
             .context("KiCad netlist component has no symbol timestamp")?;
-        let symbol_path = format!(
-            "/{}/{}",
-            sheet_stamp.trim_matches('/'),
-            symbol_stamp.trim_matches('/')
-        )
-        .replace("//", "/");
+        let unit_path = |stamp: &str| {
+            format!(
+                "/{}/{}",
+                sheet_stamp.trim_matches('/'),
+                stamp.trim_matches('/')
+            )
+            .replace("//", "/")
+        };
+        let symbol_path = unit_path(symbol_stamp);
+        let other_unit_paths = other_stamps
+            .iter()
+            .map(|stamp| unit_path(stamp))
+            .collect::<Vec<_>>();
         let dnp = component_node.find_all("property").iter().any(|property| {
             property.find_str("name") == Some("dnp")
                 || property.get(1).and_then(SexpNode::as_str) == Some("dnp")
@@ -2049,9 +2167,11 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             value,
             footprint_id,
             symbol_path,
+            other_unit_paths,
             dnp,
             exclude_from_bom,
             pad_nets: BTreeMap::new(),
+            unconnected_pins: BTreeSet::new(),
             fields: symbol_fields(component_node),
             sheet: symbol_sheet(component_node),
         });
@@ -2065,7 +2185,26 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
     if let Some(nets_node) = root.find("nets") {
         for net_node in nets_node.find_all("net") {
             let net_name = required_value(net_node, "name")?;
-            for node in net_node.find_all("node") {
+            let nodes = net_node.find_all("node");
+            // KiCad names the net of a pin wired to nothing
+            // `unconnected-(<ref>-<pin>-Pad<n>)`, and a pin with a no-connect
+            // flag, or of the no-connect type, has `no_connect` in its pin
+            // type. Alone on its net, such a pin connects nothing. A pin with
+            // a no-connect flag that is wired to other pins is still
+            // connected, and so is a named net of one pin.
+            if let [node] = nodes.as_slice() {
+                let no_connect = node
+                    .find_str("pintype")
+                    .is_some_and(|pin_type| pin_type.contains("no_connect"));
+                if no_connect || net_name.starts_with("unconnected-") {
+                    let reference = required_value(node, "ref")?;
+                    let pin = required_value(node, "pin")?;
+                    if let Some(&index) = by_reference.get(&reference) {
+                        components[index].unconnected_pins.insert(pin);
+                    }
+                }
+            }
+            for node in nodes {
                 let reference = required_value(node, "ref")?;
                 let pin = required_value(node, "pin")?;
                 // KiCad's netlist holds the net for any component's pin,
@@ -4003,6 +4142,7 @@ fn prepare_replacements(
             kiid,
             reference,
             pad_nets,
+            unconnected_pins,
             replace_footprint: Some(replace),
             ..
         } = change
@@ -4029,7 +4169,8 @@ fn prepare_replacements(
             continue;
         }
         let available = prepared[&replace.to].pad_numbers();
-        let missing = missing_pads(pad_nets, &available);
+        let pad_nets = nets_for_pads(pad_nets, unconnected_pins, &available);
+        let missing = missing_pads(&pad_nets, &available);
         if !missing.is_empty() {
             diagnostics.push(pad_missing_conflict(reference, &replace.to, &missing));
             continue;
@@ -4180,6 +4321,7 @@ fn additions_missing_pads(
             reference,
             footprint_id,
             pad_nets,
+            unconnected_pins,
             ..
         } = change
         else {
@@ -4189,17 +4331,72 @@ fn additions_missing_pads(
         let Some(part) = prepared.get(footprint_id) else {
             continue;
         };
-        let available = part
-            .pads
-            .iter()
-            .map(|pad| pad.number.clone())
-            .collect::<BTreeSet<_>>();
-        let missing = missing_pads(pad_nets, &available);
+        let available = library_pad_numbers(part);
+        let pad_nets = nets_for_pads(pad_nets, unconnected_pins, &available);
+        let missing = missing_pads(&pad_nets, &available);
         if !missing.is_empty() {
             diagnostics.push(pad_missing_conflict(reference, footprint_id, &missing));
         }
     }
     diagnostics
+}
+
+fn library_pad_numbers(part: &PreparedFootprint) -> BTreeSet<String> {
+    part.pads.iter().map(|pad| pad.number.clone()).collect()
+}
+
+/// Leave out of each addition's and replacement's pad nets the pins KiCad
+/// left unconnected that its library footprint has no pad for
+/// (`nets_for_pads`), as `plan_sync` leaves them out of an update, so the
+/// apply sets the net of each pad the new footprint has and of no other.
+/// An addition or replacement whose footprint was not read is skipped
+/// already, and left as it is. The pads reassigned are counted again, as
+/// `skip_parts` counts them, since `plan_sync` counted a replacement's
+/// against every pin.
+fn leave_out_unconnected_pins(
+    plan: &mut SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+    replacements: &BTreeMap<String, super::pcb_footprint_update::ReplacementFootprint>,
+    board: &BoardState,
+) {
+    for change in &mut plan.changes {
+        let (pad_nets, unconnected_pins, available) = match change {
+            PlannedChange::Add {
+                footprint_id,
+                pad_nets,
+                unconnected_pins,
+                ..
+            } => match prepared.get(footprint_id) {
+                Some(part) => (pad_nets, unconnected_pins, library_pad_numbers(part)),
+                None => continue,
+            },
+            PlannedChange::Update {
+                replace_footprint: Some(replace),
+                pad_nets,
+                unconnected_pins,
+                ..
+            } => match replacements.get(&replace.to) {
+                Some(library) => (pad_nets, unconnected_pins, library.pad_numbers()),
+                None => continue,
+            },
+            PlannedChange::Update { .. } | PlannedChange::Delete { .. } => continue,
+        };
+        *pad_nets = nets_for_pads(pad_nets, unconnected_pins, &available);
+    }
+    plan.counts.pads_reassigned.planned = plan
+        .changes
+        .iter()
+        .map(|change| match change {
+            PlannedChange::Update { kiid, pad_nets, .. } => board
+                .footprints
+                .iter()
+                .find(|footprint| &footprint.kiid == kiid)
+                .map_or(0, |footprint| {
+                    changed_pad_count(pad_nets, &footprint.pad_nets)
+                }),
+            PlannedChange::Add { .. } | PlannedChange::Delete { .. } => 0,
+        })
+        .sum();
 }
 
 /// What a footprint owns that KiCad's API cannot carry through an update (#836).
@@ -4852,6 +5049,7 @@ fn build_added_footprint(
         position,
         fields,
         sheet,
+        ..
     } = change
     else {
         bail!("only a planned addition builds a new footprint");
@@ -5396,6 +5594,103 @@ mod tests {
         assert!(!component.dnp);
     }
 
+    /// Real `kicad-cli sch export netlist` output (KiCad 10.0.8): an LM339
+    /// with three of its units placed, and a keyed header whose pin 2, at the
+    /// key, has a no-connect flag. Provenance in
+    /// `tests/fixtures/pcb_sync_multi_unit_keyed_kicad10/README.md`.
+    const MULTI_UNIT_KEYED: &str =
+        include_str!("../../tests/fixtures/pcb_sync_multi_unit_keyed_kicad10/kk_sync.net");
+
+    fn exported<'a>(design: &'a ExportedDesign, reference: &str) -> &'a DesignComponent {
+        design
+            .components
+            .iter()
+            .find(|component| component.reference == reference)
+            .unwrap_or_else(|| panic!("{reference} is exported"))
+    }
+
+    /// Every unit's UUID is read, in the order KiCad lists them, the first
+    /// unit's path being the one an added footprint is linked to. Only the
+    /// first was read before, so a footprint linked to another unit matched
+    /// nothing.
+    #[test]
+    fn every_unit_of_a_multi_unit_symbol_is_read_from_the_netlist() {
+        let design = parse_exported_netlist(MULTI_UNIT_KEYED).expect("valid KiCad netlist");
+
+        let u1 = exported(&design, "U1");
+        assert_eq!(u1.symbol_path, "/d6286f98-cc91-4832-97c0-cec9c712e8d3");
+        assert_eq!(
+            u1.other_unit_paths,
+            [
+                "/ea566a33-6106-497d-ab3a-228e365858d7",
+                "/1951944c-c6bb-40ae-8bca-507fb207334e",
+            ]
+        );
+        assert_eq!(
+            exported(&design, "R1").other_unit_paths,
+            Vec::<String>::new()
+        );
+    }
+
+    /// The pins KiCad left unconnected: the header's pin 2, which has a
+    /// no-connect flag, its pin 4, wired to nothing, and every unwired pin of
+    /// the comparator. Each is alone on an `unconnected-…` net.
+    #[test]
+    fn the_pins_kicad_left_unconnected_are_read_from_the_netlist() {
+        let design = parse_exported_netlist(MULTI_UNIT_KEYED).expect("valid KiCad netlist");
+
+        let pins = |reference| {
+            exported(&design, reference)
+                .unconnected_pins
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pins("P1"), ["2", "4"]);
+        assert_eq!(pins("R1"), Vec::<&str>::new());
+        assert_eq!(pins("U1"), ["1", "12", "3", "5", "6", "7"]);
+        // They still carry their nets, for the footprints that have them.
+        assert_eq!(
+            exported(&design, "P1")
+                .pad_nets
+                .get("2")
+                .map(String::as_str),
+            Some("unconnected-(P1-Pin_2-Pad2)")
+        );
+    }
+
+    /// A pin with a no-connect flag that is wired to another pin all the same
+    /// is connected, and so is a pin alone on a net a label names: only a pin
+    /// alone on KiCad's own `unconnected-…` net, or with a no-connect pin
+    /// type, connects nothing.
+    #[test]
+    fn a_no_connect_pin_wired_to_another_pin_is_still_connected() {
+        let design = parse_exported_netlist(
+            r#"(export
+  (components
+    (comp (ref "P1") (value "Conn") (footprint "kk:KK254_1x04_Keyed")
+      (sheetpath (names "/") (tstamps "/")) (tstamps "p1-uuid"))
+    (comp (ref "R1") (value "1k") (footprint "Resistor_SMD:R_0603_1608Metric")
+      (sheetpath (names "/") (tstamps "/")) (tstamps "r1-uuid")))
+  (nets
+    (net (code "1") (name "Net-(P1-Pin_2)") (class "Default")
+      (node (ref "P1") (pin "2") (pintype "passive+no_connect"))
+      (node (ref "R1") (pin "1") (pintype "passive")))
+    (net (code "2") (name "TEST_POINT") (class "Default")
+      (node (ref "R1") (pin "2") (pintype "passive")))
+    (net (code "3") (name "Net-(P1-Pin_3)") (class "Default")
+      (node (ref "P1") (pin "3") (pintype "no_connect")))))
+"#,
+        )
+        .expect("valid netlist");
+
+        assert_eq!(
+            exported(&design, "P1").unconnected_pins,
+            BTreeSet::from(["3".to_string()])
+        );
+        assert_eq!(exported(&design, "R1").unconnected_pins, BTreeSet::new());
+    }
+
     /// Real `kicad-cli sch export netlist` output: one sheet file placed
     /// twice, as `CH1` and `CH2`, with a capacitor on it, and a capacitor on
     /// the root. Provenance in `tests/fixtures/sheet_fields_kicad10.README.md`.
@@ -5754,12 +6049,14 @@ mod tests {
             value: "10k".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.to_string(),
+            other_unit_paths: Vec::new(),
             dnp: false,
             exclude_from_bom: false,
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
             ]),
+            unconnected_pins: BTreeSet::new(),
             fields: Vec::new(),
             sheet: SymbolSheet::default(),
         }
@@ -6340,6 +6637,7 @@ mod tests {
             dnp: false,
             exclude_from_bom: false,
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
+            unconnected_pins: BTreeSet::new(),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
                 rotation: 0.0,
@@ -6683,6 +6981,7 @@ mod tests {
             dnp: true,
             exclude_from_bom: false,
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
+            unconnected_pins: BTreeSet::new(),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
                 rotation: 90.0,
@@ -6846,6 +7145,7 @@ mod tests {
             dnp: false,
             exclude_from_bom: false,
             pad_nets: board.pad_nets.clone(),
+            unconnected_pins: BTreeSet::new(),
             preserve: PreservedBoardState {
                 position: board.position,
                 rotation: board.rotation,
@@ -9066,6 +9366,7 @@ mod tests {
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
                 .collect(),
+            unconnected_pins: BTreeSet::new(),
             position: Point { x: 0.0, y: 0.0 },
             fields: Vec::new(),
             sheet: SymbolSheet::default(),
@@ -9087,6 +9388,7 @@ mod tests {
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
             skipped: Vec::new(),
+            refused_updates: Vec::new(),
             without_symbols: Vec::new(),
             copper_net_changes: Vec::new(),
             staging: None,
@@ -9264,8 +9566,11 @@ mod tests {
     }
 
     /// Update path: the same rule against the pads of the live footprint.
-    /// Before, this planned an update with one pad reassigned and said
-    /// `ready`; the apply then failed on `footprint R1 has no pad 3`.
+    /// Before #657, this planned an update with one pad reassigned and said
+    /// `ready`; the apply then failed on `footprint R1 has no pad 3`. Then it
+    /// refused the whole plan. Now only that update is refused, for the
+    /// handler to skip the part (`refused_updates`), as it skips an added
+    /// part that lacks a pad.
     #[test]
     fn a_connected_pad_the_live_footprint_lacks_is_found_while_planning() {
         let mut component = resistor("R1", "/sheet/existing");
@@ -9283,11 +9588,12 @@ mod tests {
 
         let plan = plan_sync("netlist", &design, &board);
 
-        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert_eq!(plan.status, PlanStatus::Noop);
         assert!(plan.changes.is_empty());
         assert_eq!(plan.counts.updated.planned, 0);
-        assert_eq!(plan.diagnostics.len(), 1, "{:#?}", plan.diagnostics);
-        let missing = &plan.diagnostics[0];
+        assert_eq!(plan.diagnostics, Vec::new());
+        assert_eq!(plan.refused_updates.len(), 1, "{:#?}", plan.refused_updates);
+        let missing = &plan.refused_updates[0];
         assert_eq!(missing.code, "footprint_pad_missing");
         assert_eq!(missing.reference.as_deref(), Some("R1"));
         assert_eq!(
@@ -9295,6 +9601,120 @@ mod tests {
             Some("Resistor_SMD:R_0603_1608Metric")
         );
         assert!(missing.message.contains("pad 3"), "{}", missing.message);
+    }
+
+    /// A keyed header's footprint has no pad at the key, and the schematic's
+    /// pin there has a no-connect flag. That pin connects nothing, so the
+    /// footprint is updated, and its pad nets name only the pads it has: the
+    /// apply sets each of them (`apply_footprint_fields` refuses any other).
+    /// With nothing else to change, the plan is a no-op, not an update of a
+    /// pad that does not exist.
+    #[test]
+    fn a_live_footprint_needs_no_pad_for_a_pin_kicad_left_unconnected() {
+        let keyed = |value: &str| {
+            let mut component = resistor("R1", "/sheet/existing");
+            component.value = value.to_string();
+            component
+                .pad_nets
+                .insert("3".to_string(), "unconnected-(R1-Pad3)".to_string());
+            component.unconnected_pins.insert("3".to_string());
+            ExportedDesign {
+                root_sheet_uuid: None,
+                components: vec![component],
+                skipped: Vec::new(),
+                unassigned: Vec::new(),
+                net_names: BTreeSet::new(),
+            }
+        };
+        let board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
+
+        let unchanged = plan_sync("netlist", &keyed("10k"), &board);
+        assert_eq!(unchanged.status, PlanStatus::Noop, "{unchanged:#?}");
+        assert_eq!(unchanged.refused_updates, Vec::new());
+
+        let plan = plan_sync("netlist", &keyed("22k"), &board);
+        assert_eq!(plan.status, PlanStatus::Ready, "{plan:#?}");
+        assert_eq!(plan.diagnostics, Vec::new());
+        assert_eq!(plan.refused_updates, Vec::new());
+        assert_eq!(plan.counts.pads_reassigned.planned, 0);
+        let [PlannedChange::Update {
+            value, pad_nets, ..
+        }] = plan.changes.as_slice()
+        else {
+            panic!("one update: {:#?}", plan.changes);
+        };
+        assert_eq!(value, "22k");
+        assert_eq!(pad_nets, &board.footprints[0].pad_nets);
+    }
+
+    /// The netlist lists one UUID per unit of a multi-unit symbol, and a
+    /// footprint may be linked to any of them: KiCad's Update PCB matches it
+    /// by each. One linked to the second unit used to be taken for another
+    /// symbol's (`reference_identity_conflict`), which refused the plan.
+    #[test]
+    fn a_footprint_linked_to_a_later_unit_of_its_symbol_is_matched() {
+        let mut component = resistor("U1", "/sheet/unit-a");
+        component.other_unit_paths = vec!["/sheet/unit-b".to_string(), "/sheet/unit-e".to_string()];
+        component.value = "LM339".to_string();
+        let design = ExportedDesign {
+            root_sheet_uuid: None,
+            components: vec![component],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
+        };
+        let board = board_with(vec![board_resistor("U1", Some("/sheet/unit-b"))]);
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{plan:#?}");
+        assert_eq!(plan.diagnostics, Vec::new());
+        assert_eq!(plan.without_symbols, Vec::new());
+        let [PlannedChange::Update {
+            kiid,
+            value,
+            symbol_path,
+            ..
+        }] = plan.changes.as_slice()
+        else {
+            panic!("one update: {:#?}", plan.changes);
+        };
+        assert_eq!(kiid, "U1-kiid");
+        assert_eq!(value, "LM339");
+        // Its link is kept, as every matched footprint's is.
+        assert_eq!(symbol_path, "/sheet/unit-b");
+    }
+
+    /// Two footprints, each linked to a unit of one symbol, are not one
+    /// symbol's footprint: neither is picked, and the plan is refused with
+    /// both named.
+    #[test]
+    fn footprints_linked_to_two_units_of_one_symbol_are_a_conflict() {
+        let mut component = resistor("U1", "/sheet/unit-a");
+        component.other_unit_paths = vec!["/sheet/unit-b".to_string()];
+        let design = ExportedDesign {
+            root_sheet_uuid: None,
+            components: vec![component],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+            net_names: BTreeSet::new(),
+        };
+        let mut second = board_resistor("U2", Some("/sheet/unit-b"));
+        second.kiid = "U2-kiid".to_string();
+        let board = board_with(vec![board_resistor("U1", Some("/sheet/unit-a")), second]);
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert_eq!(plan.changes, Vec::new());
+        assert_eq!(plan.diagnostics.len(), 1, "{:#?}", plan.diagnostics);
+        assert_eq!(plan.diagnostics[0].code, "duplicate_board_identity");
+        assert_eq!(
+            plan.diagnostics[0].message,
+            "board footprints U1, U2 are each linked to a unit of U1"
+        );
+        // Neither is reported as a footprint whose symbol was removed.
+        assert_eq!(plan.without_symbols, Vec::new());
     }
 
     /// The pad set is every pad KiCad sent, netted or not. The 0402 from the
@@ -11034,6 +11454,204 @@ mod tests {
         let sent = served.sent_footprints();
         assert_eq!(sent.len(), 1);
         assert_eq!(field_text(&sent[0].reference_field), "C2");
+    }
+
+    /// The captured R1 (`schematic_backed_resistor`, pads 1 and 2) at `value`
+    /// on `footprint_id`, its pins 1 and 2 on VCC and GND, with `components`
+    /// and `nets` added to the export.
+    fn r1_netlist_with(value: &str, footprint_id: &str, components: &str, nets: &str) -> String {
+        format!(
+            r#"(export
+  (components
+    (comp (ref "R1") (value "{value}") (footprint "{footprint_id}")
+      (sheetpath (names "/Power/") (tstamps "/sheet-uuid/"))
+      (tstamps "symbol-uuid"))
+{components}  )
+  (nets
+    (net (code "1") (name "VCC") (class "Default")
+      (node (ref "R1") (pin "1") (pintype "passive")))
+    (net (code "2") (name "GND") (class "Default")
+      (node (ref "R1") (pin "2") (pintype "passive")))
+{nets}  ))
+"#
+        )
+    }
+
+    /// R1's pin 3 alone on its net, as KiCad exports a pin with a
+    /// no-connect flag.
+    const R1_PIN_3_NO_CONNECT: &str = r#"    (net (code "3") (name "unconnected-(R1-Pad3)") (class "Default")
+      (node (ref "R1") (pin "3") (pintype "passive+no_connect")))
+"#;
+
+    fn holding_r1() -> HeldBoard {
+        HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        }
+    }
+
+    /// A footprint on the board without a pad the schematic connects used to
+    /// refuse the whole plan, unlike an added part without one. It is
+    /// skipped now, as that part is, and everything else is applied.
+    #[tokio::test]
+    async fn a_board_footprint_missing_a_connected_pad_is_skipped_and_the_rest_applied() {
+        let served = ServedSync::holding(holding_r1()).await;
+        let netlist = r1_netlist_with(
+            "10k",
+            "Resistor_SMD:R_0402",
+            &format!(
+                r#"    (comp (ref "C1") (value "100n") (footprint "{STOCK_0603}")
+      (sheetpath (names "/") (tstamps "/"))
+      (tstamps "c1-uuid"))
+"#
+            ),
+            r#"    (net (code "3") (name "SENSE") (class "Default")
+      (node (ref "R1") (pin "3") (pintype "passive"))
+      (node (ref "C1") (pin "1") (pintype "passive")))
+    (net (code "4") (name "C1-2") (class "Default")
+      (node (ref "C1") (pin "2") (pintype "passive")))
+"#,
+        );
+
+        let plan = served.dry_run(&netlist).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["diagnostics"], serde_json::json!([]), "{plan:#}");
+        assert_eq!(plan["changes_count"], 1, "{plan:#}");
+        assert_eq!(plan["changes"][0]["kind"], "add", "{plan:#}");
+        assert_eq!(plan["changes"][0]["reference"], "C1", "{plan:#}");
+        assert_eq!(
+            plan["skipped_footprints"],
+            serde_json::json!([{
+                "code": "footprint_pad_missing",
+                "message": "the schematic connects R1 pad 3, which footprint Resistor_SMD:R_0402 does not have",
+                "reference": "R1",
+                "references": ["R1"],
+                "footprint_id": "Resistor_SMD:R_0402",
+            }]),
+            "{plan:#}"
+        );
+        assert_eq!(plan["coverage"]["skipped_footprint"]["planned"], 1);
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["skipped_footprints"], plan["skipped_footprints"]);
+        assert_eq!(served.sent("UpdateItems"), 0, "R1 is left as it is");
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(field_text(&sent[0].reference_field), "C1");
+    }
+
+    /// The real-board case: a keyed header's footprint has no pad at the
+    /// key, where the schematic's pin has a no-connect flag. The footprint is
+    /// updated, and the apply sets the nets of the pads it has.
+    #[tokio::test]
+    async fn a_keyed_board_footprint_is_updated_without_a_pad_at_its_key() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+        let served = ServedSync::holding(holding_r1()).await;
+        let netlist = r1_netlist_with("10k", "Resistor_SMD:R_0402", "", R1_PIN_3_NO_CONNECT);
+
+        let plan = served.dry_run(&netlist).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["diagnostics"], serde_json::json!([]), "{plan:#}");
+        assert_eq!(
+            plan["skipped_footprints"],
+            serde_json::json!([]),
+            "{plan:#}"
+        );
+        assert_eq!(plan["changes_count"], 1, "{plan:#}");
+        assert_eq!(plan["changes"][0]["kind"], "update", "{plan:#}");
+        assert_eq!(plan["changes"][0]["value"], "10k", "{plan:#}");
+        assert_eq!(
+            plan["changes"][0]["pad_nets"],
+            serde_json::json!({ "1": "VCC", "2": "GND" }),
+            "{plan:#}"
+        );
+        assert_eq!(
+            plan["coverage"]["pads_reassigned"]["planned"], 0,
+            "{plan:#}"
+        );
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        assert_eq!(field_text(&held.value_field), "10k");
+    }
+
+    /// An added footprint without a pad for a pin wired to nothing, which
+    /// KiCad puts alone on an `unconnected-…` net, is placed, not skipped.
+    #[tokio::test]
+    async fn an_added_footprint_needs_no_pad_for_a_pin_kicad_left_unconnected() {
+        let served = ServedSync::new().await;
+        let netlist = format!(
+            r#"(export
+  (components
+    (comp (ref "C1") (value "100n") (footprint "{STOCK_0603}")
+      (sheetpath (names "/") (tstamps "/"))
+      (tstamps "c1-uuid")))
+  (nets
+    (net (code "1") (name "VCC") (class "Default")
+      (node (ref "C1") (pin "1") (pintype "passive")))
+    (net (code "2") (name "GND") (class "Default")
+      (node (ref "C1") (pin "2") (pintype "passive")))
+    (net (code "3") (name "unconnected-(C1-Pad3)") (class "Default")
+      (node (ref "C1") (pin "3") (pintype "passive")))))
+"#
+        );
+
+        let plan = served.dry_run(&netlist).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            plan["skipped_footprints"],
+            serde_json::json!([]),
+            "{plan:#}"
+        );
+        assert_eq!(plan["changes"][0]["kind"], "add", "{plan:#}");
+        assert_eq!(
+            plan["changes"][0]["pad_nets"],
+            serde_json::json!({ "1": "VCC", "2": "GND" }),
+            "{plan:#}"
+        );
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(served.sent_footprints().len(), 1);
+    }
+
+    /// The same for a replacement: its new footprint needs no pad for a pin
+    /// KiCad left unconnected.
+    #[tokio::test]
+    async fn a_replacement_needs_no_pad_for_a_pin_kicad_left_unconnected() {
+        let served = ServedSync::holding(holding_r1()).await;
+        let netlist = r1_netlist_with("10k", STOCK_0603, "", R1_PIN_3_NO_CONNECT);
+
+        let plan = served.dry_run(&netlist).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            plan["skipped_footprints"],
+            serde_json::json!([]),
+            "{plan:#}"
+        );
+        assert_eq!(
+            plan["changes"][0]["replace_footprint"]["to"], STOCK_0603,
+            "{plan:#}"
+        );
+        assert_eq!(
+            plan["changes"][0]["pad_nets"],
+            serde_json::json!({ "1": "VCC", "2": "GND" }),
+            "{plan:#}"
+        );
+        // Pads 1 and 2 keep their nets, and the new footprint has no pad 3.
+        assert_eq!(
+            plan["coverage"]["pads_reassigned"]["planned"], 0,
+            "{plan:#}"
+        );
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
     }
 
     /// A refusal before any plan exists (saved hierarchy, netlist export, IPC
@@ -13261,6 +13879,7 @@ mod tests {
             dnp,
             exclude_from_bom: false,
             pad_nets: BTreeMap::new(),
+            unconnected_pins: BTreeSet::new(),
             position: Point { x: 10.0, y: 10.0 },
             fields: Vec::new(),
             sheet: SymbolSheet::default(),

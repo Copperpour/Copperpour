@@ -1,0 +1,618 @@
+(export
+	(version "E")
+	(design
+		(source "Z:\\git\\github\\Copperpour.wt\\pcb-sync-units\\crates\\copperpour-core\\tests\\fixtures\\pcb_sync_multi_unit_keyed_kicad10\\kk_sync.kicad_sch")
+		(date "2026-11-25T23:48:20")
+		(tool "Eeschema 10.0.8")
+		(sheet
+			(number "1")
+			(name "/")
+			(tstamps "/")
+			(title_block
+				(title)
+				(company)
+				(rev)
+				(date)
+				(source "kk_sync.kicad_sch")
+				(comment
+					(number "1")
+					(value "")
+				)
+				(comment
+					(number "2")
+					(value "")
+				)
+				(comment
+					(number "3")
+					(value "")
+				)
+				(comment
+					(number "4")
+					(value "")
+				)
+				(comment
+					(number "5")
+					(value "")
+				)
+				(comment
+					(number "6")
+					(value "")
+				)
+				(comment
+					(number "7")
+					(value "")
+				)
+				(comment
+					(number "8")
+					(value "")
+				)
+				(comment
+					(number "9")
+					(value "")
+				)
+			)
+		)
+	)
+	(components
+		(comp
+			(ref "P1")
+			(value "KK254_1x04_Keyed")
+			(footprint "kk:KK254_1x04_Keyed")
+			(description "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+			(fields
+				(field
+					(name "Footprint") "kk:KK254_1x04_Keyed")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+			)
+			(libsource
+				(lib "Connector_Generic")
+				(part "Conn_01x04")
+				(description "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+			)
+			(property
+				(name "Sheetname")
+				(value "kk_sync")
+			)
+			(property
+				(name "Sheetfile")
+				(value "kk_sync.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "connector")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "Connector*:*_1x??_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "d4cec7e0-14c0-4c0d-870e-7d993798495e")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "4")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R1")
+			(value "2k2")
+			(footprint "Resistor_SMD:R_0603_1608Metric")
+			(description "Resistor")
+			(fields
+				(field
+					(name "MPN") "RC0603FR-072K2L")
+				(field
+					(name "Footprint") "Resistor_SMD:R_0603_1608Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Resistor")
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "MPN")
+				(value "RC0603FR-072K2L")
+			)
+			(property
+				(name "Sheetname")
+				(value "kk_sync")
+			)
+			(property
+				(name "Sheetfile")
+				(value "kk_sync.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b02525a8-c2bc-45a0-921b-1045b83afa82")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U1")
+			(value "LM339")
+			(footprint "Package_DIP:DIP-14_W7.62mm")
+			(datasheet "https://www.st.com/resource/en/datasheet/lm139.pdf")
+			(description "Quad Differential Comparators, SOIC-14/TSSOP-14")
+			(fields
+				(field
+					(name "Footprint") "Package_DIP:DIP-14_W7.62mm")
+				(field
+					(name "Datasheet") "https://www.st.com/resource/en/datasheet/lm139.pdf")
+				(field
+					(name "Description") "Quad Differential Comparators, SOIC-14/TSSOP-14")
+			)
+			(libsource
+				(lib "Comparator")
+				(part "LM339")
+				(description "Quad Differential Comparators, SOIC-14/TSSOP-14")
+			)
+			(property
+				(name "Sheetname")
+				(value "kk_sync")
+			)
+			(property
+				(name "Sheetfile")
+				(value "kk_sync.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "cmp open collector")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "SOIC*3.9x8.7mm*P1.27mm* TSSOP*4.4x5mm*P0.65mm*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "d6286f98-cc91-4832-97c0-cec9c712e8d3" "ea566a33-6106-497d-ab3a-228e365858d7"
+				"1951944c-c6bb-40ae-8bca-507fb207334e"
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "5")
+						)
+						(pin
+							(num "4")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+				(unit
+					(name "B")
+					(pins
+						(pin
+							(num "7")
+						)
+						(pin
+							(num "6")
+						)
+						(pin
+							(num "1")
+						)
+					)
+				)
+				(unit
+					(name "C")
+					(pins
+						(pin
+							(num "11")
+						)
+						(pin
+							(num "10")
+						)
+						(pin
+							(num "13")
+						)
+					)
+				)
+				(unit
+					(name "D")
+					(pins
+						(pin
+							(num "9")
+						)
+						(pin
+							(num "8")
+						)
+						(pin
+							(num "14")
+						)
+					)
+				)
+				(unit
+					(name "E")
+					(pins
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "12")
+						)
+					)
+				)
+			)
+		)
+	)
+	(groups)
+	(variants)
+	(libparts
+		(libpart
+			(lib "Comparator")
+			(part "LM339")
+			(description "Quad Differential Comparators, SOIC-14/TSSOP-14")
+			(docs "https://www.st.com/resource/en/datasheet/lm139.pdf")
+			(footprints
+				(fp "SOIC*3.9x8.7mm*P1.27mm*")
+				(fp "TSSOP*4.4x5mm*P0.65mm*")
+			)
+			(fields
+				(field
+					(name "Reference") "U")
+				(field
+					(name "Value") "LM339")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://www.st.com/resource/en/datasheet/lm139.pdf")
+				(field
+					(name "Description") "Quad Differential Comparators, SOIC-14/TSSOP-14")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "open_collector")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "open_collector")
+				)
+				(pin
+					(num "3")
+					(name "V+")
+					(type "power_in")
+				)
+				(pin
+					(num "4")
+					(name "-")
+					(type "input")
+				)
+				(pin
+					(num "5")
+					(name "+")
+					(type "input")
+				)
+				(pin
+					(num "6")
+					(name "-")
+					(type "input")
+				)
+				(pin
+					(num "7")
+					(name "+")
+					(type "input")
+				)
+				(pin
+					(num "8")
+					(name "-")
+					(type "input")
+				)
+				(pin
+					(num "9")
+					(name "+")
+					(type "input")
+				)
+				(pin
+					(num "10")
+					(name "-")
+					(type "input")
+				)
+				(pin
+					(num "11")
+					(name "+")
+					(type "input")
+				)
+				(pin
+					(num "12")
+					(name "V-")
+					(type "power_in")
+				)
+				(pin
+					(num "13")
+					(name "")
+					(type "open_collector")
+				)
+				(pin
+					(num "14")
+					(name "")
+					(type "open_collector")
+				)
+			)
+		)
+		(libpart
+			(lib "Connector_Generic")
+			(part "Conn_01x04")
+			(description "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+			(footprints
+				(fp "Connector*:*_1x??_*")
+			)
+			(fields
+				(field
+					(name "Reference") "J")
+				(field
+					(name "Value") "Conn_01x04")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "Pin_1")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "Pin_2")
+					(type "passive")
+				)
+				(pin
+					(num "3")
+					(name "Pin_3")
+					(type "passive")
+				)
+				(pin
+					(num "4")
+					(name "Pin_4")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "Device")
+			(part "R")
+			(description "Resistor")
+			(footprints
+				(fp "R_*")
+			)
+			(fields
+				(field
+					(name "Reference") "R")
+				(field
+					(name "Value") "R")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Resistor")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "passive")
+				)
+			)
+		)
+	)
+	(libraries
+		(library
+			(logical "Comparator")
+			(uri "${KICAD10_SYMBOL_DIR}/Comparator.kicad_sym")
+		)
+		(library
+			(logical "Connector_Generic")
+			(uri "${KICAD10_SYMBOL_DIR}/Connector_Generic.kicad_sym")
+		)
+		(library
+			(logical "Device")
+			(uri "${KICAD10_SYMBOL_DIR}/Device.kicad_sym")
+		)
+	)
+	(nets
+		(net
+			(code "1")
+			(name "Net-(P1-Pin_1)")
+			(class "Default")
+			(node
+				(ref "P1")
+				(pin "1")
+				(pinfunction "Pin_1_1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R1")
+				(pin "2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "2")
+			(name "Net-(P1-Pin_3)")
+			(class "Default")
+			(node
+				(ref "P1")
+				(pin "3")
+				(pinfunction "Pin_3_3")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "4")
+				(pinfunction "-_4")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "3")
+			(name "Net-(R1-Pad1)")
+			(class "Default")
+			(node
+				(ref "R1")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "2")
+				(pintype "open_collector")
+			)
+		)
+		(net
+			(code "4")
+			(name "unconnected-(P1-Pin_2-Pad2)")
+			(class "Default")
+			(node
+				(ref "P1")
+				(pin "2")
+				(pinfunction "Pin_2_2")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "5")
+			(name "unconnected-(P1-Pin_4-Pad4)")
+			(class "Default")
+			(node
+				(ref "P1")
+				(pin "4")
+				(pinfunction "Pin_4_4")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "6")
+			(name "unconnected-(U1-Pad1)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "1")
+				(pintype "open_collector")
+			)
+		)
+		(net
+			(code "7")
+			(name "unconnected-(U1A-+-Pad5)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "5")
+				(pinfunction "+_5")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "8")
+			(name "unconnected-(U1B-+-Pad7)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "7")
+				(pinfunction "+_7")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "9")
+			(name "unconnected-(U1B---Pad6)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "6")
+				(pinfunction "-_6")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "10")
+			(name "unconnected-(U1E-V+-Pad3)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "3")
+				(pinfunction "V+_3")
+				(pintype "power_in")
+			)
+		)
+		(net
+			(code "11")
+			(name "unconnected-(U1E-V--Pad12)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "12")
+				(pinfunction "V-_12")
+				(pintype "power_in")
+			)
+		)
+	)
+)
