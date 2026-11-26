@@ -94,6 +94,7 @@ pub(crate) mod sch_annotate;
 pub mod sch_batch;
 mod sch_block_move;
 pub mod sch_bus;
+mod sch_cleanup;
 pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;

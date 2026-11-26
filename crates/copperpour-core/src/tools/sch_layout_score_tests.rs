@@ -153,6 +153,32 @@ async fn single_saved_score_and_gateway_report_the_same_read_only_result() {
     assert_eq!(result["not_compared"], json!([]));
 }
 
+#[tokio::test]
+async fn the_near_miss_fixture_retains_its_legacy_connectivity_answers() {
+    let handler = handler().await;
+    let connected = Sheet::input(CROWDED);
+    let near_miss = connected.fork();
+    let source = fs::read_to_string(&near_miss.path).unwrap();
+    assert_eq!(source.matches("(xy 63.5 105.41)").count(), 1);
+    fs::write(
+        &near_miss.path,
+        source.replacen("(xy 63.5 105.41)", "(xy 63.5004 105.41)", 1),
+    )
+    .unwrap();
+
+    // The existing comparator treats the two endpoints as coincident.
+    // Cleanup must use finer precision without changing that answer.
+    let report = compare(&handler, &near_miss, &connected, &[]).await;
+    assert_eq!(report["reasons"], json!([]), "{report}");
+    assert_eq!(report["delta"]["diagonal_wires"], -1, "{report}");
+
+    let before = near_miss.files();
+    let report = ok(&handler, &near_miss, "find_pin_contacts", json!({})).await;
+    assert_eq!(report["contact_count"], 7, "{report}");
+    assert_eq!(report["short_wires"], json!([]), "{report}");
+    assert_eq!(near_miss.files(), before);
+}
+
 async fn direct_lanes_with_clear_fields(handler: &McpHandler, crossed: &Sheet) -> Sheet {
     let clear = crossed.fork();
     ok(

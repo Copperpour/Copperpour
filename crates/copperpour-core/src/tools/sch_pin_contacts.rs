@@ -300,7 +300,7 @@ fn diagonal(wire: &Wire) -> bool {
         && (wire.y2 - wire.y1).abs() >= COINCIDENT_TOLERANCE
 }
 
-fn touches(at: Point, wire: &Wire) -> bool {
+pub(super) fn touches(at: Point, wire: &Wire) -> bool {
     if diagonal(wire) {
         // The shared axis-aligned wire index does not cover diagonals.
         let (dx, dy) = (wire.x2 - wire.x1, wire.y2 - wire.y1);
@@ -320,7 +320,7 @@ fn touches(at: Point, wire: &Wire) -> bool {
     }
 }
 
-fn touches_interior(at: Point, wire: &Wire) -> bool {
+pub(super) fn touches_interior(at: Point, wire: &Wire) -> bool {
     let key = pt_key(at.0, at.1);
     if key == pt_key(wire.x1, wire.y1) || key == pt_key(wire.x2, wire.y2) {
         return false;
@@ -330,15 +330,16 @@ fn touches_interior(at: Point, wire: &Wire) -> bool {
     along > 0.0 && along < dx * dx + dy * dy && touches(at, wire)
 }
 
-fn short_pin_wires(
+pub(super) struct WireChain {
+    pub(super) ends: [Point; 2],
+    pub(super) indices: Vec<usize>,
+}
+
+pub(super) fn wire_chains(
     index: &ConnectivityIndex<'_>,
     wires: &[Wire],
-    directives: &[Directive<'_>],
-    min_wire_mm: f64,
-) -> Vec<Value> {
-    if min_wire_mm == 0.0 {
-        return Vec::new();
-    }
+    additional_attachment: impl Fn(Point) -> bool,
+) -> Vec<WireChain> {
     let ends: Vec<_> = wires
         .iter()
         .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
@@ -356,7 +357,7 @@ fn short_pin_wires(
         if a / 2 != b / 2
             && [ends[a], ends[b]].into_iter().all(|at| {
                 !index.wire_run_joint_has_attachment(at.0, at.1)
-                    && !directives.iter().any(|directive| near(at, directive.at))
+                    && !additional_attachment(at)
                     && !diagonals.iter().any(|wire| touches_interior(at, wire))
             })
         {
@@ -364,28 +365,15 @@ fn short_pin_wires(
             neighbors[b] = Some(a);
         }
     }
-    let pins = index.placed_pins();
-    let terminals_at = |at: Point| {
-        let mut terminals: Vec<_> = index.wire_run_pins_at(at.0, at.1).collect();
-        terminals.sort_unstable();
-        terminals
-    };
-    let mut short = Vec::new();
+    let mut chains = Vec::new();
     for (start, &at) in ends.iter().enumerate() {
         if neighbors[start].is_some() {
             continue;
         }
-        let start_pins = terminals_at(at);
-        if start_pins.is_empty() {
-            continue;
-        }
         let mut run = Vec::new();
-        let mut length_mm = 0.0;
         let mut end = start;
         loop {
-            let wire = &wires[end / 2];
-            run.push(wire);
-            length_mm += (wire.x2 - wire.x1).hypot(wire.y2 - wire.y1);
+            run.push(end / 2);
             let other_end = end ^ 1;
             match neighbors[other_end] {
                 Some(next) => end = next,
@@ -395,32 +383,72 @@ fn short_pin_wires(
                 }
             }
         }
-        // Sheet order fixes run direction and reports a run only once.
-        // Use KiCad's saved precision so a 2.54 mm wire does not round below the minimum.
-        let length_mm = round6(length_mm);
-        if end <= start || length_mm >= min_wire_mm {
+        if end > start {
+            chains.push(WireChain {
+                ends: [at, ends[end]],
+                indices: run,
+            });
+        }
+    }
+    chains
+}
+
+fn short_pin_wires(
+    index: &ConnectivityIndex<'_>,
+    wires: &[Wire],
+    directives: &[Directive<'_>],
+    min_wire_mm: f64,
+) -> Vec<Value> {
+    if min_wire_mm == 0.0 {
+        return Vec::new();
+    }
+    let pins = index.placed_pins();
+    let terminals_at = |at: Point| {
+        let mut terminals: Vec<_> = index.wire_run_pins_at(at.0, at.1).collect();
+        terminals.sort_unstable();
+        terminals
+    };
+    let mut short = Vec::new();
+    for chain in wire_chains(index, wires, |at| {
+        directives.iter().any(|directive| near(at, directive.at))
+    }) {
+        let [at, end] = chain.ends;
+        let start_pins = terminals_at(at);
+        let end_pins = terminals_at(end);
+        if !spans_symbols(pins, &start_pins, &end_pins) {
             continue;
         }
-        let end_pins = terminals_at(ends[end]);
-        if spans_symbols(pins, &start_pins, &end_pins)
-            && !run.iter().any(|wire| {
-                index.junctions().any(|at| touches_interior(at, wire))
-                    || directives
-                        .iter()
-                        .any(|directive| touches_interior(directive.at, wire))
-                    || index
-                        .labels()
-                        .iter()
-                        .any(|label| touches_interior((label.x, label.y), wire))
-            })
-        {
+        let run = chain
+            .indices
+            .into_iter()
+            .map(|i| &wires[i])
+            .collect::<Vec<_>>();
+        let length_mm: f64 = run
+            .iter()
+            .map(|wire| (wire.x2 - wire.x1).hypot(wire.y2 - wire.y1))
+            .sum();
+        // Use KiCad's saved precision so a 2.54 mm wire does not round below the minimum.
+        let length_mm = round6(length_mm);
+        if length_mm >= min_wire_mm {
+            continue;
+        }
+        if !run.iter().any(|wire| {
+            index.junctions().any(|at| touches_interior(at, wire))
+                || directives
+                    .iter()
+                    .any(|directive| touches_interior(directive.at, wire))
+                || index
+                    .labels()
+                    .iter()
+                    .any(|label| touches_interior((label.x, label.y), wire))
+        }) {
             let wire_uuids: Vec<_> = run.into_iter().map(|wire| wire.uuid.as_deref()).collect();
             short.push(json!({
                 "kind": "short_pin_wire",
                 "length_mm": length_mm,
                 "wire_uuids": wire_uuids,
                 "start": {"point": point(at), "pins": start_pins.iter().map(|&i| pin_info(&pins[i])).collect::<Vec<_>>()},
-                "end": {"point": point(ends[end]), "pins": end_pins.iter().map(|&i| pin_info(&pins[i])).collect::<Vec<_>>()},
+                "end": {"point": point(end), "pins": end_pins.iter().map(|&i| pin_info(&pins[i])).collect::<Vec<_>>()},
             }));
         }
     }

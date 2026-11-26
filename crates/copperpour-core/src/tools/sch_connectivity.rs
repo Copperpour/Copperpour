@@ -32,7 +32,7 @@
 //! names cannot drift from the three that ask about attachment.
 
 use copperpour_sexp::{
-    geometry::{point_on_segment, points_coincident},
+    geometry::{point_on_segment, points_coincident, PinTransform},
     schematic::{
         extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
         pin_endpoint, wire_end_needs_junction, Label, LabelKind, LibPin, SymbolInstance, Wire,
@@ -215,6 +215,41 @@ pub(crate) fn pt_key(x: f64, y: f64) -> (i64, i64) {
     ((x * 1000.0).round() as i64, (y * 1000.0).round() as i64)
 }
 
+/// KiCad's schematic coordinates, not the coarser lookup keys used by the
+/// inspection tools. `parseInternalUnits` rounds to 10,000 IU per mm.
+pub(super) fn schematic_point(x: f64, y: f64) -> (i64, i64) {
+    const IU_PER_MM: f64 = 10_000.0;
+    // KiCad uses the decimal 0.7071, not the exact reciprocal square root.
+    const LIMIT: f64 = i32::MAX as f64 * (7071.0 / 10_000.0);
+    let coordinate = |mm: f64| (mm * IU_PER_MM).clamp(-LIMIT, LIMIT).round() as i64;
+    (coordinate(x), coordinate(y))
+}
+
+fn schematic_mm((x, y): (i64, i64)) -> (f64, f64) {
+    (x as f64 / 10_000.0, y as f64 / 10_000.0)
+}
+
+/// KiCad parses the placed origin and the library pin into integer schematic
+/// units before applying the symbol transform.
+pub(super) fn schematic_pin_endpoint(pin: &LibPin, mut transform: PinTransform) -> (f64, f64) {
+    (transform.comp_x, transform.comp_y) =
+        schematic_mm(schematic_point(transform.comp_x, transform.comp_y));
+    let (x, y) = schematic_mm(schematic_point(pin.local_x, pin.local_y));
+    copperpour_sexp::geometry::transform_pin(x, y, transform)
+}
+
+/// Electrical contact with the drawn wire rather than a geometric proximity hit.
+pub(super) fn schematic_point_on_wire(at: (f64, f64), wire: &Wire) -> bool {
+    let p = schematic_point(at.0, at.1);
+    let a = schematic_point(wire.x1, wire.y1);
+    let b = schematic_point(wire.x2, wire.y2);
+    let between = |p: i64, a: i64, b: i64| (a.min(b)..=a.max(b)).contains(&p);
+    between(p.0, a.0, b.0)
+        && between(p.1, a.1, b.1)
+        && i128::from(p.0 - a.0) * i128::from(b.1 - a.1)
+            == i128::from(p.1 - a.1) * i128::from(b.0 - a.0)
+}
+
 /// A name a label puts on a point, with the kind of label that put it there.
 ///
 /// The kind is what makes [`NetGraph::name_of_root`] deterministic: one net can
@@ -268,6 +303,7 @@ pub(super) type ScopedNetName = (String, u8);
 #[derive(Clone)]
 pub(crate) struct NetGraph {
     point_key: fn(f64, f64) -> NetRoot,
+    pin_endpoint: fn(&LibPin, PinTransform) -> (f64, f64),
     /// Every name at a point, not just the winning one. A rail label written
     /// over the power symbol that names it puts two names on one coordinate,
     /// and dropping the loser would keep it out of
@@ -287,6 +323,7 @@ impl NetGraph {
     fn new(point_key: fn(f64, f64) -> NetRoot) -> Self {
         NetGraph {
             point_key,
+            pin_endpoint,
             point_nets: HashMap::new(),
             parent: HashMap::new(),
             root_names: HashMap::new(),
@@ -298,6 +335,10 @@ impl NetGraph {
         self.merge_named_nets();
         self.name_nets();
         self
+    }
+
+    pub(super) fn pin_position(&self, pin: &LibPin, transform: PinTransform) -> (f64, f64) {
+        (self.pin_endpoint)(pin, transform)
     }
 
     fn ensure(&mut self, k: (i64, i64)) {
@@ -695,21 +736,58 @@ pub(super) fn add_symbol_power_drivers<'a>(
 /// Power drivers name their pin's node without attaching it to a wire that
 /// crosses the pin without a junction.
 pub(super) fn snapshot_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
+    snapshot_graph(tree, wires, false)
+}
+
+pub(super) fn cleanup_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
+    snapshot_graph(tree, wires, true)
+}
+
+/// Cleanup's electrical graph uses saved schematic units for both keyed
+/// endpoints and drawn attachments, including those along diagonal wires.
+pub(super) fn exact_drawn_net_graph(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
+    let mut graph = seed_drawn_graph_with(
+        wires,
+        labels,
+        &extract_junctions(tree),
+        &extract_sheet_pins(tree),
+        schematic_point,
+        |graph, x, y, _| {
+            for wire in wires.iter().filter(|w| schematic_point_on_wire((x, y), w)) {
+                graph.union(schematic_point(x, y), schematic_point(wire.x1, wire.y1));
+            }
+        },
+    );
+    graph.pin_endpoint = schematic_pin_endpoint;
+    graph
+}
+
+fn snapshot_graph(tree: &SexpNode, wires: &[Wire], exact: bool) -> NetGraph {
     use copperpour_sexp::schematic::{extract_labels, find_lib_symbol};
 
     let labels = extract_labels(tree);
-    let mut graph = drawn_net_graph_for(tree, wires, &labels);
+    let mut graph = if exact {
+        exact_drawn_net_graph(tree, wires, &labels)
+    } else {
+        drawn_net_graph_for(tree, wires, &labels)
+    };
     let lib_symbols = tree
         .find("lib_symbols")
         .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
-    for (inst, pins) in crate::tools::placed_pins_by_reference(tree) {
+    let placed = if exact {
+        super::drawn_symbol_pins(tree).unwrap_or_default()
+    } else {
+        super::placed_pins_by_reference(tree)
+    };
+    let pin_endpoint = graph.pin_endpoint;
+    for (inst, pins) in placed {
         let Some(lib) = find_lib_symbol(&lib_symbols, &inst) else {
             continue;
         };
         let power = match SymbolPower::from_library(lib) {
             // The snapshot historically identified local symbols by UUID.
-            SymbolPower::Local if inst.uuid.is_none() => SymbolPower::Global,
+            SymbolPower::Local if !exact && inst.uuid.is_none() => SymbolPower::Global,
             power => power,
         };
         add_symbol_power_drivers(
@@ -1033,7 +1111,7 @@ impl PinNetNames {
                             && (other.electrical_type == "no_connect") == no_connect
                     })
                 };
-                let (x, y) = pin_endpoint(pin, t);
+                let (x, y) = graph.pin_position(pin, t);
                 drivers
                     .entry(graph.root_at(x, y))
                     .or_default()
