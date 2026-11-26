@@ -19,10 +19,10 @@ An omitted, null, or empty list checks zero pairs.
 `alignment_pair_count` counts the pairs checked. `misaligned_pairs` lists only
 mismatches in request order, with a zero-based `pair_index`, the expected
 `alignment`, the absolute perpendicular `offset_mm`, and both resolved pins.
-An omitted or malformed required selector field or identical selectors return
-`invalid_argument` with the indexed field. A valid selector that names no
-placed symbol or pin returns `stale_target`. A duplicate symbol UUID or a pin
-number with more than one placed endpoint returns `ambiguous_target` with
+An omitted or malformed required selector field, an unknown pin number on a
+resolved symbol, or identical selectors return `invalid_argument` with the indexed
+field. A valid UUID that names no placed symbol returns `stale_target`. A
+duplicate symbol UUID or a pin number with multiple placed endpoints returns `ambiguous_target` with
 the matching identities and positions. Target errors name the indexed selector
 in `target`. The entire call is refused without choosing a match.
 

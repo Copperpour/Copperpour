@@ -180,7 +180,7 @@ fn pair_pin<'a, 'sheet>(
             && pin.number == selector.pin_number
     });
     let Some(pin) = matching.next() else {
-        return Err(stale_pin(number, "pin not found on the placed symbol"));
+        return Err(invalid_arg(&number, "pin not found on the placed symbol"));
     };
     if let Some(second) = matching.next() {
         let candidates = [pin, second]

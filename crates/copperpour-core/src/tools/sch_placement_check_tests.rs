@@ -189,50 +189,61 @@ async fn alignment_counts_one_internal_unit_of_displacement() {
 }
 
 #[tokio::test]
-async fn missing_and_invalid_pairs_refuse_the_whole_call() {
+async fn missing_symbol_refuses_the_whole_call_as_stale() {
     let sheet = Sheet::new("power_on_pin_kicad10.kicad_sch", PIN_UNITS).await;
     let valid = pair((R1, "1"), (R3, "1"), "row");
-    for (bad_pair, kind, key, field) in [
-        (
-            pair(
-                (R1, "1"),
-                ("00000000-0000-4000-8000-000000000001", "1"),
-                "row",
-            ),
-            "stale_target",
-            "target",
-            "alignment_pairs[1].b.symbol_uuid",
-        ),
+    let missing = pair(
+        (R1, "1"),
+        ("00000000-0000-4000-8000-000000000001", "1"),
+        "row",
+    );
+    let body = sheet
+        .error_with(json!({"alignment_pairs": [valid, missing]}))
+        .await;
+    assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+    assert_eq!(body["error"]["target"], "alignment_pairs[1].b.symbol_uuid");
+    assert_eq!(
+        body["error"]["reason"],
+        "symbol UUID not found on the saved sheet"
+    );
+    assert!(body.get("misaligned_pairs").is_none(), "{body}");
+    assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), PIN_UNITS);
+}
+
+#[tokio::test]
+async fn bad_pin_numbers_and_malformed_pairs_are_invalid_arguments() {
+    let sheet = Sheet::new("power_on_pin_kicad10.kicad_sch", PIN_UNITS).await;
+    let valid = pair((R1, "1"), (R3, "1"), "row");
+    for (bad_pair, field, reason) in [
         (
             pair((R1, "9"), (R3, "1"), "row"),
-            "stale_target",
-            "target",
             "alignment_pairs[1].a.pin_number",
+            Some("pin not found on the placed symbol"),
         ),
         (
             pair((R1, "1"), (R1, "1"), "row"),
-            "invalid_argument",
-            "field",
             "alignment_pairs[1]",
+            None,
         ),
         (
             pair((R1, "1"), (R3, "1"), "diagonal"),
-            "invalid_argument",
-            "field",
             "alignment_pairs[1].alignment",
+            None,
         ),
         (
             pair((R1, "1"), ("R3", "1"), "row"),
-            "invalid_argument",
-            "field",
             "alignment_pairs[1].b.symbol_uuid",
+            Some("expected a saved symbol UUID"),
         ),
     ] {
         let body = sheet
             .error_with(json!({"alignment_pairs": [valid, bad_pair]}))
             .await;
-        assert_eq!(body["error"]["kind"], kind, "{body}");
-        assert_eq!(body["error"][key], field, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], field, "{body}");
+        if let Some(reason) = reason {
+            assert_eq!(body["error"]["reason"], reason, "{body}");
+        }
         assert!(body.get("misaligned_pairs").is_none(), "{body}");
     }
     assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), PIN_UNITS);
