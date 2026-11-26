@@ -59,7 +59,10 @@ pub(super) fn compare_tool_def() -> ToolDef {
         "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
          Counts wires crossing visible Reference or Value text on ordinary symbols \
          and wires crossing drawn pin names or numbers. \
-         Check pin connectivity and symbol identity before ranking layout changes. \
+         Check pin connectivity, symbol identity, and saved PCB/BOM fields and flags, \
+         including variants and child-sheet instances, before ranking layout changes. \
+         Refuse changes that could affect unresolved rule areas or exported text expressions. \
+         Use verdict for decisions; reasons are human-readable diagnostics. \
          No writes, editor access, or ERC.",
         json!({ "type": "object",
             "properties": {

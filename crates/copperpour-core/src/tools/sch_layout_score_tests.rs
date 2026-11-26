@@ -15,6 +15,9 @@ const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";
 const DIRECT_LANES: &str = "direct_lanes_kicad10/direct_lanes.kicad_sch";
 const TOOL: &str = "compare_schematic_layout";
 
+#[path = "sch_layout_properties_tests.rs"]
+mod properties;
+
 #[tokio::test]
 async fn only_preview_comparison_excludes_mandatory_lead_length() {
     let handler = handler().await;
