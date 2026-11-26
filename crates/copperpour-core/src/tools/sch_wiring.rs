@@ -3482,8 +3482,10 @@ fn add_power_symbol_to(
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.
     // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
-    // #PWR piles up in the top-left corner. Hide Reference like eeschema does
-    // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
+    // #PWR piles up in the top-left corner. Each field's visibility is copied
+    // from the library, as eeschema does (#853); a library that omits a field
+    // falls back to the default a power symbol has always had: Reference
+    // hidden, the rest of the metadata fields hidden, Value shown.
     //
     // The library anchors matter most here: GND anchors Value below the
     // graphic but VCC/+5V/+3V3 anchor it above, so one fixed offset cannot
@@ -3502,13 +3504,16 @@ fn add_power_symbol_to(
         crate::tools::field_at(anchors.value_at, crate::tools::FALLBACK_VALUE_AT, t);
     let positioned = crate::tools::positioned_property;
     let centred = cse::library::FieldJustify::default();
+    let hidden_in_library = |name: &str, default: bool| {
+        cse::library::field_hidden(sch, lib_id, name).unwrap_or(default)
+    };
     sym.properties.push(positioned(
         "Reference",
         &pwr_ref,
         ref_x,
         ref_y,
         ref_rot,
-        true,
+        hidden_in_library("Reference", true),
         anchors.reference_justify,
     ));
     sym.properties.push(positioned(
@@ -3517,7 +3522,7 @@ fn add_power_symbol_to(
         val_x,
         val_y,
         val_rot,
-        false,
+        hidden_in_library("Value", false),
         anchors.value_justify,
     ));
     sym.properties.push(positioned(
@@ -3526,7 +3531,7 @@ fn add_power_symbol_to(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Footprint", true),
         centred,
     ));
     sym.properties.push(positioned(
@@ -3535,7 +3540,7 @@ fn add_power_symbol_to(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Datasheet", true),
         centred,
     ));
     sym.properties.push(positioned(
@@ -3544,7 +3549,7 @@ fn add_power_symbol_to(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Description", true),
         centred,
     ));
 

@@ -1772,6 +1772,82 @@ async fn add_schematic_component_hides_power_reference() {
     );
 }
 
+/// Field visibility comes from the library definition, not from the `power:`
+/// prefix (#853): a logo whose library hides Reference and Value is placed
+/// hidden, a non-power `PWR_FLAG` keeps its library-hidden Reference hidden,
+/// and a library that shows Value keeps it shown.
+#[tokio::test]
+async fn add_schematic_component_takes_field_visibility_from_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("visibility-from-library.kicad_sch");
+    std::fs::write(
+        &path,
+        "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Graphic:Logo_Open_Hardware_Small\"\n      (property \"Reference\" \"#SYM\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"Logo_Open_Hardware_Small\" (at 0 0 0) (hide yes))\n    )\n    (symbol \"MyPower:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"PWR_FLAG\" (at 0 0 0))\n    )\n  )\n)\n",
+    )
+    .unwrap();
+
+    for (lib_id, reference) in [
+        ("Graphic:Logo_Open_Hardware_Small", "#SYM1"),
+        ("MyPower:PWR_FLAG", "#FLG02"),
+    ] {
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": lib_id,
+                "x": 50.0,
+                "y": 60.0,
+                "reference": reference
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+    }
+
+    let sch = cse::Schematic::load(&path).unwrap();
+    let field_sexp = |sym: &cse::Symbol, name: &str| {
+        cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .to_sexp(),
+        )
+    };
+    let logo = sch
+        .symbols
+        .iter()
+        .find(|s| s.reference() == Some("#SYM1"))
+        .expect("logo instance");
+    assert!(
+        field_sexp(logo, "Reference").contains("(hide yes)"),
+        "the library hides the logo Reference, so the placed Reference must be hidden: {}",
+        field_sexp(logo, "Reference")
+    );
+    assert!(
+        field_sexp(logo, "Value").contains("(hide yes)"),
+        "the library hides the logo Value, so the placed Value must be hidden: {}",
+        field_sexp(logo, "Value")
+    );
+
+    let flag = sch
+        .symbols
+        .iter()
+        .find(|s| s.reference() == Some("#FLG02"))
+        .expect("PWR_FLAG instance");
+    assert!(
+        field_sexp(flag, "Reference").contains("(hide yes)"),
+        "the library hides the PWR_FLAG Reference, so the placed Reference must be hidden: {}",
+        field_sexp(flag, "Reference")
+    );
+    assert!(
+        !field_sexp(flag, "Value").contains("hide"),
+        "the library shows the PWR_FLAG Value, so it must stay shown: {}",
+        field_sexp(flag, "Value")
+    );
+}
+
 /// A schematic keeps its own copy of every symbol, so editing the library
 /// leaves the sheet drawing the old shape — what KiCad reports as
 /// "doesn't match copy in library".
