@@ -222,9 +222,12 @@ Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
 
 **At startup** Copperpour resolves it in order: the `ipc_address` in your
 config, then `KICAD_API_SOCKET` (set only for plugins KiCad launches itself),
-then the platform default — `<temp dir>/kicad/api.sock` and, on Linux and
-macOS, any `api-<pid>.sock` beside it whose process is running. The startup log
-on stderr says which it picked, and warns when nothing was found.
+then the platform default — `<temp dir>/kicad/api.sock` and any
+`api-<pid>.sock` beside it (live-PID sockets on Linux and macOS; live named
+pipes in `\\.\pipe` on Windows, though KiCad 10.0.8 on Windows does not yet
+bind a fallback `api-<pid>.sock` pipe when another KiCad holds `api.sock`).
+The startup log on stderr says which it picked, and warns when nothing was
+found.
 
 When the address came from that probe, or nothing was found, Copperpour probes
 again on every IPC call. So the order in which the AI client and KiCad start no
