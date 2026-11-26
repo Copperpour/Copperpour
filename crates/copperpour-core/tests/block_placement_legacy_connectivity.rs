@@ -11,7 +11,7 @@ async fn the_offset_label_retains_its_legacy_connectivity_answers() {
     let (sheet, _) = OPAMP.trim_end().rsplit_once(')').unwrap();
     // This is the output trunk between U1.1 and J2.1. The preview must
     // distinguish a 0.001 mm near-miss, but the existing tools use their
-    // legacy 0.01 mm attachment tolerance.
+    // legacy 0.01 mm attachment tolerance, pending #901.
     let sheet = format!(
         r#"{sheet}
         (label "TOLERANT_OUT" (at 165.1 88.901 90)

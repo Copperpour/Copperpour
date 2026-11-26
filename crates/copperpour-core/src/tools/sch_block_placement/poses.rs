@@ -106,6 +106,7 @@ impl Pose {
 }
 
 pub(super) fn set_at(node: &mut SexpNode, (x, y, rotation): (f64, f64, f64)) -> Option<()> {
+    let has_rotation = node.head() != Some("no_connect");
     let SexpNode::List(children) = node else {
         return None;
     };
@@ -114,8 +115,9 @@ pub(super) fn set_at(node: &mut SexpNode, (x, y, rotation): (f64, f64, f64)) -> 
     };
     at.truncate(1);
     at.extend(
-        [x, y, rotation]
+        [x, y]
             .into_iter()
+            .chain(has_rotation.then_some(rotation))
             .map(|n| SexpNode::Atom(round6(n).to_string())),
     );
     Some(())

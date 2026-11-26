@@ -203,6 +203,401 @@ impl Sheet {
     }
 }
 
+fn by_reference<'a, 's>(inventory: &'s Inventory<'a>, reference: &str) -> &'s Part<'a> {
+    inventory
+        .parts
+        .values()
+        .find(|part| part.inst.reference == reference)
+        .unwrap()
+}
+
+fn push_wire(items: &mut Vec<SexpNode>, (x1, y1): inventory::Point, (x2, y2): inventory::Point) {
+    items.push(parse_sexp(&format_wire(x1, y1, x2, y2)).unwrap());
+}
+
+fn isolate_symbols(tree: &SexpNode, keep: &[&str]) -> SexpNode {
+    let mut tree = tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    items.retain(|item| match item.head() {
+        Some("symbol") => item.find_str("uuid").is_some_and(|id| keep.contains(&id)),
+        Some("wire" | "junction") => false,
+        _ => true,
+    });
+    tree
+}
+
+#[tokio::test]
+async fn preview_carries_the_moved_connectors_no_connect() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let anchor = by_reference(&inventory, "U1");
+    let connector = by_reference(&inventory, "J2");
+    let spare = connector.pin("2").unwrap();
+    let marker = "77600000-0000-4000-8000-000000000012";
+    let (x, y) = spare.tip;
+    let mut tree = isolate_symbols(&sheet.tree, &[anchor.id.uuid, connector.id.uuid]);
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    push_wire(
+        items,
+        anchor.pin("1").unwrap().tip,
+        connector.pin("1").unwrap().tip,
+    );
+    items.push(parse_sexp(&format!(r#"(no_connect (at {x} {y}) (uuid "{marker}"))"#)).unwrap());
+    let sheet = sheet.with_tree(tree);
+    let connector = sheet.id("J2");
+    let args = json!({
+        "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [],
+        "connectors": [{"connector": connector, "connector_pin": "1", "port": sheet.id("U1"), "port_pin": "1"}]
+    });
+    let report = sheet.serve(args.clone()).await;
+    assert_eq!(report["status"], "improved", "{report}");
+    let pose = report["plan"]["poses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pose| pose["uuid"] == connector["uuid"])
+        .unwrap();
+    let next = step(
+        (pose["x"].as_f64().unwrap(), pose["y"].as_f64().unwrap()),
+        (-2.0, 1.0),
+        2.54,
+    );
+    assert_ne!((x, y), next);
+    assert_eq!(
+        report["plan"]["no_connect_moves"],
+        json!([{"uuid": marker, "x": next.0, "y": next.1}])
+    );
+
+    // Inspect the actual candidate, not the test replayer (which also calls set_at).
+    let request = Request::parse(&args).unwrap();
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let labels = extract_labels(&sheet.tree);
+    let topology = topology::Topology::new(&sheet.tree, &inventory, &labels);
+    let changes = place(
+        inventory.symbol(request.anchor).unwrap(),
+        &inventory,
+        &topology,
+        &[],
+        &request,
+        0,
+    )
+    .unwrap();
+    let candidate = candidate::build(&sheet.tree, &inventory, &topology, &changes).unwrap();
+    let moved = candidate.find("no_connect").unwrap();
+    assert_eq!(moved.find_str("uuid"), Some(marker));
+    let at = moved.find("at").unwrap();
+    assert_eq!(
+        at.children().unwrap().len(),
+        3,
+        "a no-connect has no rotation"
+    );
+    assert_eq!(
+        copperpour_sexp::schematic::parse_at(moved),
+        Some((next.0, next.1, 0.0))
+    );
+}
+
+#[test]
+fn a_mirrored_quarter_turn_moves_hidden_fields_with_the_symbol() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let mut tree = sheet.tree.clone();
+    let id = sheet.id("R1");
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    let symbol = items
+        .iter_mut()
+        .find(|n| n.find_str("uuid") == id["uuid"].as_str())
+        .unwrap();
+    let SexpNode::List(properties) = symbol else {
+        unreachable!()
+    };
+    properties.push(parse_sexp("(mirror x)").unwrap());
+    properties.push(parse_sexp(r#"(property "Witness" "hidden" (at 78.74 134.62 0) (effects (font (size 1.27 1.27)) (hide yes)))"#).unwrap());
+    let inventory = Inventory::new(&tree).unwrap();
+    let part = by_reference(&inventory, "R1");
+    let next = Pose {
+        x: 101.6,
+        y: 152.4,
+        rotation: 90.0,
+    };
+    let moved = next.relocate(part).unwrap();
+    let field = moved
+        .find_all("property")
+        .into_iter()
+        .find(|f| f.get(1).and_then(SexpNode::as_str) == Some("Witness"))
+        .unwrap();
+    // The old offset (+2.54, +3.81) becomes (-3.81, +2.54) under a mirrored turn.
+    assert_eq!(
+        copperpour_sexp::schematic::parse_at(field),
+        Some((97.79, 154.94, 90.0))
+    );
+}
+
+#[tokio::test]
+async fn a_series_redraw_refuses_to_erase_a_dangling_spur() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let near = by_reference(&inventory, "R1").pin("2").unwrap().tip;
+    let mut tree = sheet.tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    push_wire(items, near, step(near, (1.0, 0.0), 5.08));
+    let sheet = sheet.with_tree(tree);
+    let report = sheet
+        .serve(json!({
+            "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [sheet.id("R1")]
+        }))
+        .await;
+    assert_eq!(
+        report["blockers"],
+        json!(["a wire island has a dangling end without an attachment"]),
+        "{report}"
+    );
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null(), "{report}");
+}
+
+#[tokio::test]
+async fn series_preview_refuses_a_lane_that_detours_via_a_label() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let anchor = by_reference(&inventory, "U1");
+    let resistor = by_reference(&inventory, "R1");
+    let served = anchor.pin("3").unwrap().tip;
+    let near = resistor.pin("2").unwrap().tip;
+    let mut tree = isolate_symbols(&sheet.tree, &[anchor.id.uuid, resistor.id.uuid]);
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    // A foreign wire ends on the straight lane. The label below it gives
+    // the router a way around the obstruction without joining that wire.
+    let label = (114.3, 88.9);
+    for (a, b) in [
+        (near, (near.0, 142.24)),
+        ((near.0, 142.24), (label.0, 142.24)),
+        ((label.0, 142.24), label),
+        (label, (served.0, label.1)),
+        ((served.0, label.1), served),
+    ] {
+        push_wire(items, a, b);
+    }
+    push_wire(items, (116.84, 86.36), (116.84, 78.74));
+    items.push(
+        parse_sexp(
+            r#"(label "FOREIGN" (at 116.84 78.74 0) (effects (font (size 0.5 0.5)) (justify left bottom))
+           (uuid "77600000-0000-4000-8000-000000000015"))"#,
+        )
+        .unwrap(),
+    );
+    items.push(
+        parse_sexp(
+            r#"(label "S" (at 114.3 88.9 90) (effects (font (size 0.5 0.5)) (justify left bottom))
+           (uuid "77600000-0000-4000-8000-000000000014"))"#,
+        )
+        .unwrap(),
+    );
+    let sheet = sheet.with_tree(tree);
+    let report = sheet
+        .serve(json!({
+            "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [sheet.id("R1")]
+        }))
+        .await;
+    assert_eq!(
+        report["blockers"],
+        json!(["R1 cannot be wired in a straight series lane"]),
+        "{report}"
+    );
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null(), "{report}");
+}
+
+#[tokio::test]
+async fn a_moving_terminal_cannot_land_on_an_existing_label() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let args = json!({
+        "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [],
+        "connectors": [{"connector": sheet.id("J2"), "connector_pin": "1", "port": sheet.id("U1"), "port_pin": "1"}]
+    });
+    let request = Request::parse(&args).unwrap();
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let connector = by_reference(&inventory, "J2");
+    let labels = extract_labels(&sheet.tree);
+    let topology = topology::Topology::new(&sheet.tree, &inventory, &labels);
+    let changes = place(
+        inventory.symbol(request.anchor).unwrap(),
+        &inventory,
+        &topology,
+        &[],
+        &request,
+        0,
+    )
+    .unwrap();
+    let (x, y) = changes.poses[connector.id.uuid].tip(connector, connector.pin("1").unwrap());
+    let mut tree = sheet.tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    items.push(
+        parse_sexp(&format!(
+            r#"(label "LANDING" (at {x} {y} 0)
+            (effects (font (size 1.27 1.27)) (justify left bottom)))"#
+        ))
+        .unwrap(),
+    );
+    let sheet = sheet.with_tree(tree);
+    let report = sheet.serve(args).await;
+    assert_eq!(
+        report["blockers"],
+        json!(["two terminals would directly touch after placement"]),
+        "{report}"
+    );
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null(), "{report}");
+}
+
+#[tokio::test]
+async fn bypass_preview_refuses_a_ground_marker_that_cannot_be_below_it() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let anchor = by_reference(&inventory, "U1");
+    let capacitor = by_reference(&inventory, "C1");
+    let supply = by_reference(&inventory, "#PWR01");
+    let pin = capacitor.pin("2").unwrap();
+    let marker = by_reference(&inventory, "#PWR07");
+    // Anchor the only ground marker above every local pose. The multi-wire
+    // ground run is not a private lead, so the search cannot move the marker.
+    let high = (177.8, 40.64);
+    let high_x = 220.98;
+    let mut tree = isolate_symbols(
+        &sheet.tree,
+        &[
+            anchor.id.uuid,
+            capacitor.id.uuid,
+            supply.id.uuid,
+            marker.id.uuid,
+        ],
+    );
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    let a = anchor.pin("5").unwrap().tip;
+    let b = capacitor.pin("1").unwrap().tip;
+    let c = supply.pin("1").unwrap().tip;
+    for (a, b) in [(c, a), (a, (b.0, a.1)), ((b.0, a.1), b)] {
+        push_wire(items, a, b);
+    }
+    let node = items
+        .iter_mut()
+        .find(|n| n.find_str("uuid") == Some(marker.id.uuid))
+        .unwrap();
+    // Face the marker upward so a lead approaching from below clears its
+    // body and Value. Its position, not an overlap, must block the bypass.
+    *node = Pose::with_tip(marker, marker.pin("1").unwrap(), high, 180.0)
+        .relocate(marker)
+        .unwrap();
+    let below = step(pin.tip, (0.0, 1.0), MIN_WIRE);
+    for (a, b) in [
+        (pin.tip, below),
+        (below, (high_x, below.1)),
+        ((high_x, below.1), (high_x, high.1)),
+        ((high_x, high.1), high),
+    ] {
+        push_wire(items, a, b);
+    }
+    let sheet = sheet.with_tree(tree);
+    let report = sheet
+        .serve(json!({
+            "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [sheet.id("C1")],
+            "assignments": [{"member": sheet.id("C1"), "anchor_pin": "5"}]
+        }))
+        .await;
+    assert_eq!(
+        report["blockers"],
+        json!(["C1 needs a nearby drawn supply path and a ground lead below it"]),
+        "{report}"
+    );
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null(), "{report}");
+}
+
+#[tokio::test]
+async fn feedback_preview_refuses_a_staggered_lane() {
+    let sheet = Sheet::fixture("opamp_stage");
+    let inventory = Inventory::new(&sheet.tree).unwrap();
+    let resistor = by_reference(&inventory, "R2");
+    let old = resistor.pin("2").unwrap().tip;
+    let wire = inventory
+        .wires
+        .iter()
+        .find(|w| endpoints(w).contains(&old))
+        .unwrap();
+    let other = endpoints(wire).into_iter().find(|&p| p != old).unwrap();
+    let mut tree = sheet.tree.clone();
+    let SexpNode::List(items) = &mut tree else {
+        unreachable!()
+    };
+    let mut lib = resistor.lib.clone();
+    let SexpNode::List(fields) = &mut lib else {
+        unreachable!()
+    };
+    fields[1] = SexpNode::Str("Device:R_Staggered".into());
+    for unit in fields.iter_mut().filter(|n| n.head() == Some("symbol")) {
+        let SexpNode::List(unit) = unit else {
+            unreachable!()
+        };
+        let name = unit[1].as_str().unwrap().replacen("R_", "R_Staggered_", 1);
+        unit[1] = SexpNode::Str(name);
+        if let Some(pin) = unit
+            .iter_mut()
+            .find(|n| n.head() == Some("pin") && n.find_str("number") == Some("2"))
+        {
+            poses::set_at(pin, (5.08, -3.81, 90.0)).unwrap();
+        }
+    }
+    let SexpNode::List(libraries) = items
+        .iter_mut()
+        .find(|n| n.head() == Some("lib_symbols"))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    libraries.push(lib);
+    let SexpNode::List(instance) = items
+        .iter_mut()
+        .find(|n| n.find_str("uuid") == Some(resistor.id.uuid))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    *instance
+        .iter_mut()
+        .find(|n| n.head() == Some("lib_id"))
+        .unwrap() = parse_sexp(r#"(lib_id "Device:R_Staggered")"#).unwrap();
+    items.retain(|n| n.find_str("uuid") != wire.uuid.as_deref());
+    let new = step(old, (1.0, 0.0), 5.08);
+    push_wire(items, new, (new.0, other.1));
+    push_wire(items, (new.0, other.1), other);
+    let sheet = sheet.with_tree(tree);
+    let report = sheet
+        .serve(json!({
+            "schematic": sheet.path, "anchor": sheet.id("U1"), "members": [sheet.id("R2")]
+        }))
+        .await;
+    assert_eq!(
+        report["blockers"],
+        json!(["R2 has no feedback lane above or below the anchor"]),
+        "{report}"
+    );
+    assert_eq!(report["status"], "blocked", "{report}");
+    assert!(report["plan"].is_null(), "{report}");
+}
+
 #[tokio::test]
 async fn missing_placed_targets_return_stale_target() {
     let sheet = Sheet::fixture("opamp_stage");
