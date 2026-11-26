@@ -16,7 +16,7 @@ impl Wire {
             start: (x1, y1),
             end: (x2, y2),
             uuid: uuid::Uuid::new_v4().to_string(),
-            stroke: None,
+            stroke: Some(Stroke::wire_default()),
         }
     }
 

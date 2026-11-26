@@ -9722,6 +9722,10 @@ mod coincident_route_tests {
 mod power_orientation_tests;
 
 #[cfg(test)]
+#[path = "wire_stroke_tests.rs"]
+mod wire_stroke_tests;
+
+#[cfg(test)]
 mod no_connect_carry_tests {
     use super::*;
 
