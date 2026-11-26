@@ -1110,9 +1110,10 @@ fn verify_template_wiring(
     path: &std::path::Path,
     wired: &std::collections::HashMap<TemplatePin, String>,
 ) -> anyhow::Result<()> {
-    use copperpour_sexp::schematic::{extract_all_net_labels, extract_wires};
+    use crate::tools::sch_connectivity::saved_net_labels;
+    use copperpour_sexp::schematic::extract_wires;
     let (_, tree) = copperpour_sexp::schematic::read_schematic(path)?;
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     let mut graph =
         crate::tools::sch_connectivity::net_graph_for(&tree, &extract_wires(&tree), &labels);
     let placed = crate::tools::PlacedPins::new(&tree);
@@ -1120,7 +1121,7 @@ fn verify_template_wiring(
         let pin = placed
             .resolve(reference, number)
             .map_err(|error| anyhow::anyhow!(error.describe()))?;
-        let (x, y) = pin.endpoint();
+        let (x, y) = graph.pin_position(&pin.pin, pin.t);
         let root = graph.root_at(x, y);
         anyhow::ensure!(
             labels
@@ -1196,6 +1197,37 @@ mod tests {
     use crate::tools::{ServerConfig, KICAD_ENV_LOCK};
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    #[test]
+    fn template_readback_requires_the_claimed_label_to_name_the_saved_pin() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("opamp_stage.kicad_sch");
+        let wired = std::collections::HashMap::from([(
+            ("J2".to_owned(), "1".to_owned()),
+            "TOLERANT_OUT".to_owned(),
+        )]);
+        std::fs::write(
+            &path,
+            include_str!(
+                "../../tests/fixtures/label_attachment_kicad10/exact/opamp_stage.kicad_sch"
+            ),
+        )
+        .unwrap();
+        verify_template_wiring(&path, &wired).unwrap();
+        std::fs::write(
+            &path,
+            include_str!(
+                "../../tests/fixtures/label_attachment_kicad10/offset/opamp_stage.kicad_sch"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_template_wiring(&path, &wired)
+                .unwrap_err()
+                .to_string(),
+            "saved readback did not connect J2.1 to 'TOLERANT_OUT'"
+        );
+    }
 
     /// Runs `test` again in a child process whose `HOME` and `APPDATA` are a
     /// fresh directory, and returns whether this is that child. Setting them

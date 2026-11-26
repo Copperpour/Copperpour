@@ -1,7 +1,7 @@
 use super::inventory::{Inventory, Part, Pin, Point};
 use super::poses::MIN_WIRE;
 use crate::tools::sch_connectivity::{
-    kicad_schematic_mm, redraw_net_graph, redraw_point_key, NetRoot, DRAWN_ATTACHMENT_TOLERANCE,
+    kicad_schematic_mm, redraw_net_graph, schematic_point, NetRoot, DRAWN_ATTACHMENT_TOLERANCE,
 };
 use copperpour_sexp::geometry::point_on_segment;
 use copperpour_sexp::schematic::{
@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const EPSILON: f64 = 1e-5;
 
 pub(super) fn coincides(a: Point, b: Point) -> bool {
-    redraw_point_key(a.0, a.1) == redraw_point_key(b.0, b.1)
+    schematic_point(a.0, a.1) == schematic_point(b.0, b.1)
 }
 
 pub(super) fn endpoints(w: &Wire) -> [Point; 2] {
@@ -76,13 +76,13 @@ impl Island<'_, '_> {
             for adjacent in points.windows(2) {
                 let [a, b] = [adjacent[0], adjacent[1]];
                 let distance = length([a, b]);
-                let (a, b) = (redraw_point_key(a.0, a.1), redraw_point_key(b.0, b.1));
+                let (a, b) = (schematic_point(a.0, a.1), schematic_point(b.0, b.1));
                 edges.entry(a).or_default().push((b, distance));
                 edges.entry(b).or_default().push((a, distance));
             }
         }
-        let start = redraw_point_key(start.0, start.1);
-        let finish = redraw_point_key(end.0, end.1);
+        let start = schematic_point(start.0, start.1);
+        let finish = schematic_point(end.0, end.1);
         let mut pending = BTreeMap::from([(start, 0.0)]);
         let mut seen = BTreeSet::new();
         while let Some((&point, &distance)) = pending.iter().min_by(|a, b| f64::total_cmp(a.1, b.1))

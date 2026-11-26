@@ -5,6 +5,33 @@ use copperpour_sexp::parse_sexp;
 use copperpour_sexp::schematic::{format_junction, format_wire, Wire};
 use std::path::Path;
 
+#[test]
+fn inventory_uses_saved_pin_tips_for_rail_and_drawn_membership() {
+    let source = include_str!(
+        "../../../tests/fixtures/label_attachment_kicad10/power-rounded-pin/opamp_stage.kicad_sch"
+    );
+    let raw = source
+        .replacen("(at 195.58 88.9 0)", "(at 195.58004 88.9 0)", 1)
+        .replacen("(at -5.08 0 0)", "(at -5.07996 0 0)", 1);
+    let tree = parse_sexp(&raw).unwrap();
+    let inventory = Inventory::new(&tree).unwrap();
+    let tip = |reference| {
+        inventory
+            .parts
+            .values()
+            .find(|part| part.inst.reference == reference)
+            .unwrap()
+            .pin("1")
+            .unwrap()
+    };
+    let connector = tip("J2");
+    let power = tip("#PWR01");
+    assert_eq!(connector.tip, (190.5, 88.9));
+    assert_eq!(connector.net, power.net);
+    assert_eq!(connector.drawn, power.drawn);
+    assert!(inventory.is_ground(connector.net));
+}
+
 struct Sheet {
     dir: tempfile::TempDir,
     tree: SexpNode,
@@ -855,12 +882,12 @@ async fn a_power_flag_on_a_private_lead_is_not_a_removable_supply() {
         .find(|ends| ends.contains(&tip))
         .unwrap();
     let (x, y) = ((wire[0].0 + wire[1].0) / 2.0, (wire[0].1 + wire[1].1) / 2.0);
-    // Name this island through the legacy graph without adding a physically
-    // attached label, so only the electrical type disqualifies the private lead.
+    // Name the net with the label hit allowance without placing the anchor
+    // on the exact redraw path. Only electrical type disqualifies the lead.
     let (x, y) = if wire[0].0 == wire[1].0 {
-        (x + 0.001, y)
+        (x + 0.0001, y)
     } else {
-        (x, y + 0.001)
+        (x, y + 0.0001)
     };
     let mut tree = sheet.tree.clone();
     let SexpNode::List(items) = &mut tree else {
@@ -1441,13 +1468,6 @@ async fn a_label_off_the_wire_does_not_prove_a_drawn_run() {
         );
         let inventory = Inventory::new(&tree).unwrap();
         let labels = extract_labels(&tree);
-        let mut queried =
-            crate::tools::sch_connectivity::drawn_net_graph_for(&tree, &inventory.wires, &labels);
-        assert_eq!(
-            queried.root_at(142.24, 88.9),
-            queried.root_at(138.43, 83.82),
-            "the shared graph tolerates the offset"
-        );
         let mut drawn =
             crate::tools::sch_connectivity::redraw_net_graph(&tree, &inventory.wires, &labels);
         let root = drawn.root_at(142.24, 88.9);

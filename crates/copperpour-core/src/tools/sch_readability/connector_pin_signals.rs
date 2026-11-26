@@ -4,8 +4,9 @@ use crate::tools::{
     get_path, opt_str_list,
     placement::ref_prefix,
     sch_connectivity::{
-        add_symbol_power_drivers, drawn_net_graph_for, label_roots, ConnectivityIndex, NamingPin,
-        NetRoot, PinNetNames, SymbolPower, UnitNotation, COINCIDENT_TOLERANCE,
+        add_symbol_power_drivers, drawn_net_graph_for, label_roots, schematic_pin_endpoint,
+        ConnectivityIndex, NamingPin, NetRoot, PinNetNames, SymbolPower, UnitNotation,
+        COINCIDENT_TOLERANCE,
     },
     sch_hierarchy::natural_compare,
     symbol_body_style, ToolContext, ToolDef, UNRESOLVED_PIN_GEOMETRY,
@@ -57,6 +58,7 @@ fn meaningful_name(name: &str, number: &str) -> bool {
 }
 
 struct DrawnPin {
+    net_at: (f64, f64),
     pin: LibPin,
     at: (f64, f64),
     name_hidden: bool,
@@ -136,6 +138,7 @@ fn read_symbol(node: &SexpNode, libs: &[&SexpNode]) -> Result<DrawnSymbol, Strin
                 == Some(0.0);
         let at = pin_endpoint(&pin, transform);
         pins.push(DrawnPin {
+            net_at: schematic_pin_endpoint(&pin, transform),
             pin,
             at,
             name_hidden,
@@ -233,7 +236,7 @@ async fn handle_check_connector_pin_signals(
             &mut nets,
             &symbol.instance,
             symbol.power,
-            symbol.pins.iter().map(|drawn| (&drawn.pin, drawn.at)),
+            symbol.pins.iter().map(|drawn| (&drawn.pin, drawn.net_at)),
             |mark| labels.push(mark),
         );
     }
@@ -321,7 +324,7 @@ async fn handle_check_connector_pin_signals(
             }
             if let Some(name) = drawn.visible_name() {
                 drawn_names_by_net
-                    .entry(nets.root_at(x, y))
+                    .entry(nets.root_at(drawn.net_at.0, drawn.net_at.1))
                     .or_default()
                     .push((instance, drawn, name));
             }
@@ -357,9 +360,10 @@ async fn handle_check_connector_pin_signals(
             } else if !index.attaches_pin(x, y) {
                 "unconnected"
             } else {
-                let root = nets.root_at(x, y);
+                let (px, py) = drawn.net_at;
+                let root = nets.root_at(px, py);
                 let (has_label, has_power) = net_evidence.get(&root).copied().unwrap_or_default();
-                let marks = marks_by_run.get(&runs.root_at(x, y));
+                let marks = marks_by_run.get(&runs.root_at(px, py));
                 if has_label {
                     evidence.push("label");
                     details["nearest_label"] =
@@ -378,7 +382,7 @@ async fn handle_check_connector_pin_signals(
                     details["pin_name"] = json!(name);
                 }
                 if evidence.is_empty() {
-                    details["net"] = json!(pin_nets.net_of_pin(&mut nets, pin, x, y));
+                    details["net"] = json!(pin_nets.net_of_pin(&mut nets, pin, px, py));
                     details["other_pin_names"] = json!(drawn_names_by_net
                         .get(&root)
                         .into_iter()

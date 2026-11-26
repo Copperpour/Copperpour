@@ -1,10 +1,11 @@
 use super::super::sch_connectivity::{
-    redraw_net_graph, redraw_point_key, snapshot_net_graph, NetRoot,
+    redraw_net_graph, saved_power_labels, schematic_pin_endpoint, schematic_point,
+    snapshot_net_graph, NetRoot,
 };
 use super::super::{resolved_placed_pins_by_reference, UNRESOLVED_PIN_GEOMETRY};
 use copperpour_sexp::schematic::{
-    extract_labels, extract_power_symbol_labels, extract_wires, find_lib_symbol, pin_endpoint,
-    pin_outward_direction, LibPin, SymbolInstance, Wire,
+    extract_labels, extract_wires, find_lib_symbol, pin_endpoint, pin_outward_direction, LibPin,
+    SymbolInstance, Wire,
 };
 use copperpour_sexp::SexpNode;
 use serde::Serialize;
@@ -183,7 +184,7 @@ impl<'a> Inventory<'a> {
         let mut graph = snapshot_net_graph(tree, &wires);
         let mut drawn = redraw_net_graph(tree, &wires, &extract_labels(tree));
         let mut rails = BTreeMap::new();
-        for label in extract_power_symbol_labels(tree) {
+        for label in saved_power_labels(tree) {
             let ground = is_ground(&label.net);
             let root = graph.root_at(label.x, label.y);
             rails
@@ -207,13 +208,14 @@ impl<'a> Inventory<'a> {
             let mut tips = BTreeSet::new();
             let mut observed = Vec::new();
             for (pin, transform) in pins {
-                let tip = pin_endpoint(&pin, transform);
+                let raw = pin_endpoint(&pin, transform);
                 let outward = pin_outward_direction(&pin, transform);
-                if ![tip.0, tip.1, outward].into_iter().all(f64::is_finite) {
+                if ![raw.0, raw.1, outward].into_iter().all(f64::is_finite) {
                     return Err(format!("{} has an unreadable pin pose", inst.reference));
                 }
+                let tip = schematic_pin_endpoint(&pin, transform);
                 if !numbers.insert(pin.number.clone())
-                    || !tips.insert(redraw_point_key(tip.0, tip.1))
+                    || !tips.insert(schematic_point(tip.0, tip.1))
                 {
                     return Err(format!("{} has shared or stacked pins", inst.reference));
                 }

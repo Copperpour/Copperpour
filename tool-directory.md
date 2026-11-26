@@ -152,8 +152,8 @@ and Windows servers do not.
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect; a point that already has one is reported as `already_present` and not rewritten. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle, skipping points that already have one; `added` counts the dots written. |
 | `connect_to_net` | Connect a pin to a named net with a short stub and label. Name the pin (`reference` + `pin_number`) or give its coordinates. For clearance, `direction: "auto"` tries outward before turning across, and omitting `stub_length` lets the tool try 2.54, 5.08 and 7.62 mm in each direction. Fixed arguments stay fixed; `stub_length: 0` adds only the label. Returns the length used, new `text_overlaps` and `bounds_unresolved` for unchecked symbol bounds. If none clear, writes the first electrically safe stub or refuses with `plan_blocked` if none is safe. |
-| `connect_pins` | Connect two pins by reference and pin number. Prefers the elbow that crosses fewer symbol bodies, then fewer label and field text runs. Reports the drawn path, or `already_connected` with `x` and `y` for verified pin-tip contact on the saved sheet, including hidden pins. Refuses (`plan_blocked`) unverified contact, a zero-length route, a wire end that would miss its pin, a route that would join another net as KiCad reads it, or a saved symbol angle KiCad cannot load. Conflict diagnostics use the net's primary name. |
-| `add_schematic_connection` | Connect two points by coordinates. Uses the same elbow choice and primary net names in diagnostics as `connect_pins`. Reports the drawn path; refuses a zero-length route or a route that would join another net. |
+| `connect_pins` | Connect two pins by reference and pin number. Prefers the elbow that crosses fewer symbol bodies, then fewer label and field text runs. Reports the drawn path or `already_connected` with `x` and `y` for verified pin-tip contact, including hidden pins. Checks saved pin geometry, including legacy angles KiCad can load. Refuses (`plan_blocked`) unverified contact, unreadable symbol angles, zero-length or diagonal straight routes, missed pin tips, and joins to other nets. It also refuses routes it cannot check on a sheet with a near-axis diagonal wire. Conflict diagnostics use the net's primary name. |
+| `add_schematic_connection` | Connect two points by coordinates. Uses the same routing and primary net names in diagnostics as `connect_pins`. A straight route must be horizontal or vertical in saved coordinates. Refuses zero-length routes, joins to another net, and routes it cannot check on a sheet with a near-axis diagonal wire. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -175,17 +175,17 @@ and Windows servers do not.
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
 | `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
 | `list_schematic_labels` | List all net, global, and hierarchical labels with positions, net names, types, and UUIDs (usable with `batch_delete`). |
-| `get_net_connections` | Get all pins and labels connected to a named net. |
-| `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations. |
-| `get_pin_connections` | Get the primary net name at a specific pin; global power takes precedence over local power. |
-| `get_pin_net_name` | Return the primary net name for a specific pin; global power takes precedence over local power. |
-| `get_component_nets` | Get the primary net name for each pin; global power takes precedence over local power. |
-| `get_net_components` | Get all components (and their pins) connected to a named net. |
-| `trace_from_point` | Trace connectivity from any (X,Y) point: returns the wires, labels, component pins and junction dots there, and the net's primary name. Hierarchical sheet pins and no-connect flags are not reported, so an empty `pins_here` does not prove a wire dangles. |
+| `get_net_connections` | Get all pins and labels on a named net. Drawn label attachment uses saved schematic coordinates and KiCad's one-unit allowance. |
+| `get_net_connectivity` | Return wires, labels, and T-junction locations for a named net. A nearby label that KiCad leaves detached does not put the wire on that net. |
+| `get_pin_connections` | Get the primary net name at a specific pin using saved-coordinate label attachment. Global power takes precedence over local power. |
+| `get_pin_net_name` | Return the primary net name at a specific pin using saved-coordinate label attachment. Global power takes precedence over local power. |
+| `get_component_nets` | Get the primary net name for each pin using saved-coordinate label attachment. Global power takes precedence over local power. |
+| `get_net_components` | Get all components and pins on a named net, using saved-coordinate label attachment. |
+| `trace_from_point` | Return nearby wires, labels, component pins and junction dots, and the primary net name at the saved coordinate. An item in `labels_here` need not belong to that net. Hierarchical sheet pins and no-connect flags are not reported, so an empty `pins_here` does not prove a wire dangles. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
-| `get_connected_items` | Get all wires, labels and components connected to a component by tracing each pin. Reports the primary names separately from the attached labels. |
+| `get_connected_items` | Get wires, attached labels, and other components on the given component's nets. Reports the primary names separately from the attached labels. A nearby label that KiCad leaves detached is not attached by proximity. |
 
 ### `sch_readability` · 4 tools
 **Purpose:** Read-only drawing and layout checks on saved schematic sheets.

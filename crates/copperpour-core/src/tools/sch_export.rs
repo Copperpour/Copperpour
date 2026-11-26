@@ -12,8 +12,7 @@ use copperpour_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        pin_endpoint, read_schematic,
+        extract_labels, extract_symbol_instances, extract_wires, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, direct_children_with_tag, find_direct_child_blocks, write_atomic_if_unchanged,
@@ -25,7 +24,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_connectivity::net_graph_for;
+use super::sch_connectivity::{net_graph_for, saved_net_labels};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -619,7 +618,7 @@ async fn handle_export_netlist_summary(
 
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     let placed = placed_pins_by_reference(&tree);
 
     let mut g = net_graph_for(&tree, &wires, &labels);
@@ -651,7 +650,8 @@ async fn handle_export_netlist_summary(
                     pins.iter()
                         .map(|(pin, transform)| {
                             let (px, py) = pin_endpoint(pin, *transform);
-                            let net = g.net_at(px, py).unwrap_or_else(|| "~".to_string());
+                            let (x, y) = g.pin_position(pin, *transform);
+                            let net = g.net_at(x, y).unwrap_or_else(|| "~".to_string());
                             json!({
                                 "number": pin.number,
                                 "name": pin.name,

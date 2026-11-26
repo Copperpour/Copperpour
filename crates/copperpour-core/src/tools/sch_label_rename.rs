@@ -11,15 +11,17 @@ use crate::tool;
 use crate::tools::footprint_metadata::quote_string;
 use crate::tools::library::skip_sexp_token;
 use crate::tools::sch_annotate::opt_bool;
-use crate::tools::sch_connectivity::{net_graph_for, NetRoot};
+use crate::tools::sch_connectivity::{
+    net_graph_for, saved_power_labels, schematic_pin_endpoint, NetRoot,
+};
 use crate::tools::sch_hierarchy::{commit_sheets, load_saved_hierarchy, SavedHierarchy};
 use crate::tools::sch_wiring::{same_point, LABEL_TAGS};
 use crate::tools::{
     get_path, invalid_arg, opt_str, require_f64, require_str, ToolContext, ToolDef,
 };
 use copperpour_sexp::schematic::{
-    extract_lib_pins_for_unit, extract_power_symbol_labels, extract_symbol_instances,
-    extract_wires, find_lib_symbol, parse_at, pin_endpoint, Label, LabelKind,
+    extract_lib_pins_for_unit, extract_symbol_instances, extract_wires, find_lib_symbol, parse_at,
+    Label, LabelKind,
 };
 use copperpour_sexp::writer::{apply_edits, direct_children_with_tag, find_direct_child_blocks};
 use copperpour_sexp::{parse_sexp, read_consistent, FileTransition, SexpEdit, SexpNode};
@@ -642,7 +644,7 @@ fn read_contents(content: &str, tree: &SexpNode) -> Result<SheetContents, String
         })
         .filter_map(|inst| inst.uuid.as_deref())
         .collect();
-    let power_labels = extract_power_symbol_labels(tree);
+    let power_labels = saved_power_labels(tree);
     // A hidden `power_in` pin of a symbol that is not a power symbol names a
     // global net by the pin's name (`SCH_PIN::IsGlobalPower`,
     // `eeschema/sch_pin.cpp:357-373`; `SCH_PIN::GetDefaultNetName`, `:1484-1504`).
@@ -656,7 +658,7 @@ fn read_contents(content: &str, tree: &SexpNode) -> Result<SheetContents, String
                 .into_iter()
                 .filter(|pin| pin.hidden && pin.electrical_type == "power_in")
                 .map(move |pin| {
-                    let (x, y) = pin_endpoint(&pin, t);
+                    let (x, y) = schematic_pin_endpoint(&pin, t);
                     (stored_name(&pin.name), x, y)
                 })
         })
@@ -666,12 +668,20 @@ fn read_contents(content: &str, tree: &SexpNode) -> Result<SheetContents, String
     // graph under a name of its own, so no two are joined by name.
     let items: Vec<Label> = labels
         .iter()
-        .map(|l| (l.x, l.y))
-        .chain(power_labels.iter().map(|p| (p.x, p.y)))
-        .chain(hidden_pins.iter().map(|&(_, x, y)| (x, y)))
+        .map(|l| (l.x, l.y, LabelKind::NetLabel))
+        .chain(
+            power_labels
+                .iter()
+                .map(|p| (p.x, p.y, LabelKind::PowerSymbol)),
+        )
+        .chain(
+            hidden_pins
+                .iter()
+                .map(|&(_, x, y)| (x, y, LabelKind::PowerSymbol)),
+        )
         .enumerate()
-        .map(|(i, (x, y))| Label {
-            kind: LabelKind::NetLabel,
+        .map(|(i, (x, y, kind))| Label {
+            kind,
             net: format!("\u{1}{i}"),
             x,
             y,
