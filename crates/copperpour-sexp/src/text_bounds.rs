@@ -1055,48 +1055,127 @@ pub fn label_placement(node: &SexpNode, kind: LabelKind) -> Option<LabelPlacemen
     })
 }
 
-/// Bounds of visible single-line pin names and numbers. Stacked pin numbers
-/// and unsupported text styles are left to the caller's coverage report.
-pub fn pin_text_bounds<'a, F: Fn(&str) -> bool + 'a>(
+/// `DEFAULT_PIN_NAME_OFFSET`, 20 mil: the offset `LIB_SYMBOL::LIB_SYMBOL`
+/// gives every symbol, so a `(pin_names …)` without `(offset …)`, or no
+/// `(pin_names …)` at all, means names inside at this offset. KiCad's writer
+/// leaves the offset out only when it is this default
+/// (`SCH_IO_KICAD_SEXPR_LIB_CACHE::SaveSymbol`).
+const DEFAULT_PIN_NAME_OFFSET_MM: f64 = 0.508;
+
+/// Which of a pin's two strings a [`PinText`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinTextRole {
+    Name,
+    Number,
+}
+
+impl PinTextRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinTextRole::Name => "name",
+            PinTextRole::Number => "number",
+        }
+    }
+}
+
+/// One drawn pin name or number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinText {
+    /// The library pin's number, which also keys its saved `(pin …)` entry.
+    pub number: String,
+    pub role: PinTextRole,
+    /// The string as drawn: unescaped, and for a name the selected
+    /// alternate's name in place of the library's.
+    pub text: String,
+    /// The pin's connection point on the sheet.
+    pub tip: (f64, f64),
+    /// The drawn string, half its stroke included.
+    pub run: SymbolBounds,
+}
+
+/// The name a placed pin draws: the library's, or that of the alternate the
+/// placed symbol selects for it (`SCH_PIN::GetShownName`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinNameChoice<'a> {
+    Base,
+    Alternate(&'a str),
+}
+
+/// Visible single-line pin names and numbers of the drawn unit and body
+/// style, placed as `SCH_PIN::PlotPinTexts` places them. `choice` gives each
+/// pin number's name: `None` leaves the pin to the caller, and an alternate
+/// must be defined on the pin and on only one drawn pin with that number.
+/// Stacked pin numbers, unsupported text styles and alternates that cannot
+/// be resolved are errors, for the caller's coverage report.
+pub fn pin_text_bounds<'a, F: Fn(&str) -> Option<PinNameChoice<'a>> + 'a>(
     lib: &'a SexpNode,
     instance: &crate::schematic::SymbolInstance,
     body_style: u32,
     default_pen: f64,
     text_offset_ratio: f64,
-    use_pin: F,
+    choice: F,
     default_overbar: bool,
-) -> impl Iterator<Item = Result<SymbolBounds, &'static str>> + use<'a, F> {
+) -> impl Iterator<Item = Result<PinText, &'static str>> + use<'a, F> {
     use crate::schematic::{lib_pin_nodes_for_body_style, parse_lib_pin};
     let show_name = lib.find("pin_names").is_none_or(|e| !flag(e, "hide"));
     let show_number = lib.find("pin_numbers").is_none_or(|e| !flag(e, "hide"));
     let inside = lib
         .find("pin_names")
         .and_then(|n| n.find_f64("offset"))
-        .unwrap_or(0.0);
+        .unwrap_or(DEFAULT_PIN_NAME_OFFSET_MM);
     let transform = instance.pin_transform();
     let rotation = instance.rotation;
-    lib_pin_nodes_for_body_style(lib, instance.unit, body_style)
+    let nodes = lib_pin_nodes_for_body_style(lib, instance.unit, body_style);
+    let mut drawn_numbers = std::collections::HashMap::<String, usize>::new();
+    for pin in nodes.iter().filter_map(|node| parse_lib_pin(node)) {
+        *drawn_numbers.entry(pin.number).or_default() += 1;
+    }
+    nodes
         .into_iter()
         .flat_map(move |node| {
             let Some(pin) = parse_lib_pin(node) else {
                 return [Err("invalid_pin_geometry"), Ok(None)];
             };
-            if pin.hidden || !use_pin(&pin.number) {
+            if pin.hidden {
                 return [Ok(None), Ok(None)];
             }
-            let text_size = |tag, visible| {
+            let alternate = match choice(&pin.number) {
+                None => return [Ok(None), Ok(None)],
+                Some(PinNameChoice::Base) => None,
+                // `SCH_SYMBOL` keeps the choice by pin number, so it cannot
+                // name one of two drawn pins that share the number.
+                Some(PinNameChoice::Alternate(_)) if drawn_numbers[&pin.number] > 1 => {
+                    return [Err("ambiguous_pin_alternate"), Ok(None)];
+                }
+                Some(PinNameChoice::Alternate(wanted)) => {
+                    if !node
+                        .find_all("alternate")
+                        .iter()
+                        .any(|alt| alt.get(1).and_then(SexpNode::as_str) == Some(wanted))
+                    {
+                        return [Err("undefined_pin_alternate"), Ok(None)];
+                    }
+                    Some(unescape(wanted))
+                }
+            };
+            // An alternate changes the name only: the number and both text
+            // sizes stay the library pin's.
+            let text_size = |tag, visible, replaced: Option<String>| {
                 let text = node.find(tag)?;
                 let size = text
                     .find("effects")?
                     .find("font")?
                     .find("size")?
                     .get_f64(1)?;
-                let value = unescape(text.get(1)?.as_str()?);
+                let value = match replaced {
+                    Some(value) => value,
+                    None => unescape(text.get(1)?.as_str()?),
+                };
                 (visible && size > 0.0 && value != "~" && !value.trim().is_empty())
                     .then_some((text, value, size))
             };
-            let name = text_size("name", show_name);
-            let number = text_size("number", show_number);
+            let name = text_size("name", show_name, alternate);
+            let number = text_size("number", show_number, None);
             let angle = pin.rotation.to_radians();
             let tip = transform_pin(pin.local_x, pin.local_y, transform);
             let root = transform_pin(
@@ -1115,10 +1194,11 @@ pub fn pin_text_bounds<'a, F: Fn(&str) -> bool + 'a>(
             // SCH_PIN::PlotPinTexts: painter clearance plus its 4 mil margin.
             let offset = ((24.0 * text_offset_ratio).round() + 4.0) * 0.0254 + default_pen;
             let both_outside = inside == 0.0 && name.is_some() && number.is_some();
-            let bounds = |info: Option<(&SexpNode, String, f64)>, is_name: bool| {
+            let bounds = |info: Option<(&SexpNode, String, f64)>, role: PinTextRole| {
                 let Some((node, text, size)) = info else {
                     return Ok(None);
                 };
+                let is_name = role == PinTextRole::Name;
                 if !is_name && text.starts_with('[') && text.ends_with(']') {
                     return Err("unsupported_stacked_pin_number");
                 }
@@ -1172,7 +1252,7 @@ pub fn pin_text_bounds<'a, F: Fn(&str) -> bool + 'a>(
                     horizontal,
                     vertical: vertical_justify,
                 };
-                Ok(Some(moved(
+                let run = moved(
                     turned(
                         style.drawn(&Drawn::of(&text), vertical_justify),
                         if vertical { 90.0 } else { 0.0 },
@@ -1180,9 +1260,19 @@ pub fn pin_text_bounds<'a, F: Fn(&str) -> bool + 'a>(
                     at.0,
                     at.1,
                     0.0,
-                )))
+                );
+                Ok(Some(PinText {
+                    number: pin.number.clone(),
+                    role,
+                    text,
+                    tip,
+                    run,
+                }))
             };
-            [bounds(name, true), bounds(number, false)]
+            [
+                bounds(name, PinTextRole::Name),
+                bounds(number, PinTextRole::Number),
+            ]
         })
         .filter_map(Result::transpose)
 }

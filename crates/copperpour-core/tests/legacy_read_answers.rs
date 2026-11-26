@@ -176,8 +176,29 @@ async fn whole_sheet_overlap_answers_are_unchanged() {
             );
         }
 
+        // A stacked pin number's text is not measured, so only the pin text
+        // term is left uncompared on that sheet (#842).
+        let pin_text_gap = fixture == PIN_NET_NAMES;
+        let reasons: Vec<_> = overlaps["pin_text_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["reasons"].as_array().unwrap().clone())
+            .collect();
+        assert_eq!(!reasons.is_empty(), pin_text_gap, "{fixture}: {overlaps}");
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| reason == "unsupported_stacked_pin_number"),
+            "{fixture}: {overlaps}"
+        );
         let layout = answer("compare_schematic_layout", fixture).await;
-        assert_eq!(layout["not_compared"], json!([]), "{fixture}: {layout}");
+        let uncompared = if pin_text_gap {
+            json!(["wire_pin_text_overlap"])
+        } else {
+            json!([])
+        };
+        assert_eq!(layout["not_compared"], uncompared, "{fixture}: {layout}");
         assert_eq!(layout["score"]["bounds_unresolved"], json!([]), "{fixture}");
     }
 
@@ -218,6 +239,12 @@ async fn fallback_and_label_overlap_answers_are_unchanged() {
                 {"type": "component_overlap", "a": "U1", "unit_a": 1, "b": "U2", "unit_b": 1,
                  "x": 101.6, "y": 101.6, "detection": "origin_fallback"},
                 {"type": "label_overlap", "net_a": "SIG_A", "net_b": "SIG_B", "x": 50.8, "y": 50.8},
+            ],
+            "pin_text_unresolved": [
+                {"reference": "U1", "unit": 1, "symbol_uuid": "5d1c0b1e-0000-4000-8000-000000000021",
+                 "reasons": ["unresolved_symbol_definition"]},
+                {"reference": "U2", "unit": 1, "symbol_uuid": "5d1c0b1e-0000-4000-8000-000000000022",
+                 "reasons": ["unresolved_symbol_definition"]},
             ],
         })
     );

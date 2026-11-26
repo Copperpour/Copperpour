@@ -1150,12 +1150,15 @@ pub(super) async fn handle_check_overlaps(
     }
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let (all, bounds_resolved, bounds_unresolved) = overlap_findings(&tree, &wires, tol);
+    let (mut all, bounds_resolved, bounds_unresolved) = overlap_findings(&tree, &wires, tol);
+    let pin_text = pin_text_findings(&tree, &wires);
+    all.extend(pin_text.findings);
     Ok(CallToolResult::json(&json!({
         "overlap_count": all.len(),
         "overlaps": all,
         "bounds_resolved": bounds_resolved,
-        "bounds_unresolved": bounds_unresolved
+        "bounds_unresolved": bounds_unresolved,
+        "pin_text_unresolved": pin_text.unresolved
     })))
 }
 
@@ -1165,6 +1168,152 @@ pub(super) fn overlap_findings(
     tol: f64,
 ) -> (Vec<serde_json::Value>, usize, Vec<String>) {
     schematic_overlaps(tree, wires, tol, &[])
+}
+
+/// The pen and text offset ratio the pin text check assumes: KiCad's
+/// defaults (`DEFAULT_LINE_WIDTH_MILS`, `m_TextOffsetRatio`), as for the field
+/// and label text this check measures; the project file is not read.
+const PIN_TEXT_PEN_MM: f64 = 0.1524;
+const PIN_TEXT_OFFSET_RATIO: f64 = 0.15;
+
+/// Wires entering a drawn pin name or number (#842), and the symbols whose
+/// pin text could not all be measured, with why.
+pub(super) struct PinTextFindings {
+    pub findings: Vec<serde_json::Value>,
+    pub unresolved: Vec<serde_json::Value>,
+}
+
+/// `wire_pin_text_overlap` findings: a wire segment whose interior enters
+/// the run of a pin name or number as `SCH_PIN::PlotPinTexts` draws it. A
+/// wire along a run's edge, or one ending on the pin's tip outside the run,
+/// does not count; a wire attached to the pin that runs on into its text
+/// does. Read-only, and separate from the clearance reports of the
+/// authoring tools.
+pub(super) fn pin_text_findings(
+    tree: &copperpour_sexp::SexpNode,
+    wires: &[Wire],
+) -> PinTextFindings {
+    use copperpour_sexp::schematic::{lib_pin_nodes_for_body_style, parse_lib_pin};
+    use copperpour_sexp::text_bounds::{pin_text_bounds, PinNameChoice, PinText};
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut runs: Vec<(SymbolInstance, PinText, Option<String>)> = Vec::new();
+    let mut unresolved = Vec::new();
+    for node in tree.find_all("symbol") {
+        let Some(instance) = copperpour_sexp::schematic::symbol_instance(node) else {
+            continue;
+        };
+        let mut reasons = BTreeSet::new();
+        match find_lib_symbol(&lib_symbols, &instance) {
+            None => {
+                reasons.insert("unresolved_symbol_definition");
+            }
+            Some(lib) => {
+                let style = super::symbol_body_style(node);
+                let placed_pins = node.find_all("pin");
+                let placed = |key: &str| -> HashMap<&str, &str> {
+                    placed_pins
+                        .iter()
+                        .filter_map(|pin| {
+                            let value = match key {
+                                "alternate" => pin.find("alternate")?.get(1)?.as_str()?,
+                                _ => pin.find_str(key)?,
+                            };
+                            Some((pin.get(1)?.as_str()?, value))
+                        })
+                        .collect()
+                };
+                let alternates = placed("alternate");
+                let pin_uuids = placed("uuid");
+                // A saved pin uuid names a graphical pin only when no other
+                // drawn pin shares its number.
+                let mut drawn = HashMap::<String, usize>::new();
+                for pin in lib_pin_nodes_for_body_style(lib, instance.unit, style)
+                    .into_iter()
+                    .filter_map(parse_lib_pin)
+                {
+                    *drawn.entry(pin.number).or_default() += 1;
+                }
+                let choice = move |number: &str| {
+                    Some(
+                        alternates
+                            .get(number)
+                            .map_or(PinNameChoice::Base, |name| PinNameChoice::Alternate(name)),
+                    )
+                };
+                for text in pin_text_bounds(
+                    lib,
+                    &instance,
+                    style,
+                    PIN_TEXT_PEN_MM,
+                    PIN_TEXT_OFFSET_RATIO,
+                    choice,
+                    true,
+                ) {
+                    match text {
+                        Ok(text) => {
+                            let uuid = (drawn.get(&text.number) == Some(&1))
+                                .then(|| pin_uuids.get(text.number.as_str()))
+                                .flatten()
+                                .map(|uuid| uuid.to_string());
+                            runs.push((instance.clone(), text, uuid));
+                        }
+                        Err(reason) => {
+                            reasons.insert(reason);
+                        }
+                    }
+                }
+            }
+        }
+        if !reasons.is_empty() {
+            unresolved.push(json!({
+                "reference": instance.reference,
+                "unit": instance.unit,
+                "symbol_uuid": instance.uuid,
+                "reasons": reasons,
+            }));
+        }
+    }
+    let round = copperpour_sexp::geometry::round6;
+    let mut findings = Vec::new();
+    for wire in wires {
+        let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
+        if from == to {
+            continue;
+        }
+        for (instance, text, pin_uuid) in &runs {
+            if text.run.segment_enters(from, to) {
+                findings.push(json!({
+                    "type": "wire_pin_text_overlap",
+                    "a": wire_json(wire),
+                    "b": {
+                        "kind": "pin_text",
+                        "reference": instance.reference,
+                        "unit": instance.unit,
+                        "symbol_uuid": instance.uuid,
+                        "pin_number": text.number,
+                        "pin_uuid": pin_uuid,
+                        "tip_x": round(text.tip.0),
+                        "tip_y": round(text.tip.1),
+                        "role": text.role.as_str(),
+                        "text": text.text
+                    },
+                    "bounds_b": {
+                        "x_min": round(text.run.min_x),
+                        "y_min": round(text.run.min_y),
+                        "x_max": round(text.run.max_x),
+                        "y_max": round(text.run.max_y)
+                    }
+                }));
+            }
+        }
+    }
+    PinTextFindings {
+        findings,
+        unresolved,
+    }
 }
 
 fn schematic_overlaps(
