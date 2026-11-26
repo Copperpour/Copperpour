@@ -6,8 +6,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tools::footprint_metadata::quote_string;
 use crate::tools::{get_path, require_str, ToolContext};
 use copperpour_schematic_editor::types::fmt_f64;
-use copperpour_sexp::geometry::round6;
 pub(crate) use copperpour_sexp::geometry::is_on_schematic_pin_grid as is_on_symbol_grid;
+use copperpour_sexp::geometry::round6;
 pub(super) use copperpour_sexp::geometry::SCHEMATIC_PIN_GRID_MM as SYMBOL_GRID;
 #[cfg(test)]
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
