@@ -417,8 +417,8 @@ pub fn tools() -> Vec<ToolDef> {
              preferring an elbow that crosses fewer symbol bodies, then fewer label and field \
              text runs. Refuses with plan_blocked if no candidate avoids joining another net \
              or if a wire would miss a pin or have zero length in KiCad. \
-             Reports already_connected with x and y without writing if visible, \
-             connectable pins already touch on the saved schematic. \
+             Reports already_connected with x and y without writing for verified pin-tip \
+             contact on the saved schematic, including hidden pins. \
              Reports the drawn path, corner included.",
             json!({
                 "type": "object",
@@ -708,8 +708,8 @@ impl ConnectionRefusal {
         match self {
             Self::ZeroLengthSegment => vec!["KiCad would read a zero-length wire segment".into()],
             Self::UnprovenContact => vec![
-                "the pin tips coincide, but contact cannot be confirmed for a hidden, \
-                 electrically unconnected or unresolved pin"
+                "the pin tips coincide, but contact cannot be confirmed for an electrically \
+                 unconnected or unresolved pin"
                     .into(),
             ],
             Self::PinNotPlaced => {
@@ -757,13 +757,16 @@ fn saved_wire_point((x, y): (f64, f64)) -> (f64, f64) {
     (kicad_schematic_mm(round6(x)), kicad_schematic_mm(round6(y)))
 }
 
+struct PlacedPinDefinition<'a> {
+    placed: &'a copperpour_sexp::SexpNode,
+    instance: copperpour_sexp::schematic::SymbolInstance,
+    pins: Vec<&'a copperpour_sexp::SexpNode>,
+}
+
 fn placed_pin_definition<'a>(
     tree: &'a copperpour_sexp::SexpNode,
     named: &NamedPin,
-) -> Option<(
-    &'a copperpour_sexp::SexpNode,
-    Vec<&'a copperpour_sexp::SexpNode>,
-)> {
+) -> Option<PlacedPinDefinition<'a>> {
     use copperpour_sexp::schematic::{lib_pin_nodes_for_body_style, symbol_instance};
     let uuid = named.instance_uuid.as_deref()?;
     let mut instances = tree
@@ -786,44 +789,161 @@ fn placed_pin_definition<'a>(
         && pins.iter().all(|pin| {
             parse_at(pin).is_some_and(|(x, y, _)| (x, y) == (named.pin.local_x, named.pin.local_y))
         });
-    verified.then_some((placed, pins))
+    verified.then_some(PlacedPinDefinition {
+        placed,
+        instance: inst,
+        pins,
+    })
 }
 
-fn can_confirm_pin_contact(
-    placed: &copperpour_sexp::SexpNode,
-    pins: &[&copperpour_sexp::SexpNode],
-    number: &str,
-) -> bool {
-    use copperpour_sexp::schematic::lib_pin_is_hidden;
+fn can_confirm_pin_contact(definition: &PlacedPinDefinition<'_>, number: &str) -> bool {
+    let PlacedPinDefinition { placed, pins, .. } = definition;
+    // KiCad uses the last position if (at ...) is repeated, but pin lookup
+    // uses the first. Only confirm contact when the saved position is unique.
+    let positions = placed.find_all("at");
+    let [position] = positions.as_slice() else {
+        return false;
+    };
+    // Read the saved angle without parse_at's zero default.
+    let angle = position.get_f64(3);
+    if !matches!(angle.map(f64::trunc), Some(0.0 | 90.0 | 180.0 | 270.0)) {
+        return false;
+    }
+    // The same first-vs-last placement ambiguity applies inside library pins.
+    if pins.iter().any(|pin| pin.find_all("at").len() != 1) {
+        return false;
+    }
     let mut placed_pins = placed
         .find_all("pin")
         .into_iter()
         .filter(|pin| pin.get(1).and_then(|n| n.as_str()) == Some(number));
-    let alternate = placed_pins
-        .next()
-        .and_then(|pin| pin.find_str("alternate"))
-        .filter(|name| !name.is_empty());
+    let selected = placed_pins.next();
     if placed_pins.next().is_some() {
         return false;
     }
+    let selections = selected.map_or_else(Vec::new, |pin| pin.find_all("alternate"));
+    let alternate = match selections.as_slice() {
+        [] => None,
+        [selection] => match selection.get(1).and_then(|n| n.as_str()) {
+            Some(name) => (!name.is_empty()).then_some(name),
+            None => return false,
+        },
+        _ => return false,
+    };
+    // Visibility does not disqualify a pin from electrical contact.
     let eligible = |pin: &copperpour_sexp::SexpNode| {
-        if lib_pin_is_hidden(pin) {
-            return Some(false);
-        }
         let kind = match alternate {
             None => pin.get(1)?.as_str()?,
-            Some(name) => pin
-                .find_all("alternate")
-                .into_iter()
-                .find(|alt| alt.get(1).and_then(|n| n.as_str()) == Some(name))?
-                .get(2)?
-                .as_str()?,
+            Some(name) => {
+                let mut definitions = pin
+                    .find_all("alternate")
+                    .into_iter()
+                    .filter(|alt| alt.get(1).and_then(|n| n.as_str()) == Some(name));
+                let selected = definitions.next()?;
+                if definitions.next().is_some() {
+                    return Some(false);
+                }
+                selected.get(2)?.as_str()?
+            }
         };
         Some(!matches!(kind, "no_connect" | "unconnected"))
     };
-    // A repeated pin number in one body must not let one eligible copy hide
-    // an ineligible one. Resolve the visible/electrical status of each.
+    // A repeated pin number in one body must not let one eligible copy mask
+    // an ineligible one. Resolve the electrical type of each.
     pins.iter().all(|pin| eligible(pin) == Some(true))
+}
+
+fn saved_contact_references<'a>(
+    definition: &PlacedPinDefinition<'a>,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    let mut records = Vec::new();
+    for instances in definition.placed.find_all("instances") {
+        for project in instances.find_all("project") {
+            for path in project.find_all("path") {
+                let (references, units) = (path.find_all("reference"), path.find_all("unit"));
+                let ([reference], [unit]) = (references.as_slice(), units.as_slice()) else {
+                    return None;
+                };
+                let reference = reference
+                    .get(1)?
+                    .as_str()
+                    .filter(|value| !value.is_empty())?;
+                let path = path.get(1)?.as_str()?;
+                if unit.get_f64(1) != Some(f64::from(definition.instance.unit)) {
+                    return None;
+                }
+                records.push((path, reference));
+            }
+        }
+    }
+    Some(records)
+}
+
+pub(super) fn contact_instance_paths(
+    schematic: &std::path::Path,
+    tree: &copperpour_sexp::SexpNode,
+) -> Option<Vec<String>> {
+    match super::resolve_schematic_ownership(schematic).ok()? {
+        Some(owner) => Some(owner.instance_paths),
+        None => tree.find_str("uuid").map(|uuid| vec![format!("/{uuid}")]),
+    }
+}
+
+fn is_canonical_instance_path(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(|path| {
+        path.split('/').all(|segment| {
+            uuid::Uuid::try_parse(segment).is_ok_and(|id| {
+                id.hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    == segment
+            })
+        })
+    })
+}
+
+fn contact_references_agree<'a>(
+    from: &PlacedPinDefinition<'_>,
+    to: &PlacedPinDefinition<'_>,
+    instance_paths: impl FnOnce() -> Option<&'a [String]>,
+) -> bool {
+    let (Some(from_records), Some(to_records)) =
+        (saved_contact_references(from), saved_contact_references(to))
+    else {
+        return false;
+    };
+    let endpoints = [
+        (from.instance.reference.as_str(), from_records),
+        (to.instance.reference.as_str(), to_records),
+    ];
+    // If KiCad can pick a different annotation, prove both requested
+    // references occur together in the actual hierarchy, not a foreign path.
+    if endpoints
+        .iter()
+        .all(|(reference, records)| records.iter().all(|(_, saved)| saved == reference))
+    {
+        return true;
+    }
+    // KiCad treats alternate UUID spellings and extra slashes as the same
+    // path. Do not let a second spelling evade the conflict check.
+    if endpoints.iter().any(|(_, records)| {
+        records
+            .iter()
+            .any(|(path, _)| !is_canonical_instance_path(path))
+    }) {
+        return false;
+    }
+    instance_paths().is_some_and(|paths| {
+        paths.iter().any(|path| {
+            endpoints.iter().all(|(reference, records)| {
+                if records.is_empty() {
+                    return true;
+                }
+                let mut on_path = records.iter().filter(|(saved_path, _)| *saved_path == path);
+                on_path.next().is_some_and(|(_, saved)| saved == reference)
+                    && on_path.next().is_none()
+            })
+        })
+    })
 }
 
 pub(crate) enum PinRoute {
@@ -831,13 +951,14 @@ pub(crate) enum PinRoute {
     AlreadyConnected { x: f64, y: f64 },
 }
 
-pub(crate) fn route_between_pins(
+pub(crate) fn route_between_pins<'a>(
     content: &str,
     tree: &copperpour_sexp::SexpNode,
     from: &NamedPin,
     to: &NamedPin,
+    instance_paths: impl FnOnce() -> Option<&'a [String]>,
 ) -> anyhow::Result<Result<PinRoute, ConnectionRefusal>> {
-    let (Some((from_instance, from_pins)), Some((to_instance, to_pins))) = (
+    let (Some(from_definition), Some(to_definition)) = (
         placed_pin_definition(tree, from),
         placed_pin_definition(tree, to),
     ) else {
@@ -845,8 +966,9 @@ pub(crate) fn route_between_pins(
     };
     let (from_tip, to_tip) = (saved_pin_tip(from), saved_pin_tip(to));
     if from_tip == to_tip {
-        if !can_confirm_pin_contact(from_instance, &from_pins, &from.pin.number)
-            || !can_confirm_pin_contact(to_instance, &to_pins, &to.pin.number)
+        if !can_confirm_pin_contact(&from_definition, &from.pin.number)
+            || !can_confirm_pin_contact(&to_definition, &to.pin.number)
+            || !contact_references_agree(&from_definition, &to_definition, instance_paths)
         {
             return Ok(Err(ConnectionRefusal::UnprovenContact));
         }
@@ -5556,7 +5678,12 @@ async fn handle_connect_pins(
         Err(refusal) => return Ok(refusal.result("connect", RECOVERY)),
     };
     // Route wire(s) between the two pin endpoints
-    let routed = match route_between_pins(&content, &tree, &from, &to)? {
+    let instance_paths = std::cell::OnceCell::new();
+    let routed = match route_between_pins(&content, &tree, &from, &to, || {
+        instance_paths
+            .get_or_init(|| contact_instance_paths(&sch_path, &tree))
+            .as_deref()
+    })? {
         Ok(PinRoute::Drawn(routed)) => routed,
         Ok(PinRoute::AlreadyConnected { x, y }) => {
             return Ok(CallToolResult::json(&json!({
@@ -9497,13 +9624,8 @@ mod coincident_route_tests {
         );
         assert_ne!(source, SHEET);
         let (handler, _dir, path) = setup(&source).await;
-        let result = serve(
-            &handler,
-            "connect_pins",
-            &path,
-            json!({"ref1": "R20", "pin1": "99", "ref2": "R21", "pin2": "2"}),
-        )
-        .await;
+        let pair = json!({"ref1": "R20", "pin1": "99", "ref2": "R21", "pin2": "2"});
+        let result = serve(&handler, "connect_pins", &path, pair.clone()).await;
         assert!(
             std::fs::read(&path).unwrap() == source.as_bytes(),
             "sheet changed"
@@ -9513,59 +9635,447 @@ mod coincident_route_tests {
             "connect_pins",
             "the requested pin position is not verified in its placed body style",
         );
+        let batch = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({
+                "is_error": true,
+                "connected_count": 0,
+                "already_connected": [],
+                "errors": [
+                    "R20.99 -> R21.2: the requested pin position is not verified in its placed body style"
+                ]
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+    }
+
+    const HIDDEN: &str = include_str!("../../tests/fixtures/hidden_pin_contact_kicad10.kicad_sch");
+    const VISIBLE: &str =
+        include_str!("../../tests/fixtures/visible_pin_contact_kicad10.kicad_sch");
+    const ALTERNATE: &str =
+        include_str!("../../tests/fixtures/alternate_pin_contact_kicad10.kicad_sch");
+    const UNPROVEN_CONTACT: &str = "the pin tips coincide, but contact cannot be confirmed \
+                                    for an electrically unconnected or unresolved pin";
+
+    async fn assert_contact(source: &str, from: &str, to: &str, x: f64, y: f64) {
+        let (handler, _dir, path) = setup(source).await;
+        assert_contact_at(&handler, &path, source, from, to, (x, y)).await;
+    }
+
+    async fn assert_contact_at(
+        handler: &McpHandler,
+        path: &std::path::Path,
+        source: &str,
+        from: &str,
+        to: &str,
+        (x, y): (f64, f64),
+    ) {
+        let pair = json!({"ref1": from, "pin1": "1", "ref2": to, "pin2": "1"});
+        let single = serve(handler, "connect_pins", path, pair.clone()).await;
+        assert_eq!(
+            single,
+            json!({"is_error": false, "already_connected": true, "x": x, "y": y})
+        );
+        assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
+
+        let batch = serve(
+            handler,
+            "batch_connect_pins",
+            path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({
+                "is_error": false,
+                "connected_count": 0,
+                "already_connected": [{"pair": format!("{from}.1 -> {to}.1"), "x": x, "y": y}],
+                "errors": []
+            })
+        );
+        assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
     }
 
     #[tokio::test]
-    async fn contact_does_not_claim_hidden_or_electrically_unconnected_pins() {
-        let pin = "(pin passive line\n\t\t\t\t\t(at 0 3.81 270)";
-        let alternate = SHEET.replacen(
-            pin,
-            &format!("{pin}\n\t\t\t\t\t(alternate \"NC\" no_connect line)"),
-            1,
-        );
-        let (start, end) = crate::tools::find_all_symbol_instance_blocks(&alternate, "R1")[0];
-        let mut selected = alternate.clone();
-        let symbol =
-            alternate[start..end].replacen("(pin \"1\"", "(pin \"1\"\n\t\t\t(alternate \"NC\")", 1);
-        selected.replace_range(start..end, &symbol);
-        for source in [
-            SHEET.replacen(pin, &format!("{pin}\n\t\t\t\t\t(hide yes)"), 1),
-            SHEET.replacen(pin, "(pin unconnected line\n\t\t\t\t\t(at 0 3.81 270)", 1),
-            selected,
-        ] {
-            assert_ne!(source, SHEET);
-            let (handler, _dir, path) = setup(&source).await;
-            let pair = json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"});
-            let single = serve(&handler, "connect_pins", &path, pair.clone()).await;
-            assert!(
-                std::fs::read(&path).unwrap() == source.as_bytes(),
-                "sheet changed"
-            );
-            assert_blocked(
-                &single,
-                "connect_pins",
-                "the pin tips coincide, but contact cannot be confirmed for a hidden, \
-                 electrically unconnected or unresolved pin",
-            );
+    async fn reports_hidden_power_pin_contact_without_writing() {
+        assert_contact(HIDDEN, "#PWR01", "R30", 124.46, 137.16).await;
+    }
+
+    #[tokio::test]
+    async fn reports_visible_power_pin_contact_without_writing() {
+        assert_contact(VISIBLE, "#PWR01", "R30", 124.46, 137.16).await;
+    }
+
+    #[tokio::test]
+    async fn reports_hidden_passive_pin_contact_without_writing() {
+        assert_contact(HIDDEN, "R2", "R1", 55.88, 50.8).await;
+    }
+
+    async fn assert_contact_refusal(source: &str, a: (&str, &str), b: (&str, &str)) {
+        let (handler, _dir, path) = setup(source).await;
+        assert_contact_refusal_at(&handler, &path, source, a, b).await;
+    }
+
+    async fn assert_contact_refusal_at(
+        handler: &McpHandler,
+        path: &std::path::Path,
+        source: &str,
+        a: (&str, &str),
+        b: (&str, &str),
+    ) {
+        for ((from, pin1), (to, pin2)) in [(a, b), (b, a)] {
+            let pair = json!({"ref1": from, "pin1": pin1, "ref2": to, "pin2": pin2});
+            let single = serve(handler, "connect_pins", path, pair.clone()).await;
+            assert_blocked(&single, "connect_pins", UNPROVEN_CONTACT);
+            assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
+
             let batch = serve(
-                &handler,
+                handler,
                 "batch_connect_pins",
-                &path,
+                path,
                 json!({"connections": [pair]}),
             )
             .await;
-            assert!(
-                std::fs::read(&path).unwrap() == source.as_bytes(),
-                "sheet changed"
+            assert_eq!(
+                batch,
+                json!({
+                    "is_error": true,
+                    "connected_count": 0,
+                    "already_connected": [],
+                    "errors": [format!("{from}.{pin1} -> {to}.{pin2}: {UNPROVEN_CONTACT}")]
+                })
             );
-            assert_eq!(batch["is_error"], true, "{batch}");
-            assert_eq!(batch["connected_count"], 0, "{batch}");
-            assert_eq!(batch["already_connected"], json!([]), "{batch}");
-            assert!(batch["errors"][0]
-                .as_str()
-                .unwrap()
-                .contains("contact cannot be confirmed"));
+            assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_a_no_connect_pin() {
+        assert_contact_refusal(HIDDEN, ("R3", "1"), ("R4", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_an_unconnected_pin() {
+        // Keep the existing fail-closed check for this noncanonical type.
+        let source = HIDDEN.replacen("(pin no_connect line", "(pin unconnected line", 1);
+        assert_contact_refusal(&source, ("R3", "1"), ("R4", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_a_selected_no_connect_alternate() {
+        assert_contact_refusal(ALTERNATE, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_a_selected_legacy_unconnected_alternate() {
+        // KiCad normalizes the old spelling when resaving this definition.
+        let source = ALTERNATE.replacen(
+            "(alternate \"NC\" no_connect line)",
+            "(alternate \"NC\" unconnected line)",
+            1,
+        );
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_for_an_unresolved_pin_number() {
+        let (handler, _dir, path) = setup(HIDDEN).await;
+        let pair = json!({"ref1": "#PWR01", "pin1": "1", "ref2": "R30", "pin2": "99"});
+        let single = serve(&handler, "connect_pins", &path, pair.clone()).await;
+        assert_eq!(single["is_error"], true, "{single}");
+        assert_eq!(
+            single["error"],
+            json!({
+                "kind": "stale_target",
+                "target": "R30 pin 99",
+                "reason": "R30 has no pin 99 on placed unit 1",
+            }),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), HIDDEN.as_bytes());
+        let batch = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({
+                "is_error": true,
+                "connected_count": 0,
+                "already_connected": [],
+                "errors": ["R30 pin 99: R30 has no pin 99 on placed unit 1"]
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), HIDDEN.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_the_placement_has_two_positions() {
+        let source = HIDDEN.replacen(
+            "(at 124.46 137.16 0)",
+            "(at 124.46 137.16 0)\n\t\t(at 127 137.16 0)",
+            1,
+        );
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_the_library_pin_has_two_positions() {
+        let source = HIDDEN.replacen("(at 0 0 270)", "(at 0 0 270)\n\t\t\t\t\t(at 2.54 0 270)", 1);
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_placed_symbol_has_an_invalid_orientation() {
+        // KiCad cannot save a symbol with this angle. Only change the target's
+        // angle in a copy of its saved fixture; GND still has a zero pin offset.
+        let source = HIDDEN.replacen("(at 124.46 137.16 0)", "(at 124.46 137.16 45)", 1);
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_saved_orientation_is_not_numeric() {
+        for replacement in ["(at 124.46 137.16)", "(at 124.46 137.16 bogus)"] {
+            let source = HIDDEN.replacen("(at 124.46 137.16 0)", replacement, 1);
+            assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+        }
+    }
+
+    async fn setup_reused_contact(
+        swap_resistor_references: bool,
+    ) -> (McpHandler, tempfile::TempDir, PathBuf, String) {
+        let root = "11111111-1111-4111-8111-111111111111";
+        let source = VISIBLE
+            .replace(
+                "(project \"visible_pin_contact_kicad10\"",
+                "(project \"reuse\"",
+            )
+            .replacen(
+                "(uuid \"4be0b2af-bd2b-4f96-9495-a33ac608abb9\")",
+                "(uuid \"44444444-4444-4444-8444-444444444444\")",
+                1,
+            );
+        let source = [("#PWR01", "#PWR02"), ("R30", "R31")].into_iter().fold(
+            source,
+            |source, (first, second)| {
+                let fields = |reference| {
+                    format!(
+                        "\n\t\t\t\t\t(reference \"{reference}\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)"
+                    )
+                };
+                let path = |sheet, reference| {
+                    format!("\t\t\t\t(path \"/{root}/{sheet}\"{}", fields(reference))
+                };
+                let (on_a, on_b) = if swap_resistor_references && first == "R30" {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                let changed = source.replacen(
+                    &format!(
+                        "\t\t\t\t(path \"/4be0b2af-bd2b-4f96-9495-a33ac608abb9\"{}",
+                        fields(first)
+                    ),
+                    &format!(
+                        "{}\n{}",
+                        path("22222222-2222-4222-8222-222222222222", on_a),
+                        path("33333333-3333-4333-8333-333333333333", on_b)
+                    ),
+                    1,
+                );
+                assert_ne!(changed, source);
+                changed
+            },
+        );
+        let (handler, dir, path) = setup(&source).await;
+        let sheets = [
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ]
+        .map(|uuid| {
+            format!(
+                "(sheet (at 50.8 50.8) (size 25.4 12.7) (uuid \"{uuid}\") \
+                     (property \"Sheetfile\" \"pin_contact.kicad_sch\" (at 50.8 50.8 0)))"
+            )
+        });
+        std::fs::write(dir.path().join("reuse.kicad_pro"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("reuse.kicad_sch"),
+            format!(
+                "(kicad_sch (version 20260306) (uuid \"{root}\") (lib_symbols) {} {})",
+                sheets[0], sheets[1]
+            ),
+        )
+        .unwrap();
+        (handler, dir, path, source)
+    }
+
+    #[tokio::test]
+    async fn reports_contact_on_a_reused_sheet_with_different_references() {
+        let (handler, _dir, path, source) = setup_reused_contact(false).await;
+        assert_contact_at(&handler, &path, &source, "#PWR01", "R30", (124.46, 137.16)).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_references_only_match_on_different_sheet_paths() {
+        let (handler, _dir, path, source) = setup_reused_contact(true).await;
+        assert_contact_refusal_at(&handler, &path, &source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    fn with_foreign_reference(value: &str, unit: u32) -> String {
+        let source = VISIBLE.replacen(
+            "(reference \"R30\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)",
+            &format!(
+                "(reference \"R30\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+                 \t\t\t(project \"another_project\"\n\
+                 \t\t\t\t(path \"/dab0b233-ece6-4f85-a589-8d8164617309\"\n\
+                 \t\t\t\t\t{value}\n\t\t\t\t\t(unit {unit})\n\t\t\t\t)\n\t\t\t)"
+            ),
+            1,
+        );
+        assert_ne!(source, VISIBLE);
+        source
+    }
+
+    #[tokio::test]
+    async fn reports_contact_with_a_different_reference_in_another_project() {
+        let source = with_foreign_reference("(reference \"R99\")", 1);
+        assert_contact(&source, "#PWR01", "R30", 124.46, 137.16).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_only_another_project_matches_the_reference() {
+        let source = with_foreign_reference("(reference \"R30\")", 1).replacen(
+            "(reference \"R30\")",
+            "(reference \"R99\")",
+            1,
+        );
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_path_has_conflicting_references() {
+        let source = with_foreign_reference("(reference \"R99\")", 1).replacen(
+            "/dab0b233-ece6-4f85-a589-8d8164617309",
+            "/4be0b2af-bd2b-4f96-9495-a33ac608abb9",
+            1,
+        );
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_path_alias_hides_a_conflicting_reference() {
+        for alias in [
+            "//4be0b2af-bd2b-4f96-9495-a33ac608abb9",
+            "/4BE0B2AF-BD2B-4F96-9495-A33AC608ABB9",
+        ] {
+            let source = with_foreign_reference("(reference \"R99\")", 1).replacen(
+                "/dab0b233-ece6-4f85-a589-8d8164617309",
+                alias,
+                1,
+            );
+            assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_saved_instance_unit_disagrees() {
+        let source = with_foreign_reference("(reference \"R99\")", 2);
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_no_saved_instance_reference_matches() {
+        let source = HIDDEN.replacen("(reference \"R1\")", "(reference \"R99\")", 1);
+        assert_contact_refusal(&source, ("R1", "1"), ("R2", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_instance_repeats_identity_fields() {
+        for replacement in [
+            "(reference \"R1\") (reference \"R99\")\n\t\t\t\t\t(unit 1)",
+            "(reference \"R1\")\n\t\t\t\t\t(unit 1) (unit 2)",
+        ] {
+            let source = HIDDEN.replacen("(reference \"R1\")\n\t\t\t\t\t(unit 1)", replacement, 1);
+            assert_contact_refusal(&source, ("R1", "1"), ("R2", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_instance_omits_an_identity_field() {
+        for replacement in ["(reference \"R1\")", "(unit 1)"] {
+            let source = HIDDEN.replacen("(reference \"R1\")\n\t\t\t\t\t(unit 1)", replacement, 1);
+            assert_contact_refusal(&source, ("R1", "1"), ("R2", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_instance_has_no_reference_value() {
+        for replacement in ["(reference)", "(reference \"\")"] {
+            let source = with_foreign_reference(replacement, 1);
+            assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_selected_alternate_has_two_definitions() {
+        let source = ALTERNATE.replacen(
+            "(alternate \"NC\" no_connect line)",
+            "(alternate \"NC\" input line)\n\t\t\t\t\t(alternate \"NC\" no_connect line)",
+            1,
+        );
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_placed_pin_repeats_its_alternate_selection() {
+        let source = ALTERNATE.replacen(
+            "(alternate \"NC\")",
+            "(alternate \"VPP\") (alternate \"NC\")",
+            1,
+        );
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_placed_pin_has_no_alternate_name() {
+        let source = ALTERNATE.replacen("(alternate \"NC\")", "(alternate)", 1);
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn keeps_hidden_contact_when_another_touching_pair_is_refused() {
+        let (handler, _dir, path) = setup(HIDDEN).await;
+        let result = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [
+                {"ref1": "R1", "pin1": "1", "ref2": "R2", "pin2": "1"},
+                {"ref1": "R3", "pin1": "1", "ref2": "R4", "pin2": "1"}
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({
+                "is_error": false,
+                "connected_count": 0,
+                "already_connected": [{"pair": "R1.1 -> R2.1", "x": 55.88, "y": 50.8}],
+                "errors": [format!("R3.1 -> R4.1: {UNPROVEN_CONTACT}")]
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), HIDDEN.as_bytes());
     }
 
     #[tokio::test]
