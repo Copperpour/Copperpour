@@ -19,10 +19,12 @@ An omitted, null, or empty list checks zero pairs.
 `alignment_pair_count` counts the pairs checked. `misaligned_pairs` lists only
 mismatches in request order, with a zero-based `pair_index`, the expected
 `alignment`, the absolute perpendicular `offset_mm`, and both resolved pins.
-If either selector is missing or ambiguous, the tool refuses the entire call
-with `invalid_argument` naming the indexed selector field. It will not choose
-between duplicate symbol UUIDs or between different endpoints with the same pin
-number. Identical selectors for both ends of a pair are also refused.
+An omitted or malformed required selector field or identical selectors return
+`invalid_argument` with the indexed field. A valid selector that names no
+placed symbol or pin returns `stale_target`. A duplicate symbol UUID or a pin
+number with more than one placed endpoint returns `ambiguous_target` with
+the matching identities and positions. Target errors name the indexed selector
+in `target`. The entire call is refused without choosing a match.
 
 Pins come from the placed unit and body style; stacked pins with one number and
 position are listed once. A sheet whose symbol pins cannot all be resolved, or whose

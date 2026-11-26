@@ -113,6 +113,29 @@ impl PinPosition<'_> {
     }
 }
 
+fn stale_pin(target: String, reason: &str) -> CallToolResult {
+    let message = format!("Cannot resolve {target}: {reason}. Check the saved sheet and retry.");
+    CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target,
+            reason: reason.to_owned(),
+        },
+        message,
+    )
+}
+
+fn ambiguous_pin(target: String, candidates: Vec<String>) -> CallToolResult {
+    let message = format!(
+        "Cannot resolve {target}: {} matches on the saved sheet. \
+         Correct the duplicate identity in the sheet or select another pin.",
+        candidates.len()
+    );
+    CallToolResult::error_kind(
+        ToolErrorKind::AmbiguousTarget { target, candidates },
+        message,
+    )
+}
+
 fn pair_pin<'a, 'sheet>(
     placed: &PlacedPinsByReference,
     pins: &'a [PinPosition<'sheet>],
@@ -120,23 +143,33 @@ fn pair_pin<'a, 'sheet>(
     field: &str,
 ) -> Result<&'a PinPosition<'sheet>, CallToolResult> {
     let uuid = field.to_owned() + ".symbol_uuid";
-    if selector.symbol_uuid.is_empty() {
-        return Err(invalid_arg(&uuid, "expected a non-empty symbol UUID"));
+    if uuid::Uuid::parse_str(&selector.symbol_uuid).is_err() {
+        return Err(invalid_arg(&uuid, "expected a saved symbol UUID"));
     }
     let mut symbols = placed
         .iter()
-        .filter(|(symbol, _)| symbol.uuid.as_deref() == Some(selector.symbol_uuid.as_str()));
-    if symbols.next().is_none() {
-        return Err(invalid_arg(
-            &uuid,
-            "symbol UUID not found on the saved sheet",
-        ));
-    }
-    if symbols.next().is_some() {
-        return Err(invalid_arg(
-            &uuid,
-            "symbol UUID is not unique on the saved sheet",
-        ));
+        .enumerate()
+        .filter(|(_, (symbol, _))| symbol.uuid.as_deref() == Some(selector.symbol_uuid.as_str()));
+    let Some(first) = symbols.next() else {
+        return Err(stale_pin(uuid, "symbol UUID not found on the saved sheet"));
+    };
+    if let Some(second) = symbols.next() {
+        let candidates = [first, second]
+            .into_iter()
+            .chain(symbols)
+            .map(|(index, (symbol, _))| {
+                format!(
+                    "symbol #{}: {} unit {}, UUID {}, origin ({}, {}) mm",
+                    index + 1,
+                    symbol.reference,
+                    symbol.unit,
+                    selector.symbol_uuid,
+                    symbol.x,
+                    symbol.y
+                )
+            })
+            .collect();
+        return Err(ambiguous_pin(uuid, candidates));
     }
     let number = field.to_owned() + ".pin_number";
     if selector.pin_number.is_empty() {
@@ -147,13 +180,25 @@ fn pair_pin<'a, 'sheet>(
             && pin.number == selector.pin_number
     });
     let Some(pin) = matching.next() else {
-        return Err(invalid_arg(&number, "pin not found on the placed symbol"));
+        return Err(stale_pin(number, "pin not found on the placed symbol"));
     };
-    if matching.next().is_some() {
-        return Err(invalid_arg(
-            &number,
-            "pin number has multiple placed endpoints",
-        ));
+    if let Some(second) = matching.next() {
+        let candidates = [pin, second]
+            .into_iter()
+            .chain(matching)
+            .map(|pin| {
+                format!(
+                    "{} unit {}, UUID {}, pin {} at ({}, {}) mm",
+                    pin.symbol.reference,
+                    pin.symbol.unit,
+                    selector.symbol_uuid,
+                    pin.number,
+                    pin.at.0,
+                    pin.at.1
+                )
+            })
+            .collect();
+        return Err(ambiguous_pin(number, candidates));
     }
     Ok(pin)
 }

@@ -189,35 +189,53 @@ async fn alignment_counts_one_internal_unit_of_displacement() {
 }
 
 #[tokio::test]
-async fn invalid_pairs_refuse_the_whole_call_and_name_the_field() {
+async fn missing_and_invalid_pairs_refuse_the_whole_call() {
     let sheet = Sheet::new("power_on_pin_kicad10.kicad_sch", PIN_UNITS).await;
     let valid = pair((R1, "1"), (R3, "1"), "row");
-    for (bad_pair, field) in [
+    for (bad_pair, kind, key, field) in [
         (
             pair(
                 (R1, "1"),
                 ("00000000-0000-4000-8000-000000000001", "1"),
                 "row",
             ),
+            "stale_target",
+            "target",
             "alignment_pairs[1].b.symbol_uuid",
         ),
         (
             pair((R1, "9"), (R3, "1"), "row"),
+            "stale_target",
+            "target",
             "alignment_pairs[1].a.pin_number",
         ),
-        (pair((R1, "1"), (R1, "1"), "row"), "alignment_pairs[1]"),
+        (
+            pair((R1, "1"), (R1, "1"), "row"),
+            "invalid_argument",
+            "field",
+            "alignment_pairs[1]",
+        ),
         (
             pair((R1, "1"), (R3, "1"), "diagonal"),
+            "invalid_argument",
+            "field",
             "alignment_pairs[1].alignment",
+        ),
+        (
+            pair((R1, "1"), ("R3", "1"), "row"),
+            "invalid_argument",
+            "field",
+            "alignment_pairs[1].b.symbol_uuid",
         ),
     ] {
         let body = sheet
             .error_with(json!({"alignment_pairs": [valid, bad_pair]}))
             .await;
-        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
-        assert_eq!(body["error"]["field"], field, "{body}");
+        assert_eq!(body["error"]["kind"], kind, "{body}");
+        assert_eq!(body["error"][key], field, "{body}");
         assert!(body.get("misaligned_pairs").is_none(), "{body}");
     }
+    assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), PIN_UNITS);
 }
 
 #[tokio::test]
@@ -230,15 +248,20 @@ async fn duplicate_symbol_uuid_is_ambiguous_even_if_only_one_copy_has_the_pin() 
     let body = sheet
         .error_with(json!({"alignment_pairs": [pair((POWER_UNIT, "1"), (R3, "1"), "row")]}))
         .await;
-    assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+    assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
     assert_eq!(
-        body["error"]["field"], "alignment_pairs[0].a.symbol_uuid",
+        body["error"]["target"], "alignment_pairs[0].a.symbol_uuid",
         "{body}"
     );
-    assert_eq!(
-        body["error"]["reason"],
-        "symbol UUID is not unique on the saved sheet"
-    );
+    let candidates = body["error"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{body}");
+    assert!(candidates
+        .iter()
+        .any(|row| row.as_str().unwrap().contains("R1 unit 1")));
+    assert!(candidates
+        .iter()
+        .any(|row| row.as_str().unwrap().contains("U1 unit 3")));
+    assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), source);
 }
 
 #[tokio::test]
@@ -264,15 +287,21 @@ async fn same_number_at_one_point_resolves_but_at_two_points_refuses() {
 
     let split = Sheet::new("split.kicad_sch", &source(1.27)).await;
     let body = split.error_with(args).await;
-    assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+    assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
     assert_eq!(
-        body["error"]["field"], "alignment_pairs[0].a.pin_number",
+        body["error"]["target"], "alignment_pairs[0].a.pin_number",
         "{body}"
     );
-    assert_eq!(
-        body["error"]["reason"],
-        "pin number has multiple placed endpoints"
-    );
+    let candidates = body["error"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{body}");
+    assert!(candidates[0]
+        .as_str()
+        .unwrap()
+        .ends_with("pin 1 at (12.7, 25.4) mm"));
+    assert!(candidates[1]
+        .as_str()
+        .unwrap()
+        .ends_with("pin 1 at (13.97, 25.4) mm"));
 }
 
 /// Half a grid step moves only U1's three pins off the grid. Their expected
