@@ -290,6 +290,97 @@ async fn an_ordinary_symbol_label_and_no_connect_sheet_can_fit() {
     assert_eq!(body["findings"], json!([]));
 }
 
+#[tokio::test]
+async fn the_coverage_fixture_retains_its_legacy_answers() {
+    // Observed through the same served tools on upstream main at fd58bfb1.
+    let sheet = Sheet::new(COVERAGE).await;
+    let pins = sheet
+        .setup("get_schematic_pin_locations", json!({"reference": "R1"}))
+        .await;
+    assert_eq!(
+        pins["pins"],
+        json!([
+            {"number": "1", "name": "", "unit": 1, "x": 101.6, "y": 85.09,
+             "orientation_degrees": 90.0, "length_mm": 1.27},
+            {"number": "2", "name": "", "unit": 1, "x": 101.6, "y": 92.71,
+             "orientation_degrees": 270.0, "length_mm": 1.27}
+        ])
+    );
+    for (pin, y, net) in [("1", 85.09, json!("SIG_A")), ("2", 92.71, Value::Null)] {
+        let actual = sheet
+            .setup(
+                "get_pin_net_name",
+                json!({"reference": "R1", "pin_number": pin}),
+            )
+            .await;
+        assert_eq!(
+            actual,
+            json!({"reference": "R1", "pin": pin, "pin_x": 101.6, "pin_y": y, "net": net})
+        );
+    }
+    let layout = sheet.setup("get_schematic_layout", json!({})).await;
+    assert_eq!(layout["bounds_resolved"], 1);
+    assert_eq!(layout["bounds_unresolved"], json!([]));
+    assert_box(&layout["bounding_box"], [100.584, 85.09, 102.616, 92.71]);
+    assert_eq!(
+        sheet.setup("check_schematic_overlaps", json!({})).await,
+        json!({"overlap_count": 0, "overlaps": [], "bounds_resolved": 1, "bounds_unresolved": []})
+    );
+
+    // Add positive witnesses for the legacy text and shape readers. Neither
+    // crossing wire touches a pin or joins the named net.
+    for [y1, y2] in [[86.36, 91.44], [74.93, 78.74]] {
+        sheet
+            .setup(
+                "add_wire",
+                json!({"x1": 104.14, "x2": 104.14, "y1": y1, "y2": y2}),
+            )
+            .await;
+    }
+    let overlaps = sheet.setup("check_schematic_overlaps", json!({})).await;
+    assert_eq!(overlaps["overlap_count"], 2, "{overlaps}");
+    let rows = overlaps["overlaps"].as_array().unwrap();
+    let field = rows
+        .iter()
+        .find(|row| row["type"] == "wire_field_overlap")
+        .unwrap();
+    assert_eq!(field["b"]["reference"], "R1");
+    assert_eq!(field["b"]["field"], "Reference");
+    assert_box(
+        &field["bounds_b"],
+        [102.865401, 87.825943, 104.287801, 89.913581],
+    );
+    let label = rows
+        .iter()
+        .find(|row| row["type"] == "wire_label_overlap")
+        .unwrap();
+    assert_eq!(label["b"]["net"], "SIG_A");
+    assert_box(
+        &label["bounds_b"],
+        [101.865968, 76.881201, 106.795987, 78.424554],
+    );
+
+    sheet
+        .setup(
+            "add_schematic_shapes",
+            json!({"shapes": [
+                {"type":"rect", "start":{"x":10.16,"y":30.48}, "end":{"x":20.32,"y":40.64}},
+                {"type":"poly", "points":[{"x":50.8,"y":10.16},{"x":50.8,"y":20.32},{"x":60.96,"y":20.32}]}
+            ]}),
+        )
+        .await;
+    let shapes = sheet.setup("list_schematic_shapes", json!({})).await;
+    assert_eq!(shapes["count"], 2, "{shapes}");
+    assert_eq!(shapes["shapes"][0]["type"], "rect");
+    assert_eq!(shapes["shapes"][0]["start"], json!({"x":10.16,"y":30.48}));
+    assert_eq!(shapes["shapes"][0]["end"], json!({"x":20.32,"y":40.64}));
+    assert_eq!(shapes["shapes"][1]["type"], "poly");
+    assert_eq!(
+        shapes["shapes"][1]["points"],
+        json!([{"x":50.8,"y":10.16},{"x":50.8,"y":20.32},{"x":60.96,"y":20.32}])
+    );
+}
+
 #[test]
 fn label_fields_follow_only_global_label_offsets() {
     let offset = Ok((1.5, 0.3));
