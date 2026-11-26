@@ -516,14 +516,15 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
 /// and the `(hide yes)` nested in the property's `(effects …)`.
 pub fn field_hidden(schematic: &Schematic, lib_id: &str, name: &str) -> Option<bool> {
     let symbol = embedded_lib_symbol(schematic, lib_id)?;
-    let property = symbol.find_all("property").into_iter().find(|p| {
-        crate::types::parse_property_header(p).is_some_and(|(_, n, _, _)| n == name)
-    })?;
+    let property = symbol
+        .find_all("property")
+        .into_iter()
+        .find(|p| crate::types::parse_property_header(p).is_some_and(|(_, n, _, _)| n == name))?;
     let (_, _, _, rest) = crate::types::parse_property_header(property)?;
-    let hide_flag = |n: &SexpNode| {
-        n.tag() == Some("hide") && n.value().is_none_or(|v| v == "yes")
-    };
-    let hidden = rest.iter().any(|n| n.text() == Some("hide") || hide_flag(n))
+    let hide_flag = |n: &SexpNode| n.tag() == Some("hide") && n.value().is_none_or(|v| v == "yes");
+    let hidden = rest
+        .iter()
+        .any(|n| n.text() == Some("hide") || hide_flag(n))
         || rest
             .iter()
             .filter(|n| n.tag() == Some("effects"))
