@@ -1465,10 +1465,15 @@ async fn get_symbol_info_refuses_a_mixed_or_unusable_library_path() {
     .await
     .unwrap();
     assert!(res.is_error);
+    let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+    assert_eq!(out["error"]["kind"], "invalid_argument", "{out}");
+    assert_eq!(out["error"]["field"], "symbol_name", "{out}");
     assert!(
-        result_text(&res).contains("Symbol 'Nope' not found in library"),
-        "{}",
-        result_text(&res)
+        out["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Symbol 'Nope' not found in library"),
+        "{out}"
     );
 }
 
@@ -2120,5 +2125,433 @@ mod symbol_source_tests {
             !uri.contains("KIPRJMOD"),
             "nothing portable to say about an out-of-project library: {uri}"
         );
+    }
+}
+
+mod structured_error_kind_tests {
+    use super::*;
+    use crate::tools::library::symbol_ops::handle_create_symbol;
+
+    async fn served_call(name: &str, arguments: serde_json::Value) -> (bool, serde_json::Value) {
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: "ipc:///nonexistent-copperpour-test-741-lib.sock".to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let reply = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 741,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }))
+            .await
+            .unwrap();
+        let result = reply.result.expect("tools/call returned a JSON-RPC result");
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(text)
+            .unwrap_or_else(|_| panic!("{name} returned non-JSON body: {text}"));
+        (is_error, parsed)
+    }
+
+    #[tokio::test]
+    async fn list_library_footprints_types_missing_and_non_directory_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("absent.pretty");
+        let (is_err, body) = served_call(
+            "list_library_footprints",
+            json!({ "library_path": missing.to_str().unwrap() }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert!(
+            !body["error"]["absolute_path"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Not a directory:"),
+            "{body}"
+        );
+
+        let file = tmp.path().join("not_a_dir.txt");
+        std::fs::write(&file, "x").unwrap();
+        let (is_err, body) = served_call(
+            "list_library_footprints",
+            json!({ "library_path": file.to_str().unwrap() }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "library_path", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Not a directory:"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_footprint_info_types_resolution_and_malformed_pad_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Missing filesystem path -> file_not_found with populated absolute_path.
+        let missing = tmp.path().join("absent.kicad_mod");
+        let (is_err, body) = served_call(
+            "get_footprint_info",
+            json!({ "footprint_path": missing.to_str().unwrap() }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert!(
+            !body["error"]["absolute_path"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "{body}"
+        );
+
+        // Unresolved Library:Footprint -> file_not_found without fabricating <cwd>/<lib_id>.
+        let (is_err, body) = served_call(
+            "get_footprint_info",
+            json!({ "footprint_path": "NoSuchLib741:MissingFp" }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["error"]["path"], "NoSuchLib741:MissingFp", "{body}");
+        assert_eq!(body["error"]["absolute_path"], "", "{body}");
+
+        // Malformed pads under include_pads -> malformed_file for all three pad checks.
+        let cases = [
+            (
+                "missing_at.kicad_mod",
+                "(footprint \"Bad\" (layer \"F.Cu\") (pad \"1\" smd rect (size 1 1) (layers \"F.Cu\")))\n",
+                "no readable footprint-local position",
+            ),
+            (
+                "invalid_at.kicad_mod",
+                "(footprint \"Bad\" (layer \"F.Cu\") (pad \"1\" smd rect (at bad 0) (size 1 1) (layers \"F.Cu\")))\n",
+                "invalid footprint-local position",
+            ),
+            (
+                "unreadable_pad.kicad_mod",
+                "(footprint \"Bad\" (layer \"F.Cu\") (pad (nested) smd rect (at 0 0) (size 1 1) (layers \"F.Cu\")))\n",
+                "Could not read pad",
+            ),
+        ];
+        for (filename, content, needle) in cases {
+            let fp = tmp.path().join(filename);
+            std::fs::write(&fp, content).unwrap();
+            let (is_err, body) = served_call(
+                "get_footprint_info",
+                json!({
+                    "footprint_path": fp.to_str().unwrap(),
+                    "include_pads": true
+                }),
+            )
+            .await;
+            assert!(is_err, "{filename}: {body}");
+            assert_eq!(
+                body["error"]["kind"], "malformed_file",
+                "{filename}: {body}"
+            );
+            assert!(
+                body["message"].as_str().unwrap_or("").contains(needle),
+                "{filename}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_symbol_info_types_lib_id_and_missing_symbol_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Malformed lib_id (no colon) -> invalid_argument on lib_id.
+        let (is_err, body) = served_call("get_symbol_info", json!({ "lib_id": "DeviceR" })).await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "lib_id", "{body}");
+
+        // Unresolved library -> file_not_found without fabricated absolute_path.
+        let (is_err, body) = served_call(
+            "get_symbol_info",
+            json!({ "lib_id": "NoSuchSymLib741:MissingPart" }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(
+            body["error"]["path"], "NoSuchSymLib741:MissingPart",
+            "{body}"
+        );
+        assert_eq!(body["error"]["absolute_path"], "", "{body}");
+
+        // Existing library file with missing symbol -> invalid_argument on symbol_name.
+        let sym_lib = tmp.path().join("House.kicad_sym");
+        std::fs::write(
+            &sym_lib,
+            "(kicad_symbol_lib (version 20231120) (generator \"kicad_symbol_editor\")\n  (symbol \"RealPart\")\n)\n",
+        )
+        .unwrap();
+        let (is_err, body) = served_call(
+            "get_symbol_info",
+            json!({
+                "library_path": sym_lib.to_str().unwrap(),
+                "symbol_name": "AbsentPart"
+            }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "symbol_name", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Symbol 'AbsentPart' not found in library"),
+            "{body}"
+        );
+
+        // Same missing symbol via lib_id + project sym-lib-table -> invalid_argument on lib_id.
+        std::fs::write(
+            tmp.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n  (lib (name \"House741\")(type \"KiCad\")(uri \"{}\")(options \"\")(descr \"\"))\n)\n",
+                portable_uri(&sym_lib)
+            ),
+        )
+        .unwrap();
+        let (is_err, body) = served_call(
+            "get_symbol_info",
+            json!({
+                "lib_id": "House741:AbsentPart",
+                "project_dir": tmp.path().to_str().unwrap()
+            }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "lib_id", "{body}");
+    }
+
+    #[tokio::test]
+    async fn create_symbol_types_graphics_and_unit_build_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("custom.kicad_sym");
+        let lib_str = lib.to_str().unwrap();
+
+        // 1. Top-level graphics combined with units -> invalid_argument on graphics.
+        let (is_err, body) = served_call(
+            "create_symbol",
+            json!({
+                "library_path": lib_str,
+                "name": "DualBad",
+                "reference_prefix": "U",
+                "graphics": [],
+                "units": [{ "pins": [{ "number": "1", "name": "A", "type": "passive" }] }]
+            }),
+        )
+        .await;
+        assert!(is_err, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "graphics", "{body}");
+        assert!(!lib.exists(), "refusal must not create the library file");
+
+        // 2. Direct handler checks for guards that JSON schema rejects earlier at dispatch
+        //    (bad pin electrical types, invalid graphics primitives, and non-array graphics).
+        for (args, expected_field) in [
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadSingleGfx",
+                    "reference_prefix": "U",
+                    "pins": [{ "number": "1", "name": "A", "type": "passive", "x": -2.54, "y": 0.0 }],
+                    "graphics": [{
+                        "type": "line",
+                        "start": { "x": 0.0, "y": 0.0 },
+                        "end": { "x": 2.54, "y": 0.0 },
+                        "stroke_width_mm": 0.254,
+                        "fill": "solid"
+                    }]
+                }),
+                "graphics",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadMultiGfx",
+                    "reference_prefix": "U",
+                    "units": [
+                        { "pins": [{ "number": "1", "name": "A", "type": "passive" }] },
+                        {
+                            "pins": [{ "number": "2", "name": "B", "type": "passive", "x": 0.0, "y": 0.0 }],
+                            "graphics": [{
+                                "type": "line",
+                                "start": { "x": 0.0, "y": 0.0 },
+                                "end": { "x": 2.54, "y": 0.0 },
+                                "stroke_width_mm": 0.254,
+                                "fill": "solid"
+                            }]
+                        }
+                    ]
+                }),
+                "units[1].graphics",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadPinType",
+                    "reference_prefix": "U",
+                    "pins": [{ "number": "1", "name": "NC", "type": "not_connected" }]
+                }),
+                "pins",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadSplitSignal",
+                    "reference_prefix": "U",
+                    "glyph": "opamp",
+                    "pins": [
+                        { "number": "1", "name": "IN+", "type": "not_connected" },
+                        { "number": "4", "name": "V+", "type": "power_in" }
+                    ]
+                }),
+                "pins",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadMultiPin",
+                    "reference_prefix": "U",
+                    "units": [
+                        { "pins": [{ "number": "1", "name": "A", "type": "passive" }] },
+                        { "pins": [{ "number": "2", "name": "B", "type": "not_connected" }] }
+                    ]
+                }),
+                "units[1].pins",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadPowerPin",
+                    "reference_prefix": "U",
+                    "units": [
+                        { "pins": [{ "number": "1", "name": "A", "type": "passive" }] }
+                    ],
+                    "power_pins": [{ "number": "8", "name": "VCC", "type": "not_connected", "x": 0.0, "y": 5.08 }]
+                }),
+                "power_pins",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadTopGfxType",
+                    "reference_prefix": "U",
+                    "pins": [{ "number": "1", "name": "A", "type": "passive" }],
+                    "graphics": "not-an-array"
+                }),
+                "graphics",
+            ),
+            (
+                json!({
+                    "library_path": lib_str,
+                    "name": "BadUnitGfxType",
+                    "reference_prefix": "U",
+                    "units": [
+                        { "pins": [{ "number": "1", "name": "A", "type": "passive" }] },
+                        { "pins": [{ "number": "2", "name": "B", "type": "passive" }], "graphics": "bad" }
+                    ]
+                }),
+                "units[1].graphics",
+            ),
+        ] {
+            let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+            assert!(res.is_error);
+            let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+            assert_eq!(out["error"]["kind"], "invalid_argument", "{out}");
+            assert_eq!(out["error"]["field"], expected_field, "{out}");
+        }
+        assert!(
+            !lib.exists(),
+            "no refused create_symbol call may create the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn lib_table_list_and_register_tools_type_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("board.kicad_pro");
+        std::fs::write(&proj, "{}\n").unwrap();
+
+        // Directory in place of project fp-lib-table and sym-lib-table -> file_not_found.
+        std::fs::create_dir(tmp.path().join("fp-lib-table")).unwrap();
+        std::fs::create_dir(tmp.path().join("sym-lib-table")).unwrap();
+        for tool in ["list_footprint_libraries", "list_symbol_libraries"] {
+            let (is_err, body) = served_call(
+                tool,
+                json!({ "scope": "project", "project": proj.to_str().unwrap() }),
+            )
+            .await;
+            assert!(is_err, "{tool}: {body}");
+            assert_eq!(body["error"]["kind"], "file_not_found", "{tool}: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Cannot read lib-table"),
+                "{tool}: {body}"
+            );
+        }
+
+        // register_* with missing or unusable project -> invalid_argument on project.
+        let missing_proj = tmp.path().join("no-such-project");
+        for (tool, lib_path) in [
+            ("register_footprint_library", tmp.path().join("x.pretty")),
+            ("register_symbol_library", tmp.path().join("x.kicad_sym")),
+        ] {
+            let (is_err, body) = served_call(
+                tool,
+                json!({
+                    "library_path": lib_path.to_str().unwrap(),
+                    "nickname": "House",
+                    "scope": "project"
+                }),
+            )
+            .await;
+            assert!(is_err, "{tool} missing project: {body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
+            assert_eq!(body["error"]["field"], "project", "{tool}: {body}");
+
+            let (is_err, body) = served_call(
+                tool,
+                json!({
+                    "library_path": lib_path.to_str().unwrap(),
+                    "nickname": "House",
+                    "scope": "project",
+                    "project": missing_proj.to_str().unwrap()
+                }),
+            )
+            .await;
+            assert!(is_err, "{tool} unusable project: {body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
+            assert_eq!(body["error"]["field"], "project", "{tool}: {body}");
+        }
     }
 }

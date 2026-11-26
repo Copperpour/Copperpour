@@ -702,6 +702,11 @@ fn build_symbol_unit_refuses_to_invent_a_drawn_pin_coordinate() {
         Ok(_) => panic!("a drawn pin with no x must not be built"),
         Err(error) => error,
     };
+    assert_eq!(
+        error.kind,
+        crate::tools::library::symbol_ops::SymbolUnitErrorKind::Pins,
+        "{error}"
+    );
     assert!(error.to_string().contains("exactly as supplied"), "{error}");
 }
 

@@ -1,7 +1,7 @@
 //! Library symbol, footprint, and 3D model listing, search, and inspection tools.
 
 use super::lib_tables::{
-    expand_lib_uri, global_fp_lib_table, global_sym_lib_table, read_flat_lib_table,
+    expand_lib_uri, global_fp_lib_table, global_sym_lib_table, is_lib_id, read_flat_lib_table,
     read_global_lib_table, resolve_footprint_path, KiCadSymbolSource,
 };
 use crate::mcp::error::ToolErrorKind;
@@ -465,10 +465,16 @@ pub(super) async fn handle_list_library_footprints(
     let lib_dir = PathBuf::from(library_path_str);
 
     if !lib_dir.is_dir() {
-        return Ok(CallToolResult::error(format!(
-            "Not a directory: {}",
-            library_path_str
-        )));
+        let message = format!("Not a directory: {}", library_path_str);
+        let kind = if lib_dir.exists() {
+            ToolErrorKind::InvalidArgument {
+                field: "library_path".to_string(),
+                reason: message.clone(),
+            }
+        } else {
+            ToolErrorKind::file_not_found(&lib_dir)
+        };
+        return Ok(CallToolResult::error_kind(kind, message));
     }
 
     let mut footprints = Vec::new();
@@ -509,7 +515,17 @@ pub(super) async fn handle_get_footprint_info(
         .and_then(|p| p.parent().map(Path::to_path_buf));
     let path = match resolve_footprint_path(fp_path_str, project_dir.as_deref()) {
         Ok(p) => p,
-        Err(msg) => return Ok(CallToolResult::error(msg)),
+        Err(msg) => {
+            let kind = if is_lib_id(fp_path_str) {
+                ToolErrorKind::FileNotFound {
+                    path: fp_path_str.to_string(),
+                    absolute_path: String::new(),
+                }
+            } else {
+                ToolErrorKind::file_not_found(fp_path_str)
+            };
+            return Ok(CallToolResult::error_kind(kind, msg));
+        }
     };
 
     let content = tokio::fs::read_to_string(&path).await?;
@@ -557,6 +573,15 @@ pub(super) async fn handle_get_footprint_info(
         "path": path.to_str().unwrap_or("")
     });
     if args["include_pads"].as_bool().unwrap_or(false) {
+        let malformed_pad = |message: String| {
+            CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: copperpour_sexp::paths::display_path(&path),
+                    reason: message.clone(),
+                },
+                message,
+            )
+        };
         let mut pads = Vec::with_capacity(pad_count);
         for pad in footprint
             .children()
@@ -569,12 +594,12 @@ pub(super) async fn handle_get_footprint_info(
                 .and_then(SexpNode::as_str)
                 .unwrap_or("<unreadable>");
             let Some(at) = pad.find("at") else {
-                return Ok(CallToolResult::error(format!(
+                return Ok(malformed_pad(format!(
                     "Pad '{pad_number}' has no readable footprint-local position"
                 )));
             };
             let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) else {
-                return Ok(CallToolResult::error(format!(
+                return Ok(malformed_pad(format!(
                     "Pad '{pad_number}' has an invalid footprint-local position"
                 )));
             };
@@ -588,7 +613,7 @@ pub(super) async fn handle_get_footprint_info(
             ) {
                 Ok(info) => info,
                 Err(error) => {
-                    return Ok(CallToolResult::error(format!(
+                    return Ok(malformed_pad(format!(
                         "Could not read pad '{pad_number}': {error}"
                     )))
                 }
@@ -621,19 +646,32 @@ pub(super) async fn handle_get_footprint_info(
                     },
                 ) => {
                     return Ok(CallToolResult::error_kind(
-                        crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        ToolErrorKind::InvalidArgument {
                             field: field.clone(),
                             reason: reason.clone(),
                         },
                         format!("Argument '{field}' is invalid: {reason}"),
                     ));
                 }
-                Err(crate::tools::footprint_graphics::FootprintGraphicsError::Conflict(reason))
-                | Err(crate::tools::footprint_graphics::FootprintGraphicsError::StaleTarget {
+                Err(crate::tools::footprint_graphics::FootprintGraphicsError::Conflict(reason)) => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::Conflict {
+                            paths: vec![copperpour_sexp::paths::display_path(&path)],
+                        },
+                        reason,
+                    ));
+                }
+                Err(crate::tools::footprint_graphics::FootprintGraphicsError::StaleTarget {
+                    target,
                     reason,
-                    ..
                 }) => {
-                    return Ok(CallToolResult::error(reason));
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::StaleTarget {
+                            target,
+                            reason: reason.clone(),
+                        },
+                        reason,
+                    ));
                 }
             };
         response["graphic_count"] = json!(graphics.len());
@@ -939,8 +977,13 @@ pub(super) async fn handle_get_symbol_info(
 
         let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
         if parts.len() != 2 {
-            return Ok(CallToolResult::error(
-                "lib_id must be in 'Library:Symbol' format (e.g. 'Device:R')",
+            let message = "lib_id must be in 'Library:Symbol' format (e.g. 'Device:R')";
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "lib_id".to_string(),
+                    reason: message.to_string(),
+                },
+                message,
             ));
         }
         let (lib_nick, sym_name) = (parts[0], parts[1]);
@@ -954,11 +997,17 @@ pub(super) async fn handle_get_symbol_info(
         let lib_path = match resolve_symbol_lib_path(lib_nick, sym_name, project_dir.as_deref()) {
             Some(p) => p,
             None => {
-                return Ok(CallToolResult::error(format!(
-                    "Symbol '{}' not found: no library '{}' in the project or global \
-                     sym-lib-table, nor in the installed KiCad symbol libraries",
-                    lib_id, lib_nick
-                )));
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::FileNotFound {
+                        path: lib_id.to_string(),
+                        absolute_path: String::new(),
+                    },
+                    format!(
+                        "Symbol '{}' not found: no library '{}' in the project or global \
+                         sym-lib-table, nor in the installed KiCad symbol libraries",
+                        lib_id, lib_nick
+                    ),
+                ));
             }
         };
         let identity = json!({ "lib_id": lib_id, "library": lib_nick });
@@ -979,10 +1028,19 @@ pub(super) async fn handle_get_symbol_info(
     let sym_node = match sym_node {
         Some(n) => n,
         None => {
-            return Ok(CallToolResult::error(format!(
-                "Symbol '{}' not found in library '{}'",
-                sym_name, lib_nick
-            )));
+            let field = if given("library_path") {
+                "symbol_name"
+            } else {
+                "lib_id"
+            };
+            let message = format!("Symbol '{}' not found in library '{}'", sym_name, lib_nick);
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: field.to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         }
     };
 
