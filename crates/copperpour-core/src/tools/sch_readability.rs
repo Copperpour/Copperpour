@@ -60,8 +60,12 @@ pub(super) fn compare_tool_def() -> ToolDef {
         "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
          Counts wires crossing visible Reference or Value text on ordinary symbols \
          and wires crossing drawn pin names or numbers. \
-         Check pin connectivity, symbol identity, and saved PCB/BOM fields and flags, \
-         including variants and child-sheet instances, before ranking layout changes. \
+         Before ranking layout changes, check pin connectivity, primary net names, \
+         scoped aliases, symbol identity, saved PCB/BOM fields and flags (including \
+         variants and child-sheet instances), and embedded library identity, jumpers, \
+         fields, units, and pins. Embedded Description, ki_keywords, and ki_fp_filters \
+         are not compared (https://github.com/Copperpour/Copperpour/issues/938). \
+         Refuse different schematic format versions when symbols are retained. \
          Refuse changes that could affect unresolved rule areas or exported text expressions. \
          Use verdict for decisions; reasons are human-readable diagnostics. \
          No writes, editor access, or ERC.",

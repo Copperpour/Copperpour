@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
+#[path = "sch_layout_library.rs"]
+mod library;
 #[path = "sch_layout_properties.rs"]
 mod properties;
 
@@ -399,6 +401,9 @@ fn gate(
     if reasons.is_empty() {
         if let Some((old, new)) = &sources {
             properties::uncertain_changes((old, new), &mut reasons);
+        }
+        if reasons.is_empty() && matches!(comparison, NetComparison::Layout) {
+            library::append_changes((before, &was), (after, &now), &mut reasons);
         }
     }
     reasons
