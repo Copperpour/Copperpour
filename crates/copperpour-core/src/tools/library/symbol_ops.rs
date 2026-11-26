@@ -2,6 +2,7 @@
 
 use super::footprint_ops::invalid_library_argument;
 use super::search_and_info::top_level_symbol_names;
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tools::footprint_metadata::quote_string;
 use crate::tools::{get_path, require_str, ToolContext};
@@ -913,6 +914,43 @@ fn build_glyph_unit(
     Ok((sexp, Some(geom.rect), resolved))
 }
 
+/// Which argument a [`build_symbol_unit`] refusal blames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SymbolUnitErrorKind {
+    Pins,
+    Graphics,
+}
+
+/// Structured refusal returned by [`build_symbol_unit`], naming the blamed
+/// argument group alongside the verbatim human-readable message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SymbolUnitError {
+    pub(super) kind: SymbolUnitErrorKind,
+    pub(super) message: String,
+}
+
+impl std::fmt::Display for SymbolUnitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl SymbolUnitError {
+    pub(super) fn into_result(self, pins_field: &str, graphics_field: &str) -> CallToolResult {
+        let field = match self.kind {
+            SymbolUnitErrorKind::Pins => pins_field,
+            SymbolUnitErrorKind::Graphics => graphics_field,
+        };
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: field.to_string(),
+                reason: self.message.clone(),
+            },
+            self.message,
+        )
+    }
+}
+
 /// Build one unit's inner S-expression — an optional body (a rectangle, or a
 /// conventional `glyph` shape) followed by its pins — and return it with the
 /// body rect (used for reference/value placement) and an optional warning (e.g.
@@ -920,7 +958,9 @@ fn build_glyph_unit(
 /// single- and multi-unit paths.
 ///
 /// Errors (#55) when a pin's electrical type is not one of KiCAD's 12 valid
-/// values — the caller must not write anything to disk in that case.
+/// values, when supplied `graphics` primitives are invalid, or when a drawn-body
+/// pin lacks numeric coordinates — the error names the blamed argument group and
+/// the caller must not write anything to disk in that case.
 /// Glyph units keep their fixed library-matching shape, so `show_names` only
 /// reaches the rectangle path.
 pub(super) fn build_symbol_unit(
@@ -928,15 +968,21 @@ pub(super) fn build_symbol_unit(
     glyph: Option<Glyph>,
     show_names: bool,
     graphics: Option<&[serde_json::Value]>,
-) -> anyhow::Result<BuiltUnit> {
-    validate_pin_types(pins_val)?;
+) -> Result<BuiltUnit, SymbolUnitError> {
+    validate_pin_types(pins_val).map_err(|error| SymbolUnitError {
+        kind: SymbolUnitErrorKind::Pins,
+        message: error.to_string(),
+    })?;
     // Caller-supplied geometry wins over every body. The automatic rectangle
     // exists to give pins something to sit on; a caller who has drawn the body
     // does not want a box around their drawing, and — because the auto path
     // slides pins out to the rectangle it computed — does not want their pin
     // coordinates moved either. Both follow from taking this branch (#501).
     if let Some(graphics) = graphics {
-        validate_graphics(graphics).map_err(|e| anyhow::anyhow!(e))?;
+        validate_graphics(graphics).map_err(|message| SymbolUnitError {
+            kind: SymbolUnitErrorKind::Graphics,
+            message,
+        })?;
         let (body_sexp, rect) = emit_symbol_graphics(graphics);
         let mut pins_sexp = String::new();
         let mut resolved = Vec::with_capacity(pins_val.len());
@@ -946,10 +992,13 @@ pub(super) fn build_symbol_unit(
             // value is actually used keeps a future drawn call site from
             // reintroducing the origin the caller never gave.
             let (Some(x), Some(y)) = (pin["x"].as_f64(), pin["y"].as_f64()) else {
-                anyhow::bail!(
-                    "pin \"{}\" has no numeric x and y, and a drawn body writes pin coordinates exactly as supplied",
-                    pin["number"].as_str().unwrap_or("1")
-                );
+                return Err(SymbolUnitError {
+                    kind: SymbolUnitErrorKind::Pins,
+                    message: format!(
+                        "pin \"{}\" has no numeric x and y, and a drawn body writes pin coordinates exactly as supplied",
+                        pin["number"].as_str().unwrap_or("1")
+                    ),
+                });
             };
             resolved.push(ResolvedPin::new(pin, x, y));
             pins_sexp.push_str(&emit_pin(
@@ -1685,16 +1734,29 @@ pub(crate) async fn handle_create_symbol(
     // top-level `pins` and `glyph` do.
     let sym_graphics = match graphics_arg(&args["graphics"], "top-level") {
         Ok(g) => g,
-        Err(e) => return Ok(CallToolResult::error(e)),
+        Err(e) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "graphics".to_string(),
+                    reason: e.clone(),
+                },
+                e,
+            ))
+        }
     };
     // Top-level `pins` is superseded by `units` and the schema says so, but
     // losing a redundant pin list is not the same as losing a drawing: geometry
     // sent here while `units` is in use would never reach the file, and the
     // symbol would come out with an automatic rectangle and a success.
     if sym_graphics.is_some() && !unit_objs.is_empty() {
-        return Ok(CallToolResult::error(
-            "top-level 'graphics' has no effect when 'units' is given: move it to the \
-             unit that should carry it, as units[].graphics",
+        let message = "top-level 'graphics' has no effect when 'units' is given: move it to the \
+             unit that should carry it, as units[].graphics";
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "graphics".to_string(),
+                reason: message.to_string(),
+            },
+            message,
         ));
     }
 
@@ -1744,7 +1806,7 @@ pub(crate) async fn handle_create_symbol(
             let unit1 =
                 match build_symbol_unit(&signal, sym_glyph, show_names, sym_graphics.as_deref()) {
                     Ok(v) => v,
-                    Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                    Err(e) => return Ok(e.into_result("pins", "graphics")),
                 };
             warnings.extend(unit1.warning.clone());
             warnings.extend(unit1.displacement_warning("unit 1"));
@@ -1756,7 +1818,7 @@ pub(crate) async fn handle_create_symbol(
             let power_laid = layout_power_unit(&power);
             let unit2 = match build_symbol_unit(&power_laid, None, show_names, None) {
                 Ok(v) => v,
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                Err(e) => return Ok(e.into_result("pins", "graphics")),
             };
             warnings.extend(unit2.warning.clone());
             warnings.extend(unit2.displacement_warning("unit 2"));
@@ -1776,7 +1838,7 @@ pub(crate) async fn handle_create_symbol(
                 sym_graphics.as_deref(),
             ) {
                 Ok(v) => v,
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                Err(e) => return Ok(e.into_result("pins", "graphics")),
             };
             warnings.extend(unit.warning.clone());
             warnings.extend(unit.displacement_warning("unit 1"));
@@ -1815,7 +1877,15 @@ pub(crate) async fn handle_create_symbol(
             };
             let unit_graphics = match graphics_arg(&u["graphics"], &format!("unit {}:", i + 1)) {
                 Ok(g) => g,
-                Err(e) => return Ok(CallToolResult::error(e)),
+                Err(e) => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: format!("units[{i}].graphics"),
+                            reason: e.clone(),
+                        },
+                        e,
+                    ))
+                }
             };
             if unit_graphics.is_some() {
                 if let Err(error) =
@@ -1831,7 +1901,11 @@ pub(crate) async fn handle_create_symbol(
                 unit_graphics.as_deref(),
             ) {
                 Ok(v) => v,
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                Err(e) => {
+                    return Ok(
+                        e.into_result(&format!("units[{i}].pins"), &format!("units[{i}].graphics"))
+                    )
+                }
             };
             let unit_label = format!("unit {}", i + 1);
             if let Some(w) = unit.warning.clone() {
@@ -1856,7 +1930,7 @@ pub(crate) async fn handle_create_symbol(
             };
             let unit = match build_symbol_unit(&power_laid, None, show_names, None) {
                 Ok(v) => v,
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                Err(e) => return Ok(e.into_result("power_pins", "graphics")),
             };
             if let Some((first, second)) = unit.pins.iter().enumerate().find_map(|(i, first)| {
                 unit.pins[i + 1..]
