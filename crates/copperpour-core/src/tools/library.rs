@@ -229,7 +229,7 @@ pub fn tools() -> Vec<ToolDef> {
     let mut tools = vec![
         tool!(
             "create_footprint",
-            "Create a new footprint (.kicad_mod) file from a pad layout description.",
+            "Create a new footprint (.kicad_mod) file at `output` using footprint `name` and a `pads` layout.",
             json!({
                 "type": "object",
                 "properties": {

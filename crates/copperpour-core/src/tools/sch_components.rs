@@ -451,7 +451,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_component_annotation",
-            "Add or update a custom property consistently across every placed unit of a component. Reference, Value, Footprint and Datasheet are set through edit_schematic_component's own arguments, and a key named DNP is refused: do-not-populate is KiCad's native attribute, set with edit_schematic_component's 'dnp'. On a sheet placed more than once, the change reaches every instance of the sheet.",
+            "Add or update a custom property supplied as `key` and `value` across every placed unit of a component. Reference, Value, Footprint and Datasheet are set through edit_schematic_component's own arguments, and a key named DNP is refused: do-not-populate is KiCad's native attribute, set with edit_schematic_component's 'dnp'. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
