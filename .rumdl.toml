@@ -8,5 +8,6 @@ headings = false
 code-blocks = false
 code-spans = false
 tables = false
-reflow = true
+stern = true
+reflow = false
 reflow-length-exemptions = true
