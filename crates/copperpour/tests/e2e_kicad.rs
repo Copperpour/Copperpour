@@ -1177,3 +1177,275 @@ while ($true) {
     let _ = manager.kill();
     let _ = manager.wait();
 }
+
+/// Live macOS KiCad 10 validation for `open_board` (#23):
+/// 1. Fresh launch (`Contents/Applications/pcbnew.app/Contents/MacOS/pcbnew`)
+///    on a path containing spaces → live IPC `get_board_info` (`source: "ipc"`),
+///    confirming standalone `pcbnew` answers `GetOpenDocuments` without needing
+///    Project Manager launched second.
+/// 2. Already-open reuse (`launched: false`).
+/// 3. Lock-file refusal (`conflict`).
+/// 4. Project Manager (`KiCad.app/Contents/MacOS/kicad` on `/tmp/kicad/api.sock`)
+///    + `open_board` launching `pcbnew` beside it on `/tmp/kicad/api-<pid>.sock`
+///    → discovers and selects the editor socket and subsequent `get_board_info`
+///    reaches live IPC.
+///
+/// Seeds KiCad config inside a private tempdir (`KICAD_CONFIG_HOME`) so the
+/// developer's real `~/Library/Preferences/kicad` profile is never touched, and
+/// requires `CI` or `COPPERPOUR_E2E_ALLOW_KILL_KICAD=1` before killing KiCad
+/// processes.
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires macOS KiCad 10 GUI; run via e2e workflow"]
+fn e2e_macos_open_board_live_kicad() {
+    let allow_kill = std::env::var_os("CI").is_some()
+        || std::env::var("COPPERPOUR_E2E_ALLOW_KILL_KICAD").as_deref() == Ok("1");
+    if !allow_kill {
+        eprintln!(
+            "skipping e2e_macos_open_board_live_kicad: set CI=1 or \
+             COPPERPOUR_E2E_ALLOW_KILL_KICAD=1 to allow terminating kicad/pcbnew"
+        );
+        return;
+    }
+
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCad");
+    };
+    let macos_dir = std::path::Path::new(&kicad_cli)
+        .parent()
+        .expect("kicad-cli must have a parent Contents/MacOS directory");
+    let kicad_bin = macos_dir.join("kicad");
+    assert!(
+        kicad_bin.exists(),
+        "kicad binary not found at {kicad_bin:?}"
+    );
+
+    struct KillKiCadOnDrop;
+    impl KillKiCadOnDrop {
+        fn kill_all() {
+            for name in ["pcbnew", "kicad"] {
+                let _ = Command::new("pkill")
+                    .args(["-9", "-x", name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+    impl Drop for KillKiCadOnDrop {
+        fn drop(&mut self) {
+            Self::kill_all();
+        }
+    }
+    let _cleanup = KillKiCadOnDrop;
+    KillKiCadOnDrop::kill_all();
+
+    // Remove any stale sockets/locks in /tmp/kicad left by prior runs.
+    if let Ok(entries) = std::fs::read_dir("/tmp/kicad") {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    // Seed KiCad 10 config inside a private tempdir via KICAD_CONFIG_HOME so
+    // the user's real ~/Library/Preferences/kicad profile is never touched.
+    let cfg_root = tempfile::tempdir().unwrap();
+    let kicad_config_home = cfg_root.path().join("kicad");
+    let kicad_cfg_dir = kicad_config_home.join("10.0");
+    std::fs::create_dir_all(&kicad_cfg_dir).unwrap();
+    let kicad_env: [(&str, &std::ffi::OsStr); 1] =
+        [("KICAD_CONFIG_HOME", kicad_config_home.as_os_str())];
+
+    let ensure_api_server_enabled = || {
+        let common_path = kicad_cfg_dir.join("kicad_common.json");
+        let mut cfg: Value = std::fs::read_to_string(&common_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        if !cfg.is_object() {
+            cfg = json!({});
+        }
+        let obj = cfg.as_object_mut().unwrap();
+        let api = obj.entry("api").or_insert_with(|| json!({}));
+        if !api.is_object() {
+            *api = json!({});
+        }
+        api.as_object_mut()
+            .unwrap()
+            .insert("enable_server".to_string(), json!(true));
+        let dnsa = obj.entry("do_not_show_again").or_insert_with(|| json!({}));
+        if !dnsa.is_object() {
+            *dnsa = json!({});
+        }
+        let dnsa_obj = dnsa.as_object_mut().unwrap();
+        dnsa_obj.insert("data_collection_prompt".to_string(), json!(true));
+        dnsa_obj.insert("update_check_prompt".to_string(), json!(true));
+        let session = obj.entry("session").or_insert_with(|| json!({}));
+        if !session.is_object() {
+            *session = json!({});
+        }
+        session
+            .as_object_mut()
+            .unwrap()
+            .insert("remember_open_files".to_string(), json!(false));
+        std::fs::write(&common_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    };
+    ensure_api_server_enabled();
+    std::fs::write(
+        kicad_cfg_dir.join("kicad.json"),
+        serde_json::to_string_pretty(&json!({
+            "system": {
+                "first_run_shown": true,
+                "check_for_kicad_updates": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (file, body) in [
+        ("fp-lib-table", "(fp_lib_table\n  (version 7)\n)\n"),
+        ("sym-lib-table", "(sym_lib_table\n  (version 7)\n)\n"),
+        (
+            "design-block-lib-table",
+            "(design_block_lib_table\n  (version 7)\n)\n",
+        ),
+    ] {
+        let p = kicad_cfg_dir.join(file);
+        if !p.exists() {
+            std::fs::write(p, body).unwrap();
+        }
+    }
+
+    // Copy a real KiCad 10 fixture into a directory whose path contains spaces.
+    let dir = tempfile::tempdir().unwrap();
+    let spaced_dir = dir.path().join("board with spaces");
+    std::fs::create_dir_all(&spaced_dir).unwrap();
+    let board_path = spaced_dir.join("test board.kicad_pcb");
+    std::fs::write(spaced_dir.join("test board.kicad_pro"), "{}\n").unwrap();
+    std::fs::write(
+        &board_path,
+        include_bytes!(
+            "../../copperpour-core/tests/fixtures/repeat_layout_routing_kicad10.kicad_pcb"
+        ),
+    )
+    .unwrap();
+    let board_str = board_path.to_string_lossy().to_string();
+
+    // 1. Nothing running → open_board launches pcbnew.app and binds the board.
+    let mut mcp = Mcp::spawn_with_env(&kicad_cli, &kicad_env);
+    mcp.load("verification");
+    mcp.load("pcb_board");
+    let opened = body(&mcp.tool(
+        "open_board",
+        json!({ "board": board_str, "timeout_seconds": 60 }),
+    ));
+    eprintln!("[e2e_macos_open_board_live_kicad] scenario 1: {opened}");
+    assert_eq!(opened["requested_open"], true, "fresh launch: {opened}");
+    assert_eq!(opened["launched"], true, "fresh launch: {opened}");
+    assert_eq!(opened["timed_out"], false, "fresh launch: {opened}");
+
+    let info = body(&mcp.tool("get_board_info", json!({ "board": board_str })));
+    assert_eq!(
+        info["source"], "ipc",
+        "subsequent PCB read must reach live IPC: {info}"
+    );
+
+    // 2. Board already open → open_board reuses existing endpoint with no duplicate launch.
+    let reused = body(&mcp.tool(
+        "open_board",
+        json!({ "board": board_str, "timeout_seconds": 30 }),
+    ));
+    assert_eq!(reused["requested_open"], true, "reuse: {reused}");
+    assert_eq!(reused["launched"], false, "reuse: {reused}");
+
+    // 3. Lock-file refusal when no endpoint reports the board.
+    drop(mcp);
+    KillKiCadOnDrop::kill_all();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let lock_path = spaced_dir.join("~test board.kicad_pcb.lck");
+    std::fs::write(&lock_path, "stale-lock").unwrap();
+    let mut mcp_lock = Mcp::spawn_with_env(&kicad_cli, &kicad_env);
+    mcp_lock.load("verification");
+    let lock_resp = mcp_lock.request(
+        "tools/call",
+        json!({
+            "name": "open_board",
+            "arguments": { "board": board_str, "timeout_seconds": 15 }
+        }),
+    );
+    let lock_res = &lock_resp["result"];
+    assert_eq!(lock_res["isError"], true, "lock must refuse: {lock_res}");
+    let lock_body: Value =
+        serde_json::from_str(lock_res["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        lock_body["error"]["kind"], "conflict",
+        "lock refusal must be conflict: {lock_body}"
+    );
+    drop(mcp_lock);
+    std::fs::remove_file(&lock_path).unwrap();
+
+    // 4. Project Manager running on /tmp/kicad/api.sock + open_board launching
+    //    pcbnew beside it on /tmp/kicad/api-<pid>.sock.
+    ensure_api_server_enabled();
+    let mut manager_cmd = Command::new(&kicad_bin);
+    manager_cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    for (key, value) in &kicad_env {
+        manager_cmd.env(key, value);
+    }
+    let mut manager = manager_cmd
+        .spawn()
+        .expect("spawn KiCad.app Project Manager");
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut manager_ready = false;
+    while std::time::Instant::now() < wait_deadline {
+        let candidates = copperpour_ipc::candidate_endpoints();
+        if candidates.iter().any(|addr| {
+            copperpour_ipc::KiCadIpcClient::new(addr)
+                .ping_outcome()
+                .is_responsive()
+        }) {
+            manager_ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(
+        manager_ready,
+        "Project Manager did not expose a responsive IPC socket within 30s; candidates={:?}",
+        copperpour_ipc::candidate_endpoints()
+    );
+
+    ensure_api_server_enabled();
+    let mut mcp_pm = Mcp::spawn_with_env(&kicad_cli, &kicad_env);
+    mcp_pm.load("verification");
+    mcp_pm.load("pcb_board");
+    let opened_beside_pm = body(&mcp_pm.tool(
+        "open_board",
+        json!({ "board": board_str, "timeout_seconds": 60 }),
+    ));
+    eprintln!("[e2e_macos_open_board_live_kicad] scenario 4: {opened_beside_pm}");
+    assert_eq!(
+        opened_beside_pm["requested_open"], true,
+        "beside Project Manager: {opened_beside_pm}"
+    );
+    assert_eq!(
+        opened_beside_pm["launched"], true,
+        "beside Project Manager: {opened_beside_pm}"
+    );
+    let selected_addr = opened_beside_pm["ipc_address"]
+        .as_str()
+        .expect("selected ipc_address");
+    assert!(
+        selected_addr.contains("api-"),
+        "expected pcbnew fallback socket api-<pid>.sock beside Project Manager, got: {selected_addr}"
+    );
+
+    let info_beside_pm = body(&mcp_pm.tool("get_board_info", json!({ "board": board_str })));
+    assert_eq!(
+        info_beside_pm["source"], "ipc",
+        "subsequent PCB read beside Project Manager must reach live IPC: {info_beside_pm}"
+    );
+
+    let _ = manager.kill();
+    let _ = manager.wait();
+}
