@@ -102,6 +102,13 @@ impl Scene {
         Self::with_evidence(NetReply::Normal, false).await
     }
     async fn with_evidence(net_reply: NetReply, empty_layers: bool) -> Self {
+        Self::with_create_reply(net_reply, empty_layers, false).await
+    }
+    async fn with_create_reply(
+        net_reply: NetReply,
+        empty_layers: bool,
+        ignore_create: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("six_layer.kicad_pcb");
         std::fs::copy(
@@ -156,7 +163,21 @@ impl Scene {
                 vec!["", "VCC", "GND"],
                 store.clone(),
                 |_| {},
-                move |command, _| metadata_reply(command, &document, net_reply, empty_layers),
+                move |command, store| {
+                    let reply = metadata_reply(command, &document, net_reply, empty_layers);
+                    if ignore_create && command.type_url.ends_with("CreateItems") {
+                        store.creates += 1;
+                        return Some(pack_any(
+                            &kiapi::common::commands::CreateItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                created_items: vec![],
+                            },
+                            "kiapi.common.commands.CreateItemsResponse",
+                        ));
+                    }
+                    reply
+                },
             )
         };
         let handler = McpHandler::new(crate::tools::ServerConfig {
@@ -175,6 +196,9 @@ impl Scene {
         }
     }
     async fn call(&self, tool: &str, changes: Value) -> Value {
+        self.call_with_status(tool, changes).await.0
+    }
+    async fn call_with_status(&self, tool: &str, changes: Value) -> (Value, bool) {
         let mut arguments = json!({"board":self.board, "net_name":"VCC", "layer":"In4.Cu", "x1":10.0,"y1":10.0,"x2":20.0,"y2":10.0});
         if matches!(tool, "get_nets_list" | "get_netclasses" | "apply_copper") {
             arguments = json!({"board":self.board});
@@ -213,14 +237,16 @@ impl Scene {
         if matches!(tool, "modify_trace" | "apply_copper") {
             assert_eq!(response["isError"], true, "{response}");
         }
-        body
+        (body, response["isError"].as_bool().unwrap())
     }
 }
 async fn refused(tool: &str, changes: Value, field: &str, value: &str) {
     let scene = Scene::new().await;
     let before = std::fs::read(&scene.board).unwrap();
     let items = scene.store.lock().unwrap().items.clone();
-    let body = scene.call(tool, changes).await;
+    let (body, is_error) = scene.call_with_status(tool, changes).await;
+    assert!(is_error, "{tool}: {body}");
+    assert!(body.get("zone_refill").is_none(), "{tool}: {body}");
     assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
     assert_eq!(body["error"]["field"], field, "{tool}: {body}");
     assert!(
@@ -287,16 +313,48 @@ refusal_case!(
 
 #[tokio::test]
 async fn routing_preflight_valid_routes_still_create_requested_copper() {
-    for (tool, count) in [
-        ("route_trace", 1),
-        ("route_pad_to_pad", 2),
-        ("route_differential_pair", 2),
-        ("add_via", 1),
+    for (tool, count, mut expected) in [
+        (
+            "route_trace",
+            1,
+            json!({
+                "net": "VCC", "layer": "In4.Cu", "width": 0.25,
+                "from": { "x": 10.0, "y": 10.0 }, "to": { "x": 20.0, "y": 10.0 }
+            }),
+        ),
+        (
+            "route_pad_to_pad",
+            2,
+            json!({
+                "routed": true, "net": "VCC", "layer": "In4.Cu", "width": 0.25,
+                "from": { "ref": "R1", "pad": "1", "x": 99.5, "y": 60.0 },
+                "to": { "ref": "R2", "pad": "2", "x": 110.5, "y": 50.0 },
+                "source": "ipc"
+            }),
+        ),
+        (
+            "route_differential_pair",
+            2,
+            json!({
+                "net_pos": "VCC", "net_neg": "GND",
+                "layer": "In4.Cu", "width": 0.1, "gap": 0.1
+            }),
+        ),
+        (
+            "add_via",
+            1,
+            json!({
+                "uuid": "created-1", "net": "VCC", "x": 15.0, "y": 15.0,
+                "drill": 0.4, "pad_size": 0.8, "source": "ipc_readback"
+            }),
+        ),
     ] {
         let scene = Scene::new().await;
         let before = std::fs::read(&scene.board).unwrap();
-        let body = scene.call(tool, json!({})).await;
-        assert!(body.get("error").is_none(), "{tool}: {body}");
+        let (body, is_error) = scene.call_with_status(tool, json!({})).await;
+        assert!(!is_error, "{tool}: {body}");
+        expected["zone_refill"] = json!({ "remedy": EXPECTED_ROUTING_REFILL_REMEDY });
+        assert_eq!(body, expected, "{tool}");
         let store = scene.store.lock().unwrap();
         assert_eq!(store.items.len(), 2 + count, "{tool}");
         let mut nets = Vec::new();
@@ -328,6 +386,60 @@ async fn routing_preflight_valid_routes_still_create_requested_copper() {
             }
         );
         assert_eq!(std::fs::read(&scene.board).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn routing_refill_guidance_is_absent_when_kicad_creates_nothing() {
+    let scene = Scene::with_create_reply(NetReply::Normal, false, true).await;
+    let before = std::fs::read(&scene.board).unwrap();
+    let items = scene.store.lock().unwrap().items.clone();
+    let (body, is_error) = scene.call_with_status("route_trace", json!({})).await;
+    assert!(is_error, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("KiCad created no items"),
+        "{body}"
+    );
+    assert!(body.get("zone_refill").is_none(), "{body}");
+    let store = scene.store.lock().unwrap();
+    assert_eq!((store.creates, store.updates, store.deletes), (1, 0, 0));
+    assert_eq!(store.items, items);
+    assert_eq!(std::fs::read(&scene.board).unwrap(), before);
+}
+
+#[tokio::test]
+async fn routing_refill_guidance_is_in_the_served_tool_descriptions() {
+    let scene = Scene::new().await;
+    let response = scene
+        .handler
+        .handle_message(json!({ "jsonrpc": "2.0", "id": 71, "method": "tools/list" }))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let tools = response["tools"].as_array().unwrap();
+    let affected = [
+        "route_trace",
+        "route_pad_to_pad",
+        "add_via",
+        "delete_trace",
+        "modify_trace",
+        "route_differential_pair",
+    ];
+    for name in affected
+        .into_iter()
+        .chain(["query_traces", "move_via", "delete_via"])
+    {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert_eq!(
+            description.ends_with(EXPECTED_ROUTING_REFILL_REMEDY),
+            affected.contains(&name),
+            "{name}: {description}"
+        );
     }
 }
 
