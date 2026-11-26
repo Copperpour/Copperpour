@@ -397,6 +397,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_board_guidance_is_served_over_mcp() {
+        let handler = handler().await;
+        for (path, markers) in [
+            (
+                "kicad-pcb/SKILL.md",
+                &[
+                    "open_board(board, display?, timeout_seconds?)",
+                    "load_toolset('verification')",
+                    "instead of asking the user to open KiCAD manually",
+                ][..],
+            ),
+            (
+                "copperpour/SKILL.md",
+                &[
+                    "call `open_board` (in `verification`)",
+                    "call `open_board` with the `.kicad_pcb` path",
+                ][..],
+            ),
+            (
+                "copperpour/references/troubleshooting.md",
+                &[
+                    "call `open_board` (from",
+                    "call `open_board` with the exact `.kicad_pcb` path",
+                ][..],
+            ),
+        ] {
+            let via_tool = tool(&handler, json!({"path": path})).await;
+            let text = via_tool["contents"][0]["text"].as_str().unwrap();
+            let via_resource = request(
+                &handler,
+                "resources/read",
+                json!({"uri": format!("{URI_PREFIX}{path}")}),
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(via_resource["contents"][0]["text"].as_str(), Some(text));
+            for marker in markers {
+                assert!(
+                    text.contains(marker),
+                    "served {path} guidance is missing `{marker}`"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn guidance_resources_and_tool_serve_every_bundled_file_with_identical_bytes() {
         let handler = handler().await;
         let listed = request(&handler, "resources/list", json!({}))
