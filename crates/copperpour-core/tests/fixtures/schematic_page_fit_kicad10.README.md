@@ -9,11 +9,11 @@ and `(version 20260306)`. The resave kept every item, UUID, coordinate and prope
 added KiCad's default fields, R1's pin UUIDs and wrote R1's instance under the project
 name `""`, as a save without a project does. KiCad 10.0.8's `kicad-cli sch export svg`
 plotted each sheet with default settings, and the plotted drawing is the same before and
-after the resave. The expected values below come from that plot, not from any code under
-test. The two `.kicad_wks` files are not schematics. They are minimal edits of KiCad's
-default drawing sheet description, written by hand in KiCad's own format, because
-`kicad-cli` has no command that writes or resaves a drawing sheet. KiCad 10.0.8 loads and
-plots both.
+after the resave. The expected values for the four saved sheets come from those plots,
+not from any code under test. The two `.kicad_wks` files are not schematics. They are
+minimal edits of KiCad's default drawing sheet description, written by hand in KiCad's
+own format, because `kicad-cli` has no command that writes or resaves a drawing sheet.
+KiCad 10.0.8 loads and plots both.
 
 How the numbers were read from the SVG:
 
@@ -78,3 +78,25 @@ A4 landscape with `Device:R` as R1, a wire, the local label `SIG_A` and a no-con
 Everything KiCad plots outside the drawing sheet lies within `(100.8333, 76.881)` to
 `(106.7959, 93.3958)`, inside the frame and clear of the title block, so a check that
 measures every item should report that the sheet fits.
+
+## Cases built by tool calls
+
+For the [#814 review], Paulius built these cases by tool calls on `3ef4032b`, plotted
+them with `kicad-cli sch export svg --exclude-drawing-sheet` using KiCad 10.0.8, and
+compared the plotted ink with the JSON from `check_schematic_page_fit`. Distances are in
+millimetres.
+
+| Case | KiCad ink edge | Tool result |
+| --- | --- | --- |
+| no-connect at (12.5, 30.48) | x 11.8142 | left 0.1858 |
+| sheet `Controller` at y 12.7 | y 10.5553 | top 1.444549 |
+| bus entry at x 12.05 | x 11.9738 | left 0.0262 |
+| rectangle / polyline | x 10.0838 / y 10.0838 | left 1.9162 / top 1.9162 |
+| junction, `junction_size_choice: 5` | x 11.7856 | left 0.2144 |
+| hierarchical label `ALIAS`, rotation 180 | x 6.1644 | left 5.835535 |
+| global label at x 15.24, rotation 180 | outline −0.1025 | left 12.101902 |
+| `Device:C` at x 13.97 | x 11.684 | left 0.316 |
+| `Device:R` at (180.34, 170.18) | enters the title block | intrusion `true`, body listed as unmeasured |
+| circle r 2.5 by the title-block corner | bounding box reaches it, ink does not | no finding, `fits: true` |
+
+[#814 review]: https://github.com/Copperpour/Copperpour/pull/814#pullrequestreview-6075032806
