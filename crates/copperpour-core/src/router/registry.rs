@@ -52,7 +52,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_readability",
-        description: "Check saved schematic sheets for overlaps, touching pins, long or indirect wire runs, and content outside the drawing frame or in the title block, and compare layout scores",
+        description: "Check saved schematic sheets for overlaps, touching pins, long or indirect wire runs, and content outside the drawing frame or in the title block; compare layout scores and preview or apply wire-label exchanges",
         category: "schematic",
     },
     ToolsetMeta {

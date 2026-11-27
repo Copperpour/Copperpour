@@ -27,6 +27,13 @@ pub fn write_with_indent(node: &SexpNode, indent: &str) -> String {
     buf
 }
 
+/// Render a sheet child after the opening indentation supplied by its insertion anchor.
+pub fn write_schematic_item(node: &SexpNode, indent: &str) -> String {
+    let mut buf = String::new();
+    write_node(node, &mut buf, 1, indent);
+    buf
+}
+
 /// The indentation unit a KiCAD file already uses, from its first indented
 /// line: a tab, or the run of spaces that opens it. Falls back to KiCAD's own
 /// tab for a file with nothing to learn from.

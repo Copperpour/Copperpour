@@ -92,11 +92,7 @@ fn read_symbol(node: &SexpNode, libs: &[&SexpNode]) -> Result<DrawnSymbol, Strin
     let lib = find_lib_symbol(libs, &instance)
         .ok_or_else(|| format!("{}: {UNRESOLVED_PIN_GEOMETRY}", instance.reference))?;
     let transform = instance.pin_transform();
-    let alternates: HashMap<_, _> = node
-        .find_all("pin")
-        .into_iter()
-        .filter_map(|pin| Some((pin.get(1)?.as_str()?, pin.find_str("alternate")?)))
-        .collect();
+    let alternates = crate::tools::sch_connectivity::placed_pin_alternates(node);
     let names_hidden = hides_pin_names(lib);
     let mut pins = Vec::new();
     for node in lib_pin_nodes_for_body_style(lib, instance.unit, symbol_body_style(node)) {
@@ -113,20 +109,8 @@ fn read_symbol(node: &SexpNode, libs: &[&SexpNode]) -> Result<DrawnSymbol, Strin
                     instance.reference
                 )
             })?;
-        let mut alternate_name = None;
-        if let Some(&alternate) = alternates
-            .get(pin.number.as_str())
-            .filter(|name| !name.is_empty())
-        {
-            if let Some(kind) = node.find_all("alternate").into_iter().find_map(|alt| {
-                (alt.get(1)?.as_str()? == alternate)
-                    .then(|| alt.get(2)?.as_str())
-                    .flatten()
-            }) {
-                pin.electrical_type = kind.to_owned();
-                alternate_name = Some(alternate.to_owned());
-            }
-        }
+        let alternate_name =
+            crate::tools::sch_connectivity::select_pin_alternate(&mut pin, node, &alternates);
         let name_hidden = names_hidden
             || pin.hidden
             || node

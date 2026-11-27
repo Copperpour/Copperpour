@@ -266,6 +266,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "edit_symbol_pin",
     "edit_symbol_pins",
     "enrich_datasheets",
+    "exchange_schematic_wires_and_labels",
     "export_3d",
     "export_bom",
     "export_dxf",

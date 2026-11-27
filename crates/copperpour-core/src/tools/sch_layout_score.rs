@@ -79,7 +79,7 @@ pub(super) struct Score {
 }
 
 impl Score {
-    fn json(&self) -> Value {
+    pub(super) fn json(&self) -> Value {
         let mut result = json!({
             "bounds_unresolved": self.bounds_unresolved,
             "pin_text_unresolved": self.pin_text_unresolved,
