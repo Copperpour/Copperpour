@@ -1184,6 +1184,7 @@ fn pad(number: &str, t: &str, x: f64, y: f64, w: f64, h: f64) -> PadGeom {
         w,
         h,
         rotation: 0.0,
+        custom_bounds: None,
     }
 }
 
@@ -2089,6 +2090,28 @@ mod required_argument_tests {
             original,
             "the existing footprint must survive a refused call untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_invalid_silkscreen_before_replacing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.kicad_mod");
+        let original = include_str!("../../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        std::fs::write(&path, original).unwrap();
+
+        for mode in [json!("fill"), json!(true), json!(null)] {
+            let result = call(
+                "create_footprint",
+                json!({
+                    "output": path, "name": "Replacement", "replace_existing": true,
+                    "pads": [], "silkscreen": mode
+                }),
+            )
+            .await;
+            assert!(result.is_error, "{mode}");
+            assert_eq!(error_field(&result), "silkscreen");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[tokio::test]

@@ -122,6 +122,7 @@ impl Graphic {
     fn layer_order(&self) -> u8 {
         match self.layer {
             "F.SilkS" => 5,
+            "B.CrtYd" => 29,
             "F.CrtYd" => 31,
             "F.Fab" => 35,
             other => unreachable!("create_footprint draws no graphic on {other}"),

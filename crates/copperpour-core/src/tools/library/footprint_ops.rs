@@ -6,6 +6,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tools::footprint_kicad10;
 use crate::tools::solder_margins;
 use crate::tools::{get_path, require_array, require_str, ToolContext};
+use copperpour_sexp::bounds::{pad_bbox, Bbox};
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
 use copperpour_sexp::writer::{
     apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
@@ -23,6 +24,8 @@ pub(super) struct PadGeom {
     pub(super) h: f64,
     /// Rotation in degrees, as the pad's `(at x y rotation)`.
     pub(super) rotation: f64,
+    /// The actual copper bounds of a custom pad, including its primitives.
+    pub(super) custom_bounds: Option<Bbox>,
 }
 
 impl PadGeom {
@@ -38,6 +41,10 @@ impl PadGeom {
             self.x + half_x,
             self.y + half_y,
         )
+    }
+
+    fn silk_extent(&self) -> Bbox {
+        self.custom_bounds.unwrap_or_else(|| self.extent())
     }
 }
 
@@ -314,6 +321,71 @@ pub(super) fn silk_pieces(
     pieces
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Silkscreen {
+    Outline,
+    Pin1Only,
+    None,
+}
+
+/// Try positions next to pin 1, pointing toward the interior on either axis.
+/// Keep the entire dot inside the outline and clear of pad extents.
+fn pin1_dot(
+    pin: &PadGeom,
+    pads: &[PadGeom],
+    bounds: (f64, f64, f64, f64),
+) -> Option<footprint_kicad10::Graphic> {
+    const RADIUS: f64 = 0.15;
+    const STROKE: f64 = 0.1;
+    let outer_radius = RADIUS + STROKE / 2.0;
+    let gap = outer_radius + SILK_PAD_CLEARANCE;
+    let (x0, y0, x1, y1) = bounds;
+    let (left, top, right, bottom) = (
+        x0 + outer_radius,
+        y0 + outer_radius,
+        x1 - outer_radius,
+        y1 - outer_radius,
+    );
+    if left > right || top > bottom {
+        return None;
+    }
+    let dx = (x0 + x1) / 2.0 - pin.x;
+    let dy = (y0 + y1) / 2.0 - pin.y;
+    let (px0, py0, px1, py1) = pin.silk_extent();
+    let x = pin.x.clamp(left, right);
+    let y = pin.y.clamp(top, bottom);
+    // A centered axis has no preferred direction, so try both sides on it.
+    let mut axes = [
+        [(dx >= 0.0, (px1 + gap, y)), (dx <= 0.0, (px0 - gap, y))],
+        [(dy >= 0.0, (x, py1 + gap)), (dy <= 0.0, (x, py0 - gap))],
+    ];
+    if dy.abs() > dx.abs() {
+        axes.swap(0, 1);
+    }
+
+    let mut candidates = axes
+        .into_iter()
+        .flatten()
+        .filter_map(|(inward, point)| inward.then_some(point));
+    let (x, y) = candidates.find(|&(x, y)| {
+        (left..=right).contains(&x)
+            && (top..=bottom).contains(&y)
+            && pads.iter().all(|pad| {
+                let (x0, y0, x1, y1) = pad.silk_extent();
+                x <= x0 - gap || x >= x1 + gap || y <= y0 - gap || y >= y1 + gap
+            })
+    })?;
+    Some(footprint_kicad10::Graphic {
+        shape: footprint_kicad10::Shape::Circle {
+            center: (x, y),
+            end: (x + RADIUS, y),
+        },
+        layer: "F.SilkS",
+        width: STROKE,
+        filled: true,
+    })
+}
+
 /// Build the courtyard, silkscreen, fab outline and pin-1 marker (silk dot +
 /// fab chamfer) for a footprint from its pads and, when given, its body (#711):
 /// with a body, the courtyard goes around the pads and the body, and the silk
@@ -322,6 +394,8 @@ pub(super) fn silk_pieces(
 pub(super) fn build_footprint_graphics(
     args: &serde_json::Value,
     pads: &[PadGeom],
+    courtyard_layers: &[&'static str],
+    silkscreen: Silkscreen,
 ) -> FootprintOutlines {
     use footprint_kicad10::{Graphic, Shape};
     let (pmin_x, pmin_y, pmax_x, pmax_y) = pads_bbox(pads);
@@ -364,62 +438,62 @@ pub(super) fn build_footprint_graphics(
         width,
         filled: false,
     };
-    let mut graphics = vec![line(
-        Shape::Rect {
-            start: (cmin_x, cmin_y),
-            end: (cmax_x, cmax_y),
-        },
-        "F.CrtYd",
-        0.05,
-    )];
+    let courtyard = Shape::Rect {
+        start: (cmin_x, cmin_y),
+        end: (cmax_x, cmax_y),
+    };
+    let mut graphics: Vec<_> = courtyard_layers
+        .iter()
+        .map(|&layer| line(courtyard.clone(), layer, 0.05))
+        .collect();
 
     // Silk: outside the body, broken near pads; without a body, just outside
     // the pad envelope so it clears them.
-    let (smin_x, smin_y, smax_x, smax_y) = match body_box {
-        Some((bx0, by0, bx1, by1)) => {
-            let outline = (
-                bx0 - SILK_BODY_OFFSET,
-                by0 - SILK_BODY_OFFSET,
-                bx1 + SILK_BODY_OFFSET,
-                by1 + SILK_BODY_OFFSET,
-            );
-            let (x0, y0, x1, y1) = outline;
-            for (horizontal, across, from, to) in [
-                (true, y0, x0, x1),
-                (true, y1, x0, x1),
-                (false, x0, y0, y1),
-                (false, x1, y0, y1),
-            ] {
-                for (start, end) in silk_pieces(pads, horizontal, across, from, to) {
-                    let (start, end) = if horizontal {
-                        ((start, across), (end, across))
-                    } else {
-                        ((across, start), (across, end))
-                    };
-                    graphics.push(line(Shape::Line { start, end }, "F.SilkS", SILK_WIDTH));
+    if silkscreen == Silkscreen::Outline {
+        match body_box {
+            Some((bx0, by0, bx1, by1)) => {
+                let outline = (
+                    bx0 - SILK_BODY_OFFSET,
+                    by0 - SILK_BODY_OFFSET,
+                    bx1 + SILK_BODY_OFFSET,
+                    by1 + SILK_BODY_OFFSET,
+                );
+                let (x0, y0, x1, y1) = outline;
+                for (horizontal, across, from, to) in [
+                    (true, y0, x0, x1),
+                    (true, y1, x0, x1),
+                    (false, x0, y0, y1),
+                    (false, x1, y0, y1),
+                ] {
+                    for (start, end) in silk_pieces(pads, horizontal, across, from, to) {
+                        let (start, end) = if horizontal {
+                            ((start, across), (end, across))
+                        } else {
+                            ((across, start), (across, end))
+                        };
+                        graphics.push(line(Shape::Line { start, end }, "F.SilkS", SILK_WIDTH));
+                    }
                 }
             }
-            outline
+            None => {
+                let silk_margin = 0.15;
+                let outline = (
+                    pmin_x - silk_margin,
+                    pmin_y - silk_margin,
+                    pmax_x + silk_margin,
+                    pmax_y + silk_margin,
+                );
+                graphics.push(line(
+                    Shape::Rect {
+                        start: (outline.0, outline.1),
+                        end: (outline.2, outline.3),
+                    },
+                    "F.SilkS",
+                    SILK_WIDTH,
+                ));
+            }
         }
-        None => {
-            let silk_margin = 0.15;
-            let outline = (
-                pmin_x - silk_margin,
-                pmin_y - silk_margin,
-                pmax_x + silk_margin,
-                pmax_y + silk_margin,
-            );
-            graphics.push(line(
-                Shape::Rect {
-                    start: (outline.0, outline.1),
-                    end: (outline.2, outline.3),
-                },
-                "F.SilkS",
-                SILK_WIDTH,
-            ));
-            outline
-        }
-    };
+    }
 
     // Fab: the component body when given, else the pad envelope. May overlap
     // pads — fab is a documentation layer, not subject to silk-over-pad rules.
@@ -433,30 +507,9 @@ pub(super) fn build_footprint_graphics(
         let points = chamfered_rect_points(fmin_x, fmin_y, fmax_x, fmax_y, p1.x, p1.y, chamfer);
         graphics.push(line(Shape::Poly { points }, "F.Fab", 0.1));
 
-        // Silk pin-1 dot just outside the silk outline, aligned with pin 1's
-        // pad — NOT at the footprint corner, where a dot is ambiguous between
-        // pin 1 and the last pin that shares the same corner. It sits directly
-        // beside pin 1 so the mark is unmistakable.
-        let (dx, dy) = if (p1.x - cx).abs() >= (p1.y - cy).abs() {
-            // Pin 1 is on a left/right edge: dot outside that edge, at pin 1's y.
-            let sign = if p1.x < cx { -1.0 } else { 1.0 };
-            let edge = if sign < 0.0 { smin_x } else { smax_x };
-            (edge + sign * 0.4, p1.y)
-        } else {
-            // Pin 1 is on a top/bottom edge: dot outside that edge, at pin 1's x.
-            let sign = if p1.y < cy { -1.0 } else { 1.0 };
-            let edge = if sign < 0.0 { smin_y } else { smax_y };
-            (p1.x, edge + sign * 0.4)
-        };
-        graphics.push(Graphic {
-            shape: Shape::Circle {
-                center: (dx, dy),
-                end: (dx + 0.15, dy),
-            },
-            layer: "F.SilkS",
-            width: 0.1,
-            filled: true,
-        });
+        if silkscreen != Silkscreen::None {
+            graphics.extend(pin1_dot(p1, pads, (fmin_x, fmin_y, fmax_x, fmax_y)));
+        }
     } else {
         // No pads to mark pin 1 against — plain fab rectangle.
         graphics.push(line(
@@ -506,6 +559,21 @@ pub(crate) async fn handle_create_footprint(
         },
     };
 
+    let silkscreen = match args.get("silkscreen") {
+        None => Silkscreen::Outline,
+        Some(value) => match value.as_str() {
+            Some("outline") => Silkscreen::Outline,
+            Some("pin1_only") => Silkscreen::Pin1Only,
+            Some("none") => Silkscreen::None,
+            _ => {
+                return Ok(invalid_library_argument(
+                    "silkscreen",
+                    "must be outline, pin1_only, or none",
+                ));
+            }
+        },
+    };
+
     let pads_val = match require_array(args, "pads") {
         Ok(v) => v.clone(),
         Err(e) => return Ok(e),
@@ -540,6 +608,7 @@ pub(crate) async fn handle_create_footprint(
     }
     let mut pads: Vec<WrittenPad> = Vec::new();
     let mut warnings = Vec::new();
+    let (mut front, mut back) = (false, false);
     for pad in &pads_val {
         // Safe after validate_footprint_pad_items: every schema-required field
         // has the declared type, so no plausible-looking pad is invented.
@@ -558,6 +627,10 @@ pub(crate) async fn handle_create_footprint(
         } else {
             vec!["*.Cu", "*.Mask"]
         };
+        let both = matches!(pad_type.as_str(), "thru_hole" | "np_thru_hole")
+            || layer_names.contains(&"*.Cu");
+        front |= both || layer_names.contains(&"F.Cu");
+        back |= both || layer_names.contains(&"B.Cu");
         let layers = kicad_pad_layers(&layer_names);
 
         // KiCad keeps a pad's orientation in [0, 360) (`EDA_ANGLE::Normalize`).
@@ -640,6 +713,15 @@ pub(crate) async fn handle_create_footprint(
             roundrect_ratio,
             custom_shape
         );
+        let custom_bounds = if shape == "custom" {
+            // Use the same transformed primitive bounds as saved-board reads.
+            let written = parse_sexp(&format!("{sexp})"))?;
+            Some(pad_bbox(&written, 0.0, 0.0, 0.0).ok_or_else(|| {
+                anyhow::anyhow!("could not measure the copper extent of custom pad '{number}'")
+            })?)
+        } else {
+            None
+        };
         // KiCad's `PAD_SHAPE` order (`pcbnew/padstack.h`).
         let shape_order = match shape {
             "circle" => 0,
@@ -657,6 +739,7 @@ pub(crate) async fn handle_create_footprint(
                 w,
                 h,
                 rotation,
+                custom_bounds,
             },
             shape_order,
             sexp,
@@ -665,7 +748,14 @@ pub(crate) async fn handle_create_footprint(
     let pad_geoms: Vec<PadGeom> = pads.iter().map(|pad| pad.geometry.clone()).collect();
 
     // Courtyard, silk, fab and pin-1 marker, derived from the pads and body.
-    let outlines = (!pad_geoms.is_empty()).then(|| build_footprint_graphics(args, &pad_geoms));
+    let courtyard_layers: &[_] = match (front, back) {
+        (true, true) => &["F.CrtYd", "B.CrtYd"],
+        (false, true) => &["B.CrtYd"],
+        // Preserve the front courtyard for pads defined on technical layers only.
+        _ => &["F.CrtYd"],
+    };
+    let outlines = (!pad_geoms.is_empty())
+        .then(|| build_footprint_graphics(args, &pad_geoms, courtyard_layers, silkscreen));
     let model_sexp = build_model_sexp(args);
 
     let attr = if pad_geoms.iter().any(|p| p.pad_type == "smd") {
@@ -713,6 +803,9 @@ pub(crate) async fn handle_create_footprint(
         " (attr {attr}) (duplicate_pad_numbers_are_jumpers no)"
     ));
     let mut graphics = outlines.map(|o| o.graphics).unwrap_or_default();
+    let pin1_marked = graphics
+        .iter()
+        .any(|graphic| matches!(graphic.shape, footprint_kicad10::Shape::Circle { .. }));
     graphics.sort_by(|a, b| a.kicad_order(b));
     for graphic in &graphics {
         text.push(' ');
@@ -758,7 +851,7 @@ pub(crate) async fn handle_create_footprint(
         "output": output.to_str().unwrap_or(""),
         "pad_count": pad_geoms.len(),
         "courtyard": !pad_geoms.is_empty(),
-        "pin1_marked": !pad_geoms.is_empty(),
+        "pin1_marked": pin1_marked,
         "model": args.get("model").and_then(|m| m["path"].as_str()).unwrap_or("")
     });
     if !warnings.is_empty() {

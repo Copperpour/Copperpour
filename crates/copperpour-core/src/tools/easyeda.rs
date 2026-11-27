@@ -1631,7 +1631,9 @@ mod tests {
         let cache_dir = easyeda_cache_dir().unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         let mock_lcsc_id = "C9999999";
-        let mock_bundle = mock_bundle("https://example.com/mock.pdf");
+        let mut mock_bundle = mock_bundle("https://example.com/mock.pdf");
+        mock_bundle["packageDetail"]["dataStr"]["shape"][1] =
+            json!("PAD~RECT~105.0~100.0~1.0~2.0~2~~2~0~105 100~0");
         std::fs::write(
             cache_dir.join(format!("{mock_lcsc_id}.json")),
             serde_json::to_string(&mock_bundle).unwrap(),
@@ -1680,6 +1682,9 @@ mod tests {
         let fp_content = std::fs::read_to_string(&fp_file).unwrap();
         assert!(fp_content.contains(EASYEDA_ATTRIBUTION));
         assert!(fp_content.contains("(pad \"1\" smd rect"));
+
+        assert!(fp_content.contains("(layer \"B.CrtYd\")"), "{fp_content}");
+        assert!(fp_content.contains("(layer \"F.CrtYd\")"), "{fp_content}");
 
         // Verify library tables exist
         assert!(project_dir.join("sym-lib-table").is_file());
