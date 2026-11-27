@@ -7,7 +7,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_connectivity::{
-    label_roots, net_graph_for, pt_key, ConnectivityIndex, PinNetNames, UnitNotation,
+    label_roots, net_graph_for, saved_net_labels, ConnectivityIndex, PinNetNames, UnitNotation,
 };
 use crate::tools::{
     get_path, invalid_arg, is_power_symbol_reference, opt_f64, opt_positive_f64,
@@ -57,7 +57,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_connections",
-            "Get all pins and labels connected to a named net.",
+            "Get all pins and labels on a named net. Drawn label attachment uses saved \
+             schematic coordinates and KiCad's one-unit allowance.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -68,8 +69,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_connectivity",
-            "Build the full connectivity graph for a net using union-find. \
-             Returns all wire segments, labels, and T-junction locations.",
+            "Return wires, labels, and T-junction locations for a named net. A nearby label \
+             that KiCad leaves detached does not put the wire on that net.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -80,7 +81,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_pin_connections",
-            "Get the primary net name at a specific pin; global power takes precedence over local power.",
+            "Get the primary net name at a specific pin using saved-coordinate label \
+             attachment. Global power takes precedence over local power.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -92,7 +94,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_pin_net_name",
-            "Return the primary net name for a specific pin; global power takes precedence over local power.",
+            "Return the primary net name at a specific pin using saved-coordinate label \
+             attachment. Global power takes precedence over local power.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -104,7 +107,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_component_nets",
-            "Get the primary net name for each pin; global power takes precedence over local power.",
+            "Get the primary net name for each pin using saved-coordinate label attachment. \
+             Global power takes precedence over local power.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -115,7 +119,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_components",
-            "Get all components (and their pins) connected to a named net.",
+            "Get all components and pins on a named net, using saved-coordinate label attachment.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -126,10 +130,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "trace_from_point",
-            "Trace connectivity from any (X,Y) point — returns the wires, labels, component \
-             pins and junction dots at that point, and the net it belongs to. Hierarchical \
-             sheet pins and no-connect flags are not reported, so an empty pins_here does \
-             not prove a wire dangles.",
+            "Return nearby wires, labels, component pins and junction dots, and the primary net name at \
+             the saved coordinate. An item in labels_here need not belong to that net. \
+             Hierarchical sheet pins and no-connect flags are not reported, so an empty \
+             pins_here does not prove a wire dangles.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -184,8 +188,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_connected_items",
-            "Get all wires, labels, and components connected to a given component reference \
-             by tracing net connectivity from each of its pins.",
+            "Get wires, attached labels, and other components on the given component's nets. \
+             Reports primary names separately from attached labels. A nearby label that KiCad \
+             leaves detached is not attached by proximity.",
             json!({
                 "type": "object",
                 "properties": {
@@ -317,19 +322,15 @@ async fn handle_get_net_connections(
         )));
     };
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     if let Some(refusal) = unknown_net(&net, &labels) {
         return Ok(refusal);
     }
     let mut g = net_graph_for(&tree, &wires, &labels);
     // The net is its roots, not its name: one net can carry several names, and
     // its labels are every label on those roots, whichever name each spells.
+    let net_roots = g.roots_named(&net);
     let by_root = label_roots(&mut g, &labels);
-    let net_roots: HashSet<(i64, i64)> = by_root
-        .iter()
-        .filter(|(_, l)| l.net == net)
-        .map(|(root, _)| *root)
-        .collect();
     let matching: Vec<_> = by_root
         .iter()
         .filter(|(root, _)| net_roots.contains(root))
@@ -340,24 +341,25 @@ async fn handle_get_net_connections(
             )
         })
         .collect();
-    let net_pts: HashSet<(i64, i64)> = g.points_on_roots(&net_roots).into_iter().collect();
-    let on_net = &net_pts;
+    let connected_points = g.count_points_on_roots(&net_roots);
     // Power symbols and PWR_FLAGs name a net but are not nodes on it; KiCad's
     // netlist leaves them out.
     let pins: Vec<serde_json::Value> = placed
-        .into_iter()
+        .iter()
         .filter(|(instance, _)| !is_power_symbol_reference(&instance.reference))
         .flat_map(|(instance, pins)| {
-            pins.into_iter().filter_map(move |(pin, transform)| {
-                let (px, py) = copperpour_sexp::schematic::pin_endpoint(&pin, transform);
-                on_net.contains(&pt_key(px, py)).then(|| {
-                    json!({ "reference": instance.reference, "pin": pin.number, "name": pin.name, "x": px, "y": py })
-                })
+            pins.iter().map(move |(pin, transform)| (&instance.reference, pin, transform))
+        })
+        .filter_map(|(reference, pin, transform)| {
+            let (x, y) = g.pin_position(pin, *transform);
+            net_roots.contains(&g.root_at(x, y)).then(|| {
+                let (px, py) = copperpour_sexp::schematic::pin_endpoint(pin, *transform);
+                json!({ "reference": reference, "pin": pin.number, "name": pin.name, "x": px, "y": py })
             })
         })
         .collect();
     Ok(CallToolResult::json(
-        &json!({ "net": net, "label_count": matching.len(), "labels": matching, "pins": pins, "connected_points": net_pts.len() }),
+        &json!({ "net": net, "label_count": matching.len(), "labels": matching, "pins": pins, "connected_points": connected_points }),
     ))
 }
 
@@ -372,15 +374,19 @@ async fn handle_get_net_connectivity(
     };
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     if let Some(refusal) = unknown_net(&net, &labels) {
         return Ok(refusal);
     }
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
-    let net_wires: Vec<_> = wires
+    let net_roots = g.roots_named(&net);
+    let net_wire_objs: Vec<_> = wires
         .iter()
-        .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
+        .filter(|w| net_roots.contains(&g.root_at(w.x1, w.y1)))
+        .cloned()
+        .collect();
+    let net_wires: Vec<_> = net_wire_objs
+        .iter()
         .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
         .collect();
     let net_labels: Vec<_> = labels
@@ -392,11 +398,6 @@ async fn handle_get_net_connectivity(
                 json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
             )
         })
-        .collect();
-    let net_wire_objs: Vec<Wire> = wires
-        .iter()
-        .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
-        .cloned()
         .collect();
     let t_junctions = copperpour_sexp::schematic::find_t_junctions(&net_wire_objs, 0.01);
     Ok(CallToolResult::json(&json!({
@@ -432,10 +433,11 @@ async fn handle_get_pin_connections(
     };
     let (px, py) = pin.endpoint();
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
     let pin_nets = PinNetNames::build(&tree, &mut g, UnitNotation::for_schematic(&sch_path));
-    let net = pin_nets.net_of_pin(&mut g, &pin.pin, px, py);
+    let (x, y) = g.pin_position(&pin.pin, pin.t);
+    let net = pin_nets.net_of_pin(&mut g, &pin.pin, x, y);
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": net }),
     ))
@@ -453,7 +455,7 @@ async fn handle_get_component_nets(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     if !instances
         .iter()
         .any(|instance| instance.reference == reference)
@@ -468,7 +470,8 @@ async fn handle_get_component_nets(
         .flat_map(|(_, pins)| pins)
         .map(|(pin, transform)| {
             let (px, py) = copperpour_sexp::schematic::pin_endpoint(&pin, transform);
-            let net = pin_nets.net_of_pin(&mut g, &pin, px, py);
+            let (x, y) = g.pin_position(&pin, transform);
+            let net = pin_nets.net_of_pin(&mut g, &pin, x, y);
             json!({ "pin": pin.number, "name": pin.name, "x": px, "y": py, "net": net })
         })
         .collect();
@@ -488,20 +491,20 @@ async fn handle_get_net_components(
     };
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     if let Some(refusal) = unknown_net(&net, &labels) {
         return Ok(refusal);
     }
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
+    let net_roots = g.roots_named(&net);
     let result: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
         .into_iter()
         .filter_map(|(instance, pins)| {
             let connected: Vec<_> = pins
                 .into_iter()
                 .filter_map(|(pin, transform)| {
-                    let (px, py) = copperpour_sexp::schematic::pin_endpoint(&pin, transform);
-                    if net_pts.contains(&pt_key(px, py)) {
+                    let (px, py) = g.pin_position(&pin, transform);
+                    if net_roots.contains(&g.root_at(px, py)) {
                         Some(json!({ "pin": pin.number, "name": pin.name }))
                     } else {
                         None
@@ -534,8 +537,8 @@ async fn handle_trace_from_point(
         Err(e) => return Ok(e),
     };
     // A zero or negative tolerance makes every coincidence test below answer
-    // "nothing here" while the net graph, which resolves at its own fixed
-    // tolerance, still names a net — a successful response asserting a net at a
+    // "nothing here" while the net graph still names a net at its saved
+    // coordinate — a successful response asserting a net at a
     // point it also reports as bare. Refused rather than answered, as
     // `find_orphan_items` refuses it.
     let tol = match opt_positive_f64(args, "tolerance") {
@@ -545,8 +548,9 @@ async fn handle_trace_from_point(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let buses = extract_buses(&tree);
+    // Use raw marks for the proximity report and saved pin tips for net membership.
     let labels = extract_all_net_labels(&tree);
-    let mut g = net_graph_for(&tree, &wires, &labels);
+    let mut g = net_graph_for(&tree, &wires, &saved_net_labels(&tree));
     let on_wire: Vec<_> = wires
         .iter()
         .filter(|w| {
@@ -694,7 +698,7 @@ async fn handle_find_shorted_nets(
     let sch_path = get_path(args, "schematic")?;
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
     let mut root_nets: HashMap<(i64, i64), Vec<&str>> = HashMap::new();
     for (root, label) in label_roots(&mut g, &labels) {
@@ -769,7 +773,7 @@ fn reaches_beyond_this_sheet(kind: &LabelKind) -> bool {
 /// what another sheet adds to a net `find_single_pin_nets` sees on its own.
 fn global_net_pin_counts(tree: &copperpour_sexp::SexpNode) -> HashMap<String, usize> {
     let wires = extract_wires(tree);
-    let labels = extract_all_net_labels(tree);
+    let labels = saved_net_labels(tree);
     let mut graph = net_graph_for(tree, &wires, &labels);
     let mut pins_by_root: HashMap<(i64, i64), usize> = HashMap::new();
     for (instance, pins) in placed_pins_by_reference(tree) {
@@ -777,7 +781,7 @@ fn global_net_pin_counts(tree: &copperpour_sexp::SexpNode) -> HashMap<String, us
             continue;
         }
         for (pin, transform) in pins {
-            let (x, y) = copperpour_sexp::schematic::pin_endpoint(&pin, transform);
+            let (x, y) = graph.pin_position(&pin, transform);
             *pins_by_root.entry(graph.root_at(x, y)).or_default() += 1;
         }
     }
@@ -905,7 +909,7 @@ async fn handle_find_single_pin_nets(
     let sch_path = get_path(args, "schematic")?;
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
 
     // Every connection point, under the graph root that carries it. A sheet
@@ -918,9 +922,10 @@ async fn handle_find_single_pin_nets(
             continue;
         }
         for (pin, transform) in pins {
+            let (px, py) = graph.pin_position(pin, *transform);
             let (x, y) = copperpour_sexp::schematic::pin_endpoint(pin, *transform);
             pins_by_root
-                .entry(graph.root_at(x, y))
+                .entry(graph.root_at(px, py))
                 .or_default()
                 .push(Connection::ComponentPin {
                     reference: &instance.reference,
@@ -1042,7 +1047,7 @@ async fn handle_get_connected_items(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     if !instances
         .iter()
         .any(|instance| instance.reference == reference)
@@ -1065,7 +1070,7 @@ async fn handle_get_connected_items(
         .filter(|(instance, _)| instance.reference == reference)
     {
         for (pin, transform) in pins {
-            let (px, py) = copperpour_sexp::schematic::pin_endpoint(pin, *transform);
+            let (px, py) = g.pin_position(pin, *transform);
             let root = g.root_at(px, py);
             connected_roots.insert(root);
             if let Some(net) = g.name_of_root(root) {
@@ -1075,14 +1080,9 @@ async fn handle_get_connected_items(
     }
 
     // Find all wires, labels, and components on those nets
-    let all_net_pts: HashSet<(i64, i64)> =
-        g.points_on_roots(&connected_roots).into_iter().collect();
-
     let connected_wires: Vec<serde_json::Value> = wires
         .iter()
-        .filter(|w| {
-            all_net_pts.contains(&pt_key(w.x1, w.y1)) || all_net_pts.contains(&pt_key(w.x2, w.y2))
-        })
+        .filter(|w| connected_roots.contains(&g.root_at(w.x1, w.y1)))
         .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
         .collect();
 
@@ -1105,8 +1105,8 @@ async fn handle_get_connected_items(
             let matching_pins: Vec<_> = pins
                 .iter()
                 .filter_map(|(pin, transform)| {
-                    let (px, py) = copperpour_sexp::schematic::pin_endpoint(pin, *transform);
-                    if all_net_pts.contains(&pt_key(px, py)) {
+                    let (px, py) = g.pin_position(pin, *transform);
+                    if connected_roots.contains(&g.root_at(px, py)) {
                         Some(json!({ "pin": pin.number, "name": pin.name }))
                     } else {
                         None

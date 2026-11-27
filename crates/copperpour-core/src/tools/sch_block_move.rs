@@ -7,15 +7,15 @@
 //! whole sheet must come out of the move exactly as they went in.
 
 use crate::tools::sch_connectivity::{
-    net_graph_for, snapshot_net_graph, NetGraph, NetRoot, PinNetNames, UnitNotation,
-    COINCIDENT_TOLERANCE,
+    net_graph_for, saved_net_labels, snapshot_net_graph, NetGraph, NetRoot, PinNetNames,
+    UnitNotation, COINCIDENT_TOLERANCE,
 };
 use crate::tools::sch_wiring::NoConnectCarry;
 use copperpour_schematic_editor as cse;
 use copperpour_schematic_editor::sexp::{atom, SexpNode as RawNode};
 use copperpour_schematic_editor::types::{fmt_f64, translate_field_ats};
 use copperpour_sexp::geometry::points_coincident;
-use copperpour_sexp::schematic::{extract_all_net_labels, extract_wires, parse_at, pin_endpoint};
+use copperpour_sexp::schematic::{extract_wires, parse_at, pin_endpoint};
 use copperpour_sexp::SexpNode;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -322,12 +322,10 @@ pub(super) enum NetComparison {
     Cleanup,
 }
 
-/// Every symbol and sheet pin's net root and net name, with how a refusal
-/// names it. `None` when a symbol's library pins do not resolve, since an
-/// unseen pin cannot be shown to keep its net.
+/// Every symbol and sheet pin's net, or `None` if pin geometry is unresolved.
 fn pin_nets(tree: &SexpNode) -> Option<PinNets> {
     let wires = extract_wires(tree);
-    let labels = extract_all_net_labels(tree);
+    let labels = saved_net_labels(tree);
     let mut graph = net_graph_for(tree, &wires, &labels);
     collect_pin_nets(tree, &mut graph, &BTreeSet::new(), NetComparison::Move)
 }
@@ -412,8 +410,7 @@ fn collect_pin_nets(
     Some(nets)
 }
 
-/// How the move would change the sheet's pin nets, one line per net; empty
-/// when it changes none.
+/// How the move would change the sheet's pin nets.
 ///
 /// Pins are compared by the net they share with other pins and by the net's
 /// name, never by position, since every pin in the box moves.

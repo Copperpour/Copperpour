@@ -183,7 +183,7 @@ async fn single_saved_score_and_gateway_report_the_same_read_only_result() {
 }
 
 #[tokio::test]
-async fn the_near_miss_fixture_retains_its_legacy_connectivity_answers() {
+async fn the_near_miss_changes_electrical_identity_but_not_pin_contact_proximity() {
     let handler = handler().await;
     let connected = Sheet::input(CROWDED);
     let near_miss = connected.fork();
@@ -195,10 +195,8 @@ async fn the_near_miss_fixture_retains_its_legacy_connectivity_answers() {
     )
     .unwrap();
 
-    // The existing comparator treats the two endpoints as coincident.
-    // Cleanup must use finer precision without changing that answer.
     let report = compare(&handler, &near_miss, &connected, &[]).await;
-    assert_eq!(report["reasons"], json!([]), "{report}");
+    assert_eq!(report["verdict"], "blocked", "{report}");
     assert_eq!(report["delta"]["diagonal_wires"], -1, "{report}");
 
     let before = near_miss.files();

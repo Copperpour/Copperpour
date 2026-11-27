@@ -1228,6 +1228,14 @@ pub fn extract_all_net_labels(tree: &SexpNode) -> Vec<Label> {
 /// it flags. Symbols whose definition is not embedded in `lib_symbols` are
 /// skipped: without it there is no pin to place the label on.
 pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    extract_power_symbol_labels_with(tree, pin_endpoint)
+}
+
+/// Power drivers at the pin positions used by the caller's geometry model.
+pub fn extract_power_symbol_labels_with(
+    tree: &SexpNode,
+    position: impl Fn(&LibPin, PinTransform) -> (f64, f64),
+) -> Vec<Label> {
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
@@ -1254,7 +1262,7 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
             if pin.electrical_type != "power_in" {
                 continue;
             }
-            let (x, y) = pin_endpoint(&pin, t);
+            let (x, y) = position(&pin, t);
             labels.push(Label {
                 kind: LabelKind::PowerSymbol,
                 net: inst.value.clone(),
