@@ -77,6 +77,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "compare_schematic_layout",
     "find_pin_contacts",
     "plan_schematic_cleanup",
+    "plan_schematic_split",
     "preview_block_placement",
     // sch_analysis
     "find_orphan_items",

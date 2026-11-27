@@ -20,6 +20,7 @@ pub fn tools() -> Vec<ToolDef> {
         super::sch_cleanup::definition(),
         super::sch_block_placement::definition(),
         sch_placement_check::definition(),
+        super::sch_split_plan::tool_def(),
     ]
 }
 
@@ -188,6 +189,11 @@ mod tests {
             .iter()
             .all(|tool| tool.name != "preview_block_placement"));
         assert_readability_route("preview_block_placement").await;
+    }
+
+    #[tokio::test]
+    async fn split_plan_belongs_to_readability() {
+        assert_readability_route("plan_schematic_split").await;
     }
 
     #[tokio::test]

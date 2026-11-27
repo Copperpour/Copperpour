@@ -110,6 +110,9 @@ mod sch_pin_contacts;
 mod sch_placement_check;
 pub mod sch_readability;
 mod sch_shapes;
+mod sch_split_plan;
+#[cfg(test)]
+mod sch_split_plan_tests;
 mod sch_texts;
 mod sch_transfer;
 pub(crate) mod sch_wire_runs;
@@ -4182,6 +4185,26 @@ pub(crate) fn key_top_level_sheets(
     listed: Vec<(std::path::PathBuf, Option<String>)>,
     known: Option<(&std::path::Path, &str)>,
 ) -> Option<Vec<TopLevelSheet>> {
+    key_top_level_sheets_with(listed, known, &|path| {
+        copperpour_schematic_editor::Schematic::load(path).ok()
+    })
+}
+
+type LoadHierarchySheet<'a> =
+    &'a dyn Fn(&std::path::Path) -> Option<copperpour_schematic_editor::Schematic>;
+
+fn same_placement_uuid(left: &str, right: &str) -> bool {
+    match (uuid::Uuid::parse_str(left), uuid::Uuid::parse_str(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn key_top_level_sheets_with(
+    listed: Vec<(std::path::PathBuf, Option<String>)>,
+    known: Option<(&std::path::Path, &str)>,
+    load: LoadHierarchySheet<'_>,
+) -> Option<Vec<TopLevelSheet>> {
     listed
         .into_iter()
         .map(|(schematic, uuid)| {
@@ -4190,11 +4213,7 @@ pub(crate) fn key_top_level_sheets(
                 (None, Some((file, uuid))) if same_schematic_document(file, &schematic) => {
                     uuid.to_owned()
                 }
-                (None, _) => {
-                    copperpour_schematic_editor::Schematic::load(&schematic)
-                        .ok()?
-                        .uuid?
-                }
+                (None, _) => load(&schematic)?.uuid?,
             };
             Some(TopLevelSheet { schematic, uuid })
         })
@@ -4207,15 +4226,34 @@ fn paths_under_each(
     sheets: &[TopLevelSheet],
     target: &std::path::Path,
     override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
+    load: LoadHierarchySheet<'_>,
+    preserve_placements: bool,
 ) -> Vec<Option<Vec<String>>> {
     sheets
         .iter()
         .map(|sheet| {
-            if same_schematic_document(&sheet.schematic, target) {
+            let mut paths = if same_schematic_document(&sheet.schematic, target) {
                 Some(vec![format!("/{}", sheet.uuid)])
             } else {
-                sheet_file_instance_paths(&sheet.schematic, &sheet.uuid, target, override_schematic)
+                sheet_file_instance_paths(
+                    &sheet.schematic,
+                    &sheet.uuid,
+                    target,
+                    override_schematic,
+                    load,
+                    preserve_placements,
+                )
+            }?;
+            if preserve_placements
+                && sheets.iter().any(|other| {
+                    same_placement_uuid(&other.uuid, &sheet.uuid)
+                        && other.schematic != sheet.schematic
+                })
+            {
+                // The target's root path also names a different top-level file.
+                paths.extend(paths.first().cloned());
             }
+            Some(paths)
         })
         .collect()
 }
@@ -4229,7 +4267,13 @@ pub(crate) fn top_level_instance_paths(
     override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
 ) -> Option<Vec<String>> {
     let mut paths = Vec::new();
-    for found in paths_under_each(sheets, target, override_schematic) {
+    for found in paths_under_each(
+        sheets,
+        target,
+        override_schematic,
+        &|path| copperpour_schematic_editor::Schematic::load(path).ok(),
+        false,
+    ) {
         paths.extend(found?);
     }
     paths.sort();
@@ -4501,6 +4545,20 @@ pub(crate) fn resolve_schematic_ownership_from(
     target: &std::path::Path,
     current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    resolve_schematic_ownership_with(
+        target,
+        current_dir,
+        &|path| copperpour_schematic_editor::Schematic::load(path).ok(),
+        false,
+    )
+}
+
+fn resolve_schematic_ownership_with(
+    target: &std::path::Path,
+    current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+    load: LoadHierarchySheet<'_>,
+    preserve_placements: bool,
+) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
     let project_files = candidate_project_files_from(target, current_dir)?;
 
     let mut roots = Vec::new();
@@ -4509,12 +4567,12 @@ pub(crate) fn resolve_schematic_ownership_from(
     for project_file in project_files {
         let listed = listed_top_level_sheets(&project_file);
         roots.extend(listed.iter().map(|(schematic, _)| schematic.clone()));
-        let Some(top_level_sheets) = key_top_level_sheets(listed, None) else {
+        let Some(top_level_sheets) = key_top_level_sheets_with(listed, None, load) else {
             complete = false;
             continue;
         };
 
-        let found = paths_under_each(&top_level_sheets, target, None);
+        let found = paths_under_each(&top_level_sheets, target, None, load, preserve_placements);
         complete &= found.iter().all(Option::is_some);
         let places = |index: &usize| {
             found[*index]
@@ -4531,7 +4589,9 @@ pub(crate) fn resolve_schematic_ownership_from(
         let root = top_level_sheets[index].clone();
         let mut instance_paths: Vec<String> = found.into_iter().flatten().flatten().collect();
         instance_paths.sort();
-        instance_paths.dedup();
+        if !preserve_placements {
+            instance_paths.dedup();
+        }
         owners.push(SchematicOwnership {
             project_file,
             root_schematic: root.schematic,
@@ -4616,6 +4676,8 @@ struct PathCollect<'a> {
         &'a std::path::Path,
         &'a copperpour_schematic_editor::Schematic,
     )>,
+    load: LoadHierarchySheet<'a>,
+    preserve_placements: bool,
     suffix: Vec<String>,
     stack: std::collections::HashSet<std::path::PathBuf>,
     found: Vec<String>,
@@ -4637,18 +4699,19 @@ fn collect_sheet_instance_paths(
     let mut complete = true;
     let loaded;
     let schematic = match collect.override_schematic {
-        Some((path, sch)) if same_schematic_document(current, path) => Ok(sch),
+        Some((path, sch)) if same_schematic_document(current, path) => Some(sch),
         _ => {
-            loaded = copperpour_schematic_editor::Schematic::load(current);
-            loaded.as_ref().map_err(|_| ())
+            loaded = (collect.load)(current);
+            loaded.as_ref()
         }
     };
-    if let Ok(schematic) = schematic {
+    if let Some(schematic) = schematic {
         let directory = current
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         for sheet in &schematic.sheets {
             let child = directory.join(sheet.file());
+            let first = collect.found.len();
             collect.suffix.push(sheet.uuid.clone());
             if same_schematic_document(&child, collect.target) {
                 let mut path = format!("/{}", collect.root_uuid);
@@ -4661,6 +4724,15 @@ fn collect_sheet_instance_paths(
                 complete &= collect_sheet_instance_paths(collect, &child, depth + 1);
             }
             collect.suffix.pop();
+            if collect.preserve_placements
+                && schematic.sheets.iter().any(|other| {
+                    same_placement_uuid(&other.uuid, &sheet.uuid) && other.file() != sheet.file()
+                })
+            {
+                // A different sibling file shares this path prefix. Preserve
+                // the ambiguity even if only one sibling contains the target.
+                collect.found.extend(collect.found.get(first).cloned());
+            }
         }
     } else {
         complete = false;
@@ -4678,18 +4750,24 @@ fn sheet_file_instance_paths(
     root_uuid: &str,
     target: &std::path::Path,
     override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
+    load: LoadHierarchySheet<'_>,
+    preserve_placements: bool,
 ) -> Option<Vec<String>> {
     let mut collect = PathCollect {
         target,
         root_uuid,
         override_schematic,
+        load,
+        preserve_placements,
         suffix: Vec::new(),
         stack: std::collections::HashSet::new(),
         found: Vec::new(),
     };
     let complete = collect_sheet_instance_paths(&mut collect, root_schematic, 0);
     collect.found.sort();
-    collect.found.dedup();
+    if !preserve_placements {
+        collect.found.dedup();
+    }
     complete.then_some(collect.found)
 }
 
@@ -4710,22 +4788,54 @@ pub(crate) fn sheet_instance_context(
     sch: &mut copperpour_schematic_editor::Schematic,
 ) -> Result<SheetInstanceContext, SchematicTargetError> {
     let own_root = ensure_root_uuid(sch);
+    let ownership = resolve_schematic_ownership(sch_path)?;
+    Ok(instance_context_from_ownership(
+        sch_path, &own_root, ownership,
+    ))
+}
+
+/// Same ownership rules as the edit path, without creating cooperative
+/// lockfiles. The requested document is the same snapshot the caller analyses.
+pub(super) fn saved_sheet_instance_context(
+    path: &std::path::Path,
+    source: &str,
+    own_root: &str,
+) -> Result<SheetInstanceContext, SchematicTargetError> {
+    let ownership = resolve_schematic_ownership_with(
+        path,
+        std::env::current_dir,
+        &|other| {
+            if same_schematic_document(path, other) {
+                return copperpour_schematic_editor::Schematic::from_source(other, source).ok();
+            }
+            let source = std::fs::read_to_string(other).ok()?;
+            copperpour_schematic_editor::Schematic::from_source(other, source).ok()
+        },
+        true,
+    )?;
+    Ok(instance_context_from_ownership(path, own_root, ownership))
+}
+
+fn instance_context_from_ownership(
+    sch_path: &std::path::Path,
+    own_root: &str,
+    ownership: Option<SchematicOwnership>,
+) -> SheetInstanceContext {
     let standalone = SheetInstanceContext {
         project_name: project_name_for(sch_path),
         instance_path: format!("/{own_root}"),
         instance_paths: vec![format!("/{own_root}")],
         is_child_sheet: false,
     };
-
-    let Some(ownership) = resolve_schematic_ownership(sch_path)? else {
-        return Ok(standalone);
+    let Some(ownership) = ownership else {
+        return standalone;
     };
     let instance_path = ownership
         .instance_paths
         .first()
         .cloned()
         .unwrap_or_else(|| standalone.instance_path.clone());
-    Ok(SheetInstanceContext {
+    SheetInstanceContext {
         project_name: ownership
             .project_file
             .file_stem()
@@ -4735,7 +4845,7 @@ pub(crate) fn sheet_instance_context(
         instance_path,
         instance_paths: ownership.instance_paths,
         is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
-    })
+    }
 }
 
 /// Symbols named per distinct diagnosis before the rest become a count.
