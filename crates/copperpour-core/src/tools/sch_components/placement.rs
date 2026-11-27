@@ -383,9 +383,15 @@ pub(crate) fn place_one_component(
     // Value, Footprint, Datasheet and Description from the placed instance,
     // not as a fallback from lib_symbols; every library-owned default must be
     // copied even though the embedded definition carries it (#226, #506).
-    // Power symbols get their Reference hidden too, matching eeschema: a
-    // #PWR designator is never shown on the sheet.
-    let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
+    // Each field's visibility comes from the library definition, as eeschema
+    // copies it onto a placed symbol (#853). A library that omits a field
+    // keeps the default KiCad gives it: Footprint, Datasheet, Description and
+    // custom fields hidden, Reference and Value shown.
+    let hidden_in_library = |name: &str, default: bool| {
+        cse::library::field_hidden(sch, lib_id, name).unwrap_or(default)
+    };
+    let hide_reference = hidden_in_library("Reference", false);
+    let hide_value = hidden_in_library("Value", false);
     let anchors = cse::library::field_anchors(sch, lib_id);
     // The anchors follow the placement, mirror included: a mirrored body puts
     // its Reference and Value where the reflection lands them, exactly as a
@@ -419,7 +425,7 @@ pub(crate) fn place_one_component(
         val_x,
         val_y,
         val_rot,
-        false,
+        hide_value,
         anchors.value_justify,
     ));
     sym.properties.push(positioned(
@@ -428,7 +434,7 @@ pub(crate) fn place_one_component(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Footprint", true),
         centred,
     ));
     sym.properties.push(positioned(
@@ -437,7 +443,7 @@ pub(crate) fn place_one_component(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Datasheet", true),
         centred,
     ));
     sym.properties.push(positioned(
@@ -446,14 +452,15 @@ pub(crate) fn place_one_component(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Description", true),
         centred,
     ));
 
     // Carry all custom properties from the library symbol (excluding standard 5 and ki_*)
     let lib_custom_props = cse::library::symbol_custom_properties(sch, lib_id);
     for custom in lib_custom_props {
-        let mut prop = positioned(&custom.name, &custom.value, x, y, 0.0, true, centred);
+        let hidden = hidden_in_library(&custom.name, true);
+        let mut prop = positioned(&custom.name, &custom.value, x, y, 0.0, hidden, centred);
         prop.private = custom.private;
         sym.properties.push(prop);
     }

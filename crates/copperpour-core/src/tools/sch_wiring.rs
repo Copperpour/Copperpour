@@ -3829,8 +3829,10 @@ fn add_power_symbol_to(
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.
     // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
-    // #PWR piles up in the top-left corner. Hide Reference like eeschema does
-    // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
+    // #PWR piles up in the top-left corner. Each field's visibility is copied
+    // from the library, as eeschema does (#853); a library that omits a field
+    // falls back to the default a power symbol has always had: Reference
+    // hidden, the rest of the metadata fields hidden, Value shown.
     //
     // The library anchors matter most here: GND anchors Value below the
     // graphic but VCC/+5V/+3V3 anchor it above, so one fixed offset cannot
@@ -3849,13 +3851,16 @@ fn add_power_symbol_to(
         crate::tools::field_at(anchors.value_at, crate::tools::FALLBACK_VALUE_AT, t);
     let positioned = crate::tools::positioned_property;
     let centred = cse::library::FieldJustify::default();
+    let hidden_in_library = |name: &str, default: bool| {
+        cse::library::field_hidden(sch, lib_id, name).unwrap_or(default)
+    };
     sym.properties.push(positioned(
         "Reference",
         &pwr_ref,
         ref_x,
         ref_y,
         ref_rot,
-        true,
+        hidden_in_library("Reference", true),
         anchors.reference_justify,
     ));
     sym.properties.push(positioned(
@@ -3864,7 +3869,7 @@ fn add_power_symbol_to(
         val_x,
         val_y,
         val_rot,
-        false,
+        hidden_in_library("Value", false),
         anchors.value_justify,
     ));
     sym.properties.push(positioned(
@@ -3873,7 +3878,7 @@ fn add_power_symbol_to(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Footprint", true),
         centred,
     ));
     sym.properties.push(positioned(
@@ -3882,7 +3887,7 @@ fn add_power_symbol_to(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Datasheet", true),
         centred,
     ));
     sym.properties.push(positioned(
@@ -3891,7 +3896,7 @@ fn add_power_symbol_to(
         x,
         y,
         0.0,
-        true,
+        hidden_in_library("Description", true),
         centred,
     ));
 
@@ -8368,7 +8373,7 @@ mod power_symbol_tests {
             &path,
             // Anchors copied from KiCad 10's power.kicad_sym: GND points down,
             // so both fields anchor below the origin in Y-up library space.
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0) (hide yes))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -8476,6 +8481,48 @@ mod power_symbol_tests {
                 .find(|p| p.name == "Description")
                 .map(|p| p.value.as_str()),
             Some("Ground power symbol")
+        );
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_copies_legacy_hidden_value_from_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-legacy-hidden-value.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0) (hide yes))\n      (property \"Value\" \"GND\" (at 0 -3.81 0) (effects (font (size 1.27 1.27)) hide))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR01"))
+            .expect("power symbol instance");
+        let value = cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|property| property.name == "Value")
+                .unwrap()
+                .to_sexp(),
+        );
+        assert!(
+            value.contains("(hide yes)"),
+            "add_power_symbol must copy a hidden Value from a KiCad 6/7 library: {value}"
         );
     }
 

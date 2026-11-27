@@ -81,6 +81,11 @@ fn stub_symbol_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) 
             ),
         )
         .unwrap();
+    std::fs::write(
+        symdir.join("WITH_LEGACY_HIDDEN_FIELD.kicad_sym"),
+        "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"eeschema\")\n\t(symbol \"WITH_LEGACY_HIDDEN_FIELD\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"Legacy hidden value\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n\t\t(symbol \"WITH_LEGACY_HIDDEN_FIELD_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+    )
+    .unwrap();
     // LM2904-style multi-unit part: unit 1 = pins 1-3, unit 2 = pins 5-7,
     // unit 3 = power pins 4/8 (#35 repro shape).
     let pin = |num: &str, x: f64, y: f64, angle: u32| {
@@ -1769,6 +1774,94 @@ async fn add_schematic_component_hides_power_reference() {
     assert!(
         !val_sexp.contains("hide"),
         "Value stays visible: {val_sexp}"
+    );
+}
+
+/// Field visibility comes from the library definition, not from the `power:`
+/// prefix (#853): a logo whose library hides Reference and Value is placed
+/// hidden, a non-power `PWR_FLAG` keeps its library-hidden Reference hidden,
+/// and a library that shows Value keeps it shown.
+#[tokio::test]
+async fn add_schematic_component_takes_field_visibility_from_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("visibility-from-library.kicad_sch");
+    std::fs::write(
+        &path,
+        "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Graphic:Logo_Open_Hardware_Small\"\n      (property \"Reference\" \"#SYM\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"Logo_Open_Hardware_Small\" (at 0 0 0) (hide yes))\n    )\n    (symbol \"MyPower:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"PWR_FLAG\" (at 0 0 0))\n    )\n  )\n)\n",
+    )
+    .unwrap();
+
+    for (lib_id, reference) in [
+        ("Graphic:Logo_Open_Hardware_Small", "#SYM1"),
+        ("MyPower:PWR_FLAG", "#FLG02"),
+        ("Device:WITH_LEGACY_HIDDEN_FIELD", "U3"),
+    ] {
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": lib_id,
+                "x": 50.0,
+                "y": 60.0,
+                "reference": reference
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+    }
+
+    let sch = cse::Schematic::load(&path).unwrap();
+    let field_sexp = |sym: &cse::Symbol, name: &str| {
+        cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .to_sexp(),
+        )
+    };
+    let logo = sch
+        .symbols
+        .iter()
+        .find(|s| s.reference() == Some("#SYM1"))
+        .expect("logo instance");
+    assert!(
+        field_sexp(logo, "Reference").contains("(hide yes)"),
+        "the library hides the logo Reference, so the placed Reference must be hidden: {}",
+        field_sexp(logo, "Reference")
+    );
+    assert!(
+        field_sexp(logo, "Value").contains("(hide yes)"),
+        "the library hides the logo Value, so the placed Value must be hidden: {}",
+        field_sexp(logo, "Value")
+    );
+
+    let flag = sch
+        .symbols
+        .iter()
+        .find(|s| s.reference() == Some("#FLG02"))
+        .expect("PWR_FLAG instance");
+    assert!(
+        field_sexp(flag, "Reference").contains("(hide yes)"),
+        "the library hides the PWR_FLAG Reference, so the placed Reference must be hidden: {}",
+        field_sexp(flag, "Reference")
+    );
+    assert!(
+        !field_sexp(flag, "Value").contains("hide"),
+        "the library shows the PWR_FLAG Value, so it must stay shown: {}",
+        field_sexp(flag, "Value")
+    );
+
+    let legacy = sch
+        .symbols
+        .iter()
+        .find(|s| s.reference() == Some("U3"))
+        .expect("legacy-hidden-field instance");
+    assert!(
+        field_sexp(legacy, "Value").contains("(hide yes)"),
+        "the KiCad 6/7 library hides Value with a bare hide inside effects: {}",
+        field_sexp(legacy, "Value")
     );
 }
 
