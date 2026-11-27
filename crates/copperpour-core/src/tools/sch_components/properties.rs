@@ -349,6 +349,20 @@ fn property_insert_edit(
     Ok(SexpEdit::insert(close, prop))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PropertyWriteError {
+    Malformed(String),
+    AmbiguousVisibility(String),
+}
+
+impl std::fmt::Display for PropertyWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(message) | Self::AmbiguousVisibility(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Set one shared component property in every placed unit.
 ///
 /// Built-in properties must already exist in every unit (`add_missing=false`).
@@ -361,7 +375,7 @@ pub(crate) fn set_property_value(
     field: &str,
     new_value: &str,
     add_missing: bool,
-) -> Result<(String, PropertyWriteCounts), String> {
+) -> Result<(String, PropertyWriteCounts), PropertyWriteError> {
     let blocks: Vec<_> = find_direct_child_blocks(content, "kicad_sch")
         .into_iter()
         .filter(|&(start, end)| {
@@ -387,9 +401,11 @@ fn set_property_value_in_blocks(
     field: &str,
     new_value: &str,
     add_missing: bool,
-) -> Result<(String, PropertyWriteCounts), String> {
+) -> Result<(String, PropertyWriteCounts), PropertyWriteError> {
     if blocks.is_empty() {
-        return Err(format!("symbol '{reference}' not found in this schematic"));
+        return Err(PropertyWriteError::Malformed(format!(
+            "symbol '{reference}' not found in this schematic"
+        )));
     }
 
     let value = quote_string(new_value);
@@ -399,7 +415,7 @@ fn set_property_value_in_blocks(
 
     for &(start, end) in blocks {
         let properties = symbol_fields::symbol_properties(content, start, end)
-            .map_err(|error| format!("'{reference}': {error}"))?;
+            .map_err(|error| PropertyWriteError::Malformed(format!("'{reference}': {error}")))?;
         if let Some(property) = properties
             .into_iter()
             .find(|property| property.name == field)
@@ -418,17 +434,19 @@ fn set_property_value_in_blocks(
     if !missing.is_empty() {
         if !add_missing {
             if edits.is_empty() {
-                return Err(format!("Field '{field}' not found on '{reference}'"));
+                return Err(PropertyWriteError::Malformed(format!(
+                    "Field '{field}' not found on '{reference}'"
+                )));
             }
-            return Err(format!(
+            return Err(PropertyWriteError::Malformed(format!(
                 "'{reference}' is missing the shared '{field}' property on one of its placed units"
-            ));
+            )));
         }
         if has_private && has_public {
-            return Err(format!(
+            return Err(PropertyWriteError::AmbiguousVisibility(format!(
                 "'{reference}' has both private and public copies of '{field}'; \
                  cannot choose which to add to the missing units"
-            ));
+            )));
         }
     }
 
@@ -437,14 +455,10 @@ fn set_property_value_in_blocks(
         added: missing.len(),
     };
     for block in missing {
-        edits.push(property_insert_edit(
-            content,
-            reference,
-            block,
-            field,
-            new_value,
-            has_private,
-        )?);
+        edits.push(
+            property_insert_edit(content, reference, block, field, new_value, has_private)
+                .map_err(PropertyWriteError::Malformed)?,
+        );
     }
 
     Ok((apply_edits(content.to_string(), edits), counts))
@@ -456,27 +470,34 @@ fn set_property_value_in_blocks(
 ///
 /// Private fields cannot be removed through `remove_fields`.
 fn plan_property_removal(
+    path: &std::path::Path,
     content: &str,
     blocks: &[(usize, usize)],
     reference: &str,
     field: &str,
 ) -> Result<(Vec<SexpEdit>, usize), CallToolResult> {
-    let unchanged = |why: String| {
-        CallToolResult::error(format!(
-            "No fields were updated on '{reference}': {field}: {why}"
-        ))
+    let malformed = |why: String| {
+        let message = format!("No fields were updated on '{reference}': {field}: {why}");
+        super::malformed_schematic_error(path, message)
     };
     if blocks.is_empty() {
-        return Err(unchanged(format!(
-            "symbol '{reference}' not found in this schematic"
-        )));
+        let message = format!(
+            "No fields were updated on '{reference}': {field}: symbol '{reference}' not found in this schematic"
+        );
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: format!("component {reference}"),
+                reason: message.clone(),
+            },
+            message,
+        ));
     }
 
     let mut edits = Vec::new();
 
     for &(start, end) in blocks {
         let properties =
-            symbol_fields::symbol_properties(content, start, end).map_err(unchanged)?;
+            symbol_fields::symbol_properties(content, start, end).map_err(&malformed)?;
         if let Some(property) = properties
             .into_iter()
             .find(|property| property.name == field)
@@ -492,7 +513,7 @@ fn plan_property_removal(
             }
             let (from, to) = find_block_with_leading_whitespace(content, property.block.0)
                 .ok_or_else(|| {
-                    unchanged(format!("'{field}' property on '{reference}' is malformed"))
+                    malformed(format!("'{field}' property on '{reference}' is malformed"))
                 })?;
             edits.push(SexpEdit::delete(from, to));
         }
@@ -502,10 +523,19 @@ fn plan_property_removal(
     Ok((edits, units))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditErrorKind {
+    InvalidArgument { field: &'static str },
+    PlanBlocked,
+    StaleTarget,
+    MalformedFile,
+}
+
 #[derive(Default)]
 struct FieldPlacementEdits {
     changes: Vec<String>,
     errors: Vec<String>,
+    error_kinds: Vec<EditErrorKind>,
     applied: Vec<(String, FieldPlacement)>,
     unit: Option<u32>,
 }
@@ -564,6 +594,9 @@ fn apply_field_placements(
             let Some(spec) = spec.as_object() else {
                 plan.errors
                     .push(format!("{name}: field_placements entries must be objects"));
+                plan.error_kinds.push(EditErrorKind::InvalidArgument {
+                    field: "field_placements",
+                });
                 continue;
             };
             let mut placement = FieldPlacement::default();
@@ -585,6 +618,9 @@ fn apply_field_placements(
                         }
                         None => {
                             plan.errors.push(format!("{name}.{key}: expected a number"));
+                            plan.error_kinds.push(EditErrorKind::InvalidArgument {
+                                field: "field_placements",
+                            });
                             bad = true;
                         }
                     },
@@ -597,6 +633,9 @@ fn apply_field_placements(
                     None => {
                         plan.errors
                             .push(format!("{name}.hide: expected true or false"));
+                        plan.error_kinds.push(EditErrorKind::InvalidArgument {
+                            field: "field_placements",
+                        });
                         bad = true;
                     }
                 },
@@ -608,6 +647,9 @@ fn apply_field_placements(
                 plan.errors.push(format!(
                     "{name}: field_placements entry sets nothing — give x, y, rotation or hide"
                 ));
+                plan.error_kinds.push(EditErrorKind::InvalidArgument {
+                    field: "field_placements",
+                });
                 continue;
             }
             // A field's position is absolute, so one coordinate cannot be
@@ -620,6 +662,8 @@ fn apply_field_placements(
                      an absolute coordinate cannot be right for all of them",
                     unit_count
                 ));
+                plan.error_kinds
+                    .push(EditErrorKind::InvalidArgument { field: "unit" });
                 continue;
             }
             match set_property_placement(content, reference, name, &placement, only_unit) {
@@ -640,7 +684,10 @@ fn apply_field_placements(
                     let message = format!("No fields were updated on '{reference}': {reason}");
                     return Err(FieldPlacementFailure::malformed_file(path, reason, message));
                 }
-                Err(refusal) => plan.errors.push(format!("{name}: {}", refusal.reason())),
+                Err(refusal) => {
+                    plan.errors.push(format!("{name}: {}", refusal.reason()));
+                    plan.error_kinds.push(EditErrorKind::StaleTarget);
+                }
             }
         }
     }
@@ -1126,6 +1173,7 @@ pub(super) async fn handle_edit_schematic_component(
     let uuids = target.uuids();
 
     let mut errors: Vec<String> = Vec::new();
+    let mut error_kinds: Vec<EditErrorKind> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
     // between calls (the instances rewrite below, and the custom-field loop),
     // and a closure capturing them mutably would lock both for its lifetime.
@@ -1147,7 +1195,10 @@ pub(super) async fn handle_edit_schematic_component(
                         $field, $new_val, counts.updated
                     ));
                 }
-                Err(why) => errors.push(format!("{}: {}", $field, why)),
+                Err(why) => {
+                    errors.push(format!("{}: {}", $field, why));
+                    error_kinds.push(EditErrorKind::MalformedFile);
+                }
             }
         };
     }
@@ -1163,6 +1214,7 @@ pub(super) async fn handle_edit_schematic_component(
     let mut absent_fields = Vec::new();
     for name in &remove_names {
         match plan_property_removal(
+            &sch_path,
             &content,
             &symbol_blocks_by_uuid(&content, &uuids),
             &reference,
@@ -1205,6 +1257,7 @@ pub(super) async fn handle_edit_schematic_component(
                 changed.truncate(before_changes);
                 expected_fields = before_expected_fields;
                 errors.push(format!("instances reference: {why}"));
+                error_kinds.push(EditErrorKind::MalformedFile);
             }
         }
     }
@@ -1283,6 +1336,7 @@ pub(super) async fn handle_edit_schematic_component(
         for (name, value) in fields {
             let Some(value) = value.as_str() else {
                 errors.push(format!("{name}: field values must be strings"));
+                error_kinds.push(EditErrorKind::InvalidArgument { field: "fields" });
                 continue;
             };
             if is_reserved_property(name) {
@@ -1290,6 +1344,7 @@ pub(super) async fn handle_edit_schematic_component(
                     "{name}: set this through the '{}' parameter, not 'fields'",
                     name.to_ascii_lowercase()
                 ));
+                error_kinds.push(EditErrorKind::InvalidArgument { field: "fields" });
                 continue;
             }
             match set_property_value_in_blocks(
@@ -1308,7 +1363,14 @@ pub(super) async fn handle_edit_schematic_component(
                         counts.updated, counts.added
                     ));
                 }
-                Err(why) => errors.push(format!("{name}: {why}")),
+                Err(PropertyWriteError::AmbiguousVisibility(why)) => {
+                    errors.push(format!("{name}: {why}"));
+                    error_kinds.push(EditErrorKind::PlanBlocked);
+                }
+                Err(PropertyWriteError::Malformed(why)) => {
+                    errors.push(format!("{name}: {why}"));
+                    error_kinds.push(EditErrorKind::MalformedFile);
+                }
             }
         }
     }
@@ -1330,6 +1392,7 @@ pub(super) async fn handle_edit_schematic_component(
     };
     changed.extend(plan.changes);
     errors.extend(plan.errors);
+    error_kinds.extend(plan.error_kinds);
     let applied_placements = plan.applied;
     let placement_unit = plan.unit;
 
@@ -1343,16 +1406,43 @@ pub(super) async fn handle_edit_schematic_component(
             || placements.is_some_and(|p| !p.is_empty()))
         && errors.is_empty()
     {
-        return Ok(CallToolResult::error(format!(
-            "No fields were updated on '{reference}'"
-        )));
+        let message = format!("No fields were updated on '{reference}'");
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "edit_schematic_component".to_owned(),
+                reasons: vec![message.clone()],
+            },
+            message,
+        ));
     }
     if changed.is_empty() && !errors.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No fields were updated on '{}': {}",
-            reference,
-            errors.join("; ")
-        )));
+        let joined = errors.join("; ");
+        let message = format!("No fields were updated on '{reference}': {joined}");
+        let kind = if error_kinds.contains(&EditErrorKind::MalformedFile) {
+            ToolErrorKind::MalformedFile {
+                path: copperpour_sexp::paths::display_path(&sch_path),
+                reason: joined,
+            }
+        } else if let Some(field) = error_kinds.iter().find_map(|kind| match kind {
+            EditErrorKind::InvalidArgument { field } => Some(*field),
+            _ => None,
+        }) {
+            ToolErrorKind::InvalidArgument {
+                field: field.to_owned(),
+                reason: joined,
+            }
+        } else if error_kinds.contains(&EditErrorKind::PlanBlocked) {
+            ToolErrorKind::PlanBlocked {
+                operation: "edit_schematic_component".to_owned(),
+                reasons: vec![joined],
+            }
+        } else {
+            ToolErrorKind::StaleTarget {
+                target: format!("component {reference}"),
+                reason: joined,
+            }
+        };
+        return Ok(CallToolResult::error_kind(kind, message));
     }
 
     let intent = ComponentMutationIntent::new(

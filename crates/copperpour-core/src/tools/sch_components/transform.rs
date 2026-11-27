@@ -410,7 +410,11 @@ pub(super) async fn handle_move_connected(
 ) -> anyhow::Result<CallToolResult> {
     // The old implementation moved only the symbol but reported that it
     // preserved connections. Refuse until the tool can move the wires too.
-    Ok(CallToolResult::error(
+    Ok(CallToolResult::error_kind(
+        ToolErrorKind::UnsupportedCapability {
+            capability: "move_connected".to_owned(),
+            kicad_version: None,
+        },
         "move_connected is not implemented. Use move_schematic_component (moves the symbol \
          only), then re-route or use connect_pins for the affected nets.",
     ))

@@ -3,14 +3,15 @@
 use super::deletion::ComponentDeleteTargetError;
 use super::properties::{
     closing_quote, dnp_property_refusal, escape_property_text, is_dnp_property,
-    is_reserved_property, set_property_value,
+    is_reserved_property, set_property_value, PropertyWriteError,
 };
 use super::readback::{
     commit_verified_component_mutation, component_target_from_source, copy_component_observation,
     load_component_mutation_readback, tool_error_summary, ComponentMutationIntent,
 };
+use super::{component_not_found_error, invalid_unit_error, malformed_schematic_error};
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
-use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_wiring::{
     apply_no_connect_carries, no_connect_carry_unwritable, observed_no_connect_moves,
     plan_no_connect_carry_for_replacement, reconcile_junctions_for_placement,
@@ -61,10 +62,17 @@ pub(super) async fn handle_add_component_annotation(
                 ),
             ));
         }
-        return Ok(CallToolResult::error(format!(
+        let message = format!(
             "'{key}' is a built-in field — set it through edit_schematic_component's \
              dedicated parameter, not as an annotation."
-        )));
+        );
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "key".to_owned(),
+                reason: message.clone(),
+            },
+            message,
+        ));
     }
 
     let content = read_consistent(&sch_path)?;
@@ -82,7 +90,22 @@ pub(super) async fn handle_add_component_annotation(
     // repaired by updating existing copies and adding only the missing ones.
     let (new_content, _) = match set_property_value(&content, &reference, &key, &value, true) {
         Ok(updated) => updated,
-        Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
+        Err(PropertyWriteError::AmbiguousVisibility(why)) => {
+            let message = format!("{key}: {why}");
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: "add_component_annotation".to_owned(),
+                    reasons: vec![message.clone()],
+                },
+                message,
+            ));
+        }
+        Err(PropertyWriteError::Malformed(why)) => {
+            return Ok(malformed_schematic_error(
+                &sch_path,
+                format!("{key}: {why}"),
+            ))
+        }
     };
     let item_ids = match target.item_ids() {
         Ok(item_ids) => item_ids,
@@ -142,7 +165,14 @@ pub(super) async fn handle_group_components(
     };
 
     if refs.is_empty() {
-        return Ok(CallToolResult::error("No references provided"));
+        let message = "No references provided";
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "references".to_owned(),
+                reason: message.to_owned(),
+            },
+            message,
+        ));
     }
 
     let mut content = read_consistent(&sch_path)?;
@@ -265,11 +295,18 @@ pub(super) async fn handle_update_symbols_from_library(
             .iter()
             .find(|r| !instances.iter().any(|i| &i.reference == *r))
         {
-            return Ok(CallToolResult::error(format!(
+            let message = format!(
                 "Component '{}' not found in {}",
                 missing,
                 sch_path.display()
-            )));
+            );
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target: format!("component {missing}"),
+                    reason: message.clone(),
+                },
+                message,
+            ));
         }
     }
 
@@ -564,17 +601,22 @@ pub(super) async fn handle_replace_component(
 
     let blocks = find_all_symbol_instance_blocks(&content, &reference);
     if blocks.is_empty() {
-        return Ok(CallToolResult::error(component_not_found(
-            &sch_path, &reference,
-        )));
+        return Ok(component_not_found_error(&sch_path, &reference));
     }
     if blocks.len() > 1 && new_unit.is_some() {
-        return Ok(CallToolResult::error(format!(
+        let message = format!(
             "Component '{}' has {} placed units; the 'unit' override is only \
              unambiguous for a single placement. Omit it to preserve each unit.",
             reference,
             blocks.len()
-        )));
+        );
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "unit".to_owned(),
+                reason: message.clone(),
+            },
+            message,
+        ));
     }
     let parsed = parse_sexp(&content)?;
     let current_units: Vec<u32> = extract_symbol_instances(&parsed)
@@ -620,20 +662,24 @@ pub(super) async fn handle_replace_component(
         .unwrap_or(1);
     if let Some(unit) = new_unit {
         if unit < 1 || unit > unit_count {
-            return Ok(CallToolResult::error(format!(
-                "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
-                unit, new_lib_id, unit_count, unit_count
-            )));
+            return Ok(invalid_unit_error(unit, &new_lib_id, unit_count));
         }
     } else if let Some(invalid) = current_units
         .iter()
         .find(|unit| **unit < 1 || **unit > unit_count)
     {
-        return Ok(CallToolResult::error(format!(
+        let message = format!(
             "Cannot replace '{}' with '{}': placed unit {} does not exist in the \
              new {}-unit symbol. Delete and re-place the component deliberately.",
             reference, new_lib_id, invalid, unit_count
-        )));
+        );
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "replace_component".to_owned(),
+                reasons: vec![message.clone()],
+            },
+            message,
+        ));
     }
 
     // Replace the library id in every unit block. Shared component identity
@@ -645,14 +691,14 @@ pub(super) async fn handle_replace_component(
     for (start, end) in &blocks {
         let block = &content[*start..*end];
         let Some(relative) = block.find(lib_id_pat) else {
-            return Ok(CallToolResult::error(format!(
-                "A unit of '{}' has no lib_id",
-                reference
-            )));
+            return Ok(malformed_schematic_error(
+                &sch_path,
+                format!("A unit of '{}' has no lib_id", reference),
+            ));
         };
         let value_start = *start + relative + lib_id_pat.len();
         let Some(value_end) = closing_quote(&content, value_start) else {
-            return Ok(CallToolResult::error("Malformed lib_id"));
+            return Ok(malformed_schematic_error(&sch_path, "Malformed lib_id"));
         };
         old_lib_ids.push(content[value_start..value_end].to_string());
         edits.push(SexpEdit::replace(
@@ -685,11 +731,14 @@ pub(super) async fn handle_replace_component(
     old_lib_ids.sort();
     old_lib_ids.dedup();
     if old_lib_ids.len() != 1 {
-        return Ok(CallToolResult::error(format!(
-            "Component '{}' already has inconsistent library ids across its units: {}",
-            reference,
-            old_lib_ids.join(", ")
-        )));
+        return Ok(malformed_schematic_error(
+            &sch_path,
+            format!(
+                "Component '{}' already has inconsistent library ids across its units: {}",
+                reference,
+                old_lib_ids.join(", ")
+            ),
+        ));
     }
     let old_lib_id = old_lib_ids.remove(0);
     content = apply_edits(content, edits);

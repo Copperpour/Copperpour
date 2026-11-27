@@ -1,8 +1,8 @@
 //! Schematic component inspection, listing, pin locations, annotation, and SVG rendering.
 
 use super::readback::wants_verbose;
+use super::{component_not_found_error, malformed_schematic_error};
 use crate::mcp::protocol::CallToolResult;
-use crate::tools::reference_hint::component_not_found;
 use crate::tools::{get_path, require_array, require_str, ToolContext};
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::schematic::{
@@ -42,9 +42,7 @@ pub(super) async fn handle_get_schematic_component(
         .filter(|symbol| symbol.reference() == Some(reference.as_str()))
         .collect();
     let Some(anchor) = placed.iter().copied().min_by_key(|symbol| symbol.unit) else {
-        return Ok(CallToolResult::error(component_not_found(
-            &sch_path, &reference,
-        )));
+        return Ok(component_not_found_error(&sch_path, &reference));
     };
     let (x, y) = anchor.position();
     let rotation = anchor.at.rotation.unwrap_or(0.0);
@@ -196,11 +194,9 @@ pub(super) async fn handle_get_schematic_pin_locations(
                 .iter()
                 .any(|instance| instance.reference == reference) =>
         {
-            Ok(CallToolResult::error(component_not_found(
-                &sch_path, &reference,
-            )))
+            Ok(component_not_found_error(&sch_path, &reference))
         }
-        Err(error) => Ok(CallToolResult::error(error)),
+        Err(error) => Ok(malformed_schematic_error(&sch_path, error)),
     }
 }
 
