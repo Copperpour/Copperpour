@@ -233,6 +233,20 @@ fn update_config(
 
     match persist(path, text.as_deref(), &content) {
         Ok(()) => {}
+        Err(SexpError::NonRegularWriteTarget { .. }) => {
+            let path = copperpour_sexp::paths::display_path(path);
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidConfiguration {
+                    path: path.clone(),
+                    reason: "non_regular_file: the configuration target is not a regular file"
+                        .to_owned(),
+                },
+                format!(
+                    "The {which} configuration path '{path}' is not a regular file. Copperpour \
+                     wrote nothing. Use a regular file at that path, not a symbolic link."
+                ),
+            ));
+        }
         // An atomic no-clobber create that finds a file never replaced
         // anything: that is positive evidence nothing was written.
         Err(SexpError::Io(error))
@@ -409,7 +423,7 @@ pub fn tools() -> Vec<ToolDef> {
              Call this when the user says things like 'always use JLCPCB' or 'I prefer 0402 passives'. \
              Every other key is kept, and the response is the file as read back. Refuses with \
              invalid_configuration, writing nothing, when the existing file cannot be parsed or \
-             read; a persistence failure is mutation_outcome_uncertain, so read the file before retrying.",
+             read, or is not a regular file. If a write cannot be verified, read the file before retrying.",
             json!({
                 "type": "object",
                 "properties": {

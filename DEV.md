@@ -53,8 +53,9 @@ no item CRUD.
 - Direct `.kicad_sch` read/write; symbols embedded from KiCad 10's `.kicad_symdir`,
   power symbols from `power.kicad_symdir`.
 - Existing-file edits are revision-checked atomic replacements: read the exact source,
-  take a cooperative lock, reject any intervening KiCad or Copperpour change, write a
-  unique sibling scratch file, fsync, rename.
+  take a cooperative lock, then stage and sync a unique sibling scratch file.
+  Recheck the target type and exact bytes before rename. Writers that ignore
+  the lock can still save between the final check and rename.
 - Locks live in `COPPERPOUR_STATE_DIR/locks` when that absolute override is set, else
   the platform local-data dir (`konnect/locks`). Reads never create files in the project.
 - Writes refuse while KiCad's `~<name>.kicad_sch.lck` exists. It records only user and

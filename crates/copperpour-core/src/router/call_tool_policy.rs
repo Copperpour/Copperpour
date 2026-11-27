@@ -201,6 +201,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "align_components",
     "annotate_schematic",
     "apply_copper",
+    "apply_schematic_cleanup",
     "apply_specctra_ses",
     "apply_template",
     "assign_net_to_class",

@@ -527,6 +527,13 @@ pub(crate) fn misplaced_item(content: &str, anchors: &[(String, (f64, f64))]) ->
     let Ok(tree) = copperpour_sexp::parse_sexp(content) else {
         return Some("the written schematic cannot be parsed".to_owned());
     };
+    misplaced_item_in(&tree, anchors)
+}
+
+pub(super) fn misplaced_item_in(
+    tree: &SexpNode,
+    anchors: &[(String, (f64, f64))],
+) -> Option<String> {
     let mut written = HashMap::new();
     for node in tree.children().unwrap_or(&[]) {
         let Some(uuid) = node.find_str("uuid") else {

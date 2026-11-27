@@ -28,14 +28,37 @@ use copperpour_sexp::writer::find_direct_child_blocks;
 use copperpour_sexp::{apply_edits, parse_sexp, DocumentRevision, SexpEdit, SexpNode};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[cfg(test)]
 #[path = "sch_cleanup_tests.rs"]
 mod tests;
 
+#[path = "sch_cleanup_apply.rs"]
+pub(super) mod apply;
+
 type Point = (f64, f64);
 const GRID: f64 = 2.54;
 const MAX_CLEANUP_STEPS: usize = 256;
+
+fn cleanup_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schematic": {"type": "string", "description": "Path to a saved .kicad_sch sheet"},
+            "x1": {"type": "number", "description": "First region corner, x in mm"},
+            "y1": {"type": "number", "description": "First region corner, y in mm"},
+            "x2": {"type": "number", "description": "Opposite region corner, x in mm"},
+            "y2": {"type": "number", "description": "Opposite region corner, y in mm"},
+            "movable": {
+                "type": ["array", "null"], "items": {"type": "string"},
+                "default": [],
+                "description": "References permitted to move or, for redundant power symbols, be removed"
+            }
+        },
+        "required": ["schematic", "x1", "y1", "x2", "y2"]
+    })
+}
 
 pub(super) fn definition() -> ToolDef {
     tool!(
@@ -43,22 +66,7 @@ pub(super) fn definition() -> ToolDef {
         "Preview a net-preserving cleanup of a region on one saved schematic. Only \
          listed symbols may move, plus power symbols and no-connects carried on \
          their pins. Does not write or need KiCad.",
-        json!({
-            "type": "object",
-            "properties": {
-                "schematic": {"type": "string", "description": "Path to a saved .kicad_sch sheet"},
-                "x1": {"type": "number", "description": "First region corner, x in mm"},
-                "y1": {"type": "number", "description": "First region corner, y in mm"},
-                "x2": {"type": "number", "description": "Opposite region corner, x in mm"},
-                "y2": {"type": "number", "description": "Opposite region corner, y in mm"},
-                "movable": {
-                    "type": ["array", "null"], "items": {"type": "string"},
-                    "default": [],
-                    "description": "References permitted to move or, for redundant power symbols, be removed"
-                }
-            },
-            "required": ["schematic", "x1", "y1", "x2", "y2"]
-        }),
+        cleanup_schema(),
         |args: &Value, _ctx| {
             let args = args.clone();
             async move {
@@ -72,46 +80,40 @@ fn handle_plan_schematic_cleanup(args: &Value) -> anyhow::Result<CallToolResult>
     plan_cleanup(args, MAX_CLEANUP_STEPS)
 }
 
-fn plan_cleanup(args: &Value, step_limit: usize) -> anyhow::Result<CallToolResult> {
-    let path = get_path(args, "schematic")?;
-    let coordinates = ["x1", "y1", "x2", "y2"].map(|key| {
+fn cleanup_selection(args: &Value) -> Result<(Region, BTreeSet<String>), CallToolResult> {
+    let coordinate = |key| {
         require_f64(args, key).and_then(|n| {
             n.is_finite()
                 .then_some(n)
                 .ok_or_else(|| invalid_arg(key, "expected a finite coordinate in mm"))
         })
-    });
-    let [x1, y1, x2, y2] = match coordinates {
-        [Ok(x1), Ok(y1), Ok(x2), Ok(y2)] => [x1, y1, x2, y2],
-        _ => {
-            return Ok(coordinates
-                .into_iter()
-                .find_map(Result::err)
-                .expect("failed coordinate"))
-        }
     };
-    let movable = match opt_str_list(args, "movable") {
-        Ok(list) => list.unwrap_or_default().into_iter().collect(),
+    let region = Region::new(
+        coordinate("x1")?,
+        coordinate("y1")?,
+        coordinate("x2")?,
+        coordinate("y2")?,
+    );
+    let movable = opt_str_list(args, "movable")?.unwrap_or_default();
+    Ok((region, movable.into_iter().collect()))
+}
+
+fn plan_cleanup(args: &Value, step_limit: usize) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "schematic")?;
+    let (region, movable) = match cleanup_selection(args) {
+        Ok(selection) => selection,
         Err(error) => return Ok(error),
     };
     let (source, tree) = match sch_layout_score::read_saved_sheet(&path) {
         Ok(sheet) => sheet,
         Err(error) => return Ok(error),
     };
-    if let Err(reason) = Sheet::new(&tree) {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::MalformedFile {
-                path: path.display().to_string(),
-                reason: reason.to_owned(),
-            },
-            format!(
-                "Cannot plan cleanup for {}: {reason}. Nothing was written.",
-                path.display()
-            ),
-        ));
-    }
-    let region = Region::new(x1, y1, x2, y2);
-    let Some((steps, skipped, _)) = plan_with_candidate(&source, region, &movable, step_limit)?
+    let sheet = match Sheet::for_cleanup(&path, &tree) {
+        Ok(sheet) => sheet,
+        Err(refusal) => return Ok(refusal),
+    };
+    let Some((steps, skipped, _)) =
+        plan_with_candidate(&source, &sheet, region, &movable, step_limit, |_, _| {})?
     else {
         let reason = format!("the region still has cleanup steps after {step_limit} edits");
         return Ok(CallToolResult::error_kind(
@@ -145,6 +147,21 @@ struct Sheet<'a> {
 }
 
 impl<'a> Sheet<'a> {
+    fn for_cleanup(path: &Path, tree: &'a SexpNode) -> Result<Self, CallToolResult> {
+        Self::new(tree).map_err(|reason| {
+            CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: path.display().to_string(),
+                    reason: reason.to_owned(),
+                },
+                format!(
+                    "Cannot plan cleanup for {}: {reason}. Nothing was written.",
+                    path.display()
+                ),
+            )
+        })
+    }
+
     fn new(tree: &'a SexpNode) -> Result<Self, &'static str> {
         let mut ids = BTreeSet::new();
         for tag in ["symbol", "wire", "junction", "no_connect"] {
@@ -376,6 +393,7 @@ struct Draft {
     new_junctions: Vec<String>,
     first_removed_wire: Option<String>,
     power_reference: Option<String>,
+    route_guard: Option<RouteGuard>,
 }
 
 struct Edit {
@@ -490,7 +508,7 @@ impl Planner<'_> {
             Ok(parts) => parts,
             Err(e) => return Ok(Err(e.to_string())),
         };
-        let source = if let [a, .., b] = route {
+        let (source, route_guard) = if let [a, .., b] = route {
             let base = parse_sexp(&stripped)?;
             let Some(guard) = RouteGuard::for_drawn_pins(&base, *a, &[*b]) else {
                 return Ok(Err(UNRESOLVED_PIN_GEOMETRY.into()));
@@ -515,9 +533,9 @@ impl Planner<'_> {
             if let Some(item) = moved_pin_attachment(&remaining, &edit, [*a, *b]) {
                 return Ok(Err(item));
             }
-            source
+            (source, Some(guard))
         } else {
-            stripped
+            (stripped, None)
         };
         let old_dots = self
             .sheet
@@ -648,6 +666,7 @@ impl Planner<'_> {
             new_junctions,
             first_removed_wire: edit.wire_ids.first().cloned(),
             power_reference: None,
+            route_guard,
             step: json!({
                 "kind": kind, "wires_removed": edit.wire_ids, "symbols_moved": moves,
                 "no_connects_moved": markers, "route": route,
@@ -1335,12 +1354,14 @@ type Plan = (Vec<Value>, Vec<Value>, String);
 
 fn plan_with_candidate(
     source: &str,
+    initial: &Sheet<'_>,
     region: Region,
     movable: &BTreeSet<String>,
     step_limit: usize,
+    mut check_route: impl FnMut(&str, &RouteGuard),
 ) -> anyhow::Result<Option<Plan>> {
-    let original = parse_sexp(source)?;
-    let mut allocated = original
+    let mut allocated = initial
+        .tree
         .children()
         .into_iter()
         .flatten()
@@ -1366,14 +1387,21 @@ fn plan_with_candidate(
     let mut cleaned_wires = BTreeSet::new();
     let mut cleaned_power = BTreeSet::new();
     loop {
-        let tree = parse_sexp(&current)?;
-        let sheet = Sheet::new(&tree).map_err(anyhow::Error::msg)?;
+        let tree;
+        let next_sheet;
+        let sheet = if steps.is_empty() {
+            initial
+        } else {
+            tree = parse_sexp(&current)?;
+            next_sheet = Sheet::new(&tree).map_err(anyhow::Error::msg)?;
+            &next_sheet
+        };
         let index = sheet.index();
         let planner = Planner {
             source: &current,
-            sheet: &sheet,
+            sheet,
             index: &index,
-            score: sch_layout_score::measure(&tree),
+            score: sch_layout_score::measure(sheet.tree),
             region,
         };
         let runs = sheet.chains(&index);
@@ -1516,6 +1544,9 @@ fn plan_with_candidate(
         }
         draft.step["wire_uuids_added"] = json!(wire_ids);
         draft.step["junction_uuids_added"] = json!(stable_ids(draft.new_junctions));
+        if let Some(guard) = &draft.route_guard {
+            check_route(&draft.source, guard);
+        }
         current = draft.source;
         steps.push(draft.step);
     }

@@ -509,30 +509,48 @@ pub(super) fn compare_layout(
 }
 
 pub(super) fn read_saved_sheet(path: &Path) -> Result<(String, SexpNode), CallToolResult> {
+    let source = decode_saved_source(path, read_saved_bytes(path)?)?;
+    let tree = parse_saved_sheet(path, &source)?;
+    Ok((source, tree))
+}
+
+fn malformed_sheet(path: &Path, reason: String) -> CallToolResult {
+    let message = format!("Cannot read schematic {}: {reason}", path.display());
+    CallToolResult::error_kind(
+        ToolErrorKind::MalformedFile {
+            path: path.display().to_string(),
+            reason,
+        },
+        message,
+    )
+}
+
+pub(super) fn read_saved_bytes(path: &Path) -> Result<Vec<u8>, CallToolResult> {
     // The writers replace atomically; a single open reads one saved version
     // without creating the cooperative lockfile used by read_schematic.
-    let malformed = |reason: String| {
-        let message = format!("Cannot read schematic {}: {reason}", path.display());
-        CallToolResult::error_kind(
-            ToolErrorKind::MalformedFile {
-                path: path.display().to_string(),
-                reason,
-            },
-            message,
-        )
-    };
-    let bytes = std::fs::read(path).map_err(|err| {
-        CallToolResult::error_kind(
-            ToolErrorKind::file_not_found(path),
-            format!("Cannot read schematic {}: {err}", path.display()),
-        )
-    })?;
-    let source = String::from_utf8(bytes).map_err(|err| malformed(err.utf8_error().to_string()))?;
-    let tree = parse_sexp(&source).map_err(|err| malformed(err.to_string()))?;
+    std::fs::read(path).map_err(|err| unreadable_sheet(path, err))
+}
+
+pub(super) fn unreadable_sheet(path: &Path, error: std::io::Error) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::file_not_found(path),
+        format!("Cannot read schematic {}: {error}", path.display()),
+    )
+}
+
+pub(super) fn decode_saved_source(path: &Path, bytes: Vec<u8>) -> Result<String, CallToolResult> {
+    String::from_utf8(bytes).map_err(|err| malformed_sheet(path, err.utf8_error().to_string()))
+}
+
+pub(super) fn parse_saved_sheet(path: &Path, source: &str) -> Result<SexpNode, CallToolResult> {
+    let tree = parse_sexp(source).map_err(|err| malformed_sheet(path, err.to_string()))?;
     if tree.head() != Some("kicad_sch") || tree.find_str("version").is_none() {
-        return Err(malformed("expected a KiCad schematic sheet".to_owned()));
+        return Err(malformed_sheet(
+            path,
+            "expected a KiCad schematic sheet".to_owned(),
+        ));
     }
-    Ok((source, tree))
+    Ok(tree)
 }
 
 pub(super) async fn handle_compare_schematic_layout(

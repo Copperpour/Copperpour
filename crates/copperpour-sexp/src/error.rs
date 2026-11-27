@@ -46,13 +46,18 @@ pub enum SexpError {
     #[error("write conflict: {path} changed since it was read")]
     Conflict { path: PathBuf },
 
-    /// The write replaced the document, but the readback under the lock did
-    /// not return what was written: another program saved it in between.
+    /// A revision-checked write found a non-regular target before staging.
+    /// No replacement was attempted.
+    #[error("write target is not a regular file: {path}")]
+    NonRegularWriteTarget { path: PathBuf },
+
+    /// The write replaced the document, but a directory sync or readback
+    /// could not establish the saved result.
     ///
     /// Unlike [`SexpError::Conflict`], the file was replaced, so this is an
     /// uncertain outcome, never a refusal: tools report it as
     /// `mutation_outcome_uncertain`.
-    #[error("readback mismatch: {path} was replaced but did not read back as written")]
+    #[error("readback mismatch: {path} was replaced but could not be verified")]
     ReadbackMismatch { path: PathBuf },
 
     /// KiCad owns, or may still own, the design document through its sibling
