@@ -3407,9 +3407,10 @@ mod served_tests {
             .call("set_component_placements", r1_to(110.0, 90.0))
             .await;
         assert!(is_error, "{body:#}");
-        let text = body.as_str().expect("a plain-text error, with no kind");
+        assert_eq!(body["error"]["kind"], "handler_error", "{body:#}");
+        assert!(body["recovery"].is_object(), "{body:#}");
         assert_eq!(
-            text,
+            body["message"],
             "KiCAD rejected the component placement batch over IPC: KiCad batch failed; changes \
              dropped: KiCad IPC error: mock KiCad refuses this update (AS_BAD_REQUEST). The board \
              file was not modified — KiCAD is reachable and may hold this board open, so editing \

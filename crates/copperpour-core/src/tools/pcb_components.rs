@@ -1415,6 +1415,8 @@ fn persist_board_replacement(
     expected: &str,
     replacement: &str,
 ) -> Result<(), copperpour_sexp::SexpError> {
+    #[cfg(test)]
+    crate::tools::write_hook::run(board_path);
     write_atomic_if_unchanged(board_path, expected, replacement)
 }
 
