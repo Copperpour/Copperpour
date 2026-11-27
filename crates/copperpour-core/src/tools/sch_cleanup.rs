@@ -432,7 +432,7 @@ impl Edit {
             if self.wire_ids.iter().any(|id| id == uuid)
                 || self.removed_power.as_deref() == Some(uuid)
             {
-                edits.push(SexpEdit::delete(start, end));
+                edits.push(delete_cleanup_block(source, start, end));
             } else if let Some((_, to, angle)) = self.symbols.iter().find(|(id, ..)| id == uuid) {
                 let raw = cse::sexp::parser::parse(block)?;
                 let mut symbol = cse::Symbol::from_sexp(&raw)?;
@@ -470,6 +470,25 @@ impl Edit {
             .ok_or_else(|| anyhow::anyhow!("cannot locate the carried no-connect marker"))?;
         Ok((source, json!(moves), json!(markers)))
     }
+}
+
+fn delete_cleanup_block(source: &str, start: usize, end: usize) -> SexpEdit {
+    let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
+    let indent = &source[line_start..start];
+    if indent.is_empty() || !indent.bytes().all(|b| b == b'\t') {
+        return SexpEdit::delete(start, end);
+    }
+    if let Some((tail, _)) = source[end..].split_once('\n') {
+        if tail
+            .strip_suffix('\r')
+            .unwrap_or(tail)
+            .bytes()
+            .all(|b| b == b'\t')
+        {
+            return SexpEdit::delete(line_start, end + tail.len() + 1);
+        }
+    }
+    SexpEdit::delete(start, end)
 }
 
 struct Planner<'a> {

@@ -92,6 +92,11 @@ const SCHEMATICS: &[(&str, &str, &str)] = &[
         "eeschema",
     ),
     (
+        "region_cleanup_kicad10/carried-no-connect.kicad_sch",
+        "region_cleanup_kicad10/carried-no-connect.README.md",
+        "eeschema",
+    ),
+    (
         "region_cleanup_kicad10/constrained/constrained.kicad_sch",
         "region_cleanup_kicad10/README.md",
         "eeschema",
@@ -99,6 +104,11 @@ const SCHEMATICS: &[(&str, &str, &str)] = &[
     (
         "region_cleanup_kicad10/crowded/crowded.kicad_sch",
         "region_cleanup_kicad10/README.md",
+        "eeschema",
+    ),
+    (
+        "region_cleanup_kicad10/redundant-power.kicad_sch",
+        "region_cleanup_kicad10/redundant-power.README.md",
         "eeschema",
     ),
     (

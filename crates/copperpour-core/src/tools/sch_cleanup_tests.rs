@@ -11,6 +11,10 @@ mod native;
 
 const CROWDED: &str =
     include_str!("../../tests/fixtures/region_cleanup_kicad10/crowded/crowded.kicad_sch");
+pub(super) const CARRIED_NO_CONNECT: &str =
+    include_str!("../../tests/fixtures/region_cleanup_kicad10/carried-no-connect.kicad_sch");
+pub(super) const REDUNDANT_POWER: &str =
+    include_str!("../../tests/fixtures/region_cleanup_kicad10/redundant-power.kicad_sch");
 const CONSTRAINED: &str =
     include_str!("../../tests/fixtures/region_cleanup_kicad10/constrained/constrained.kicad_sch");
 const SPARSE: &str =
@@ -93,6 +97,22 @@ fn step<'a>(response: &'a Value, kind: &str) -> &'a Value {
         .iter()
         .find(|step| step["kind"] == kind)
         .unwrap_or_else(|| panic!("{kind} missing from {response}"))
+}
+
+#[test]
+fn cleanup_splice_deletes_only_the_vacated_tab_indented_line() {
+    for (source, expected) in [
+        (
+            "(before)\r\n\t\r\n\t(wire)\r\n(after)",
+            "(before)\r\n\t\r\n(after)",
+        ),
+        ("(before)\n  (wire)\n(after)", "(before)\n  \n(after)"),
+        ("(before)\n\t(wire) (after)\n", "(before)\n\t (after)\n"),
+    ] {
+        let start = source.find("(wire)").unwrap();
+        let edit = delete_cleanup_block(source, start, start + "(wire)".len());
+        assert_eq!(apply_edits(source.to_owned(), vec![edit]), expected);
+    }
 }
 
 #[tokio::test]
@@ -354,19 +374,17 @@ async fn the_step_limit_reports_unfinished_cleanup_without_a_partial_plan() {
 
 #[tokio::test]
 async fn served_plans_are_repeatable_and_replay_to_a_no_op() {
-    let redundant = with_redundant_power();
     let jogged = jogged_power_lead(FIELDS);
     let flag = flag_lead_with_blocked_horizontal_elbow();
-    let marker = crowded_with_no_connect();
     for (source, movable) in [
         (CROWDED, &[][..]),
         (CROWDED, &["C1"][..]),
         (CROWDED, &["#PWR05"][..]),
         (FIELDS, &["#PWR03"][..]),
-        (redundant.as_str(), &["#PWR99"][..]),
+        (REDUNDANT_POWER, &["#PWR99"][..]),
         (jogged.as_str(), &[][..]),
         (flag.as_str(), &["#FLG99"][..]),
-        (marker.as_str(), &["C1"][..]),
+        (CARRIED_NO_CONNECT, &["C1"][..]),
     ] {
         let preview = Preview::new(source).await;
         let plan = preview.plan(movable).await;
@@ -1147,47 +1165,29 @@ fn clearance_refuses_a_new_wire_through_a_symbol_body() {
     );
 }
 
-pub(super) fn with_redundant_power() -> String {
-    let source = insert_before_close(
-        CROWDED,
-        r##"(symbol (lib_id "power:+3V3") (at 139.7 68.58 0) (unit 1)
-            (property "Reference" "#PWR99" (at 139.7 68.58 0) (hide yes))
-            (property "Value" "+3V3" (at 139.7 64.77 0))
-            (uuid "00000000-0000-4000-8000-000000000099"))"##,
-    );
-    let source = insert_before_close(&source, &fixture_wire((139.7, 68.58), (139.7, 76.2), 205));
-    insert_before_close(
-        &source,
-        r#"
-        (junction (at 139.7 76.2) (diameter 0) (color 0 0 0 0)
-            (uuid "00000000-0000-4000-8000-000000000103"))"#,
-    )
-}
-
 #[tokio::test]
 async fn redundant_power_is_removed_only_with_a_surviving_driver_on_its_drawn_node() {
-    let source = with_redundant_power();
-    let result = Preview::new(&source).await.plan(&["#PWR99"]).await;
+    let result = Preview::new(REDUNDANT_POWER).await.plan(&["#PWR99"]).await;
     let removed = step(&result, "remove_redundant_power");
     assert_eq!(
         removed["power_symbols_removed"],
-        json!(["00000000-0000-4000-8000-000000000099"])
+        json!(["9bfff921-3f05-4b7a-9826-1da315377a1b"])
     );
     assert_eq!(array(removed, "wires_removed").len(), 1);
     assert_eq!(removed["route"], json!([]));
     assert_eq!(removed["length_before_mm"], 7.62);
     assert_eq!(
         removed["junctions_removed"],
-        json!(["00000000-0000-4000-8000-000000000103"])
+        json!(["d6b162d2-e0b9-4d77-ad6f-3d401b315e0f"])
     );
 }
 
 #[tokio::test]
 async fn a_same_name_global_driver_cannot_replace_the_only_local_driver() {
-    let source = with_redundant_power();
-    let original = r#"(lib_id "power:+3V3") (at 139.7 68.58 0)"#;
-    assert_eq!(source.matches(original).count(), 1);
-    let source = source.replace(original, r#"(lib_id "power:Local3V3") (at 139.7 68.58 0)"#);
+    // Change only the stub's driver scope to exercise Copperpour's refusal.
+    let original = "(lib_id \"power:+3V3\")\n\t\t(at 139.7 68.58 0)";
+    assert_eq!(REDUNDANT_POWER.matches(original).count(), 1);
+    let source = REDUNDANT_POWER.replace(original, &original.replace("+3V3", "Local3V3"));
     let source = with_library_symbol(
         &source,
         r#"(symbol "power:Local3V3" (power local)
@@ -1235,34 +1235,36 @@ async fn another_copy_of_the_rail_elsewhere_is_not_redundancy() {
         .all(|step| step["power_symbols_removed"] == json!([])));
 }
 
-pub(super) fn crowded_with_no_connect() -> String {
-    let source = insert_before_close(
-        CROWDED,
-        r#"(no_connect (at 63.5 113.03) (uuid "00000000-0000-4000-8000-000000000100"))"#,
-    );
-    without_symbol(source, "#PWR05")
-}
-
 #[tokio::test]
 async fn a_carried_no_connect_follows_its_drawn_pin() {
-    // C1 selects style 1; style 2's copy of pin 2 must not count as a
-    // second arrival for the marker. Keep the normal pin geometry unchanged.
-    let source = crowded_with_no_connect().replacen(
-        r#"(symbol "C_1_1""#,
-        r#"(symbol "C_1_2"
-            (pin passive line (at 0 -3.81 90) (length 2.794)
-                (name "") (number "2")))
-        (symbol "C_1_1""#,
-        1,
-    );
-    let result = Preview::new(&source).await.plan(&["C1"]).await;
-    let moves = array(step(&result, "reroute"), "no_connects_moved");
+    // KiCad saved 74LS00 with pin 3 at the same coordinate in both styles.
+    // Only the placed style can own the marker during cleanup's trial move.
+    let preview = Preview::new(include_str!(
+        "../../tests/fixtures/wire_end_junctions_kicad10.kicad_sch"
+    ))
+    .await;
+    let result = served_call(
+        &preview.handler,
+        "add_no_connect",
+        json!({"schematic": preview.path, "x": 198.12, "y": 101.6}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let source = std::fs::read_to_string(&preview.path).unwrap();
+    let tree = parse_sexp(&source).unwrap();
+    let symbol = tree
+        .find_all("symbol")
+        .into_iter()
+        .find(|node| node.find_str("lib_id") == Some("74xx:74LS00"))
+        .unwrap();
+    let uuid = symbol.find_str("uuid").unwrap().to_owned();
+    let marker = tree.find("no_connect").unwrap().find_str("uuid").unwrap();
+    let mut edit = Edit::new(&Sheet::new(&tree).unwrap(), &[]);
+    edit.symbols.push((uuid, (190.5, 114.3), 0.0));
+    let (_, _, moves) = edit.prepare(&source, &tree).unwrap();
     assert_eq!(
         moves,
-        &[json!({
-            "uuid": "00000000-0000-4000-8000-000000000100", "from": [63.5, 113.03], "to": [114.3, 83.82]
-        })],
-        "{result}"
+        json!([{"uuid": marker, "from": [198.12, 101.6], "to": [198.12, 114.3]}])
     );
 }
 

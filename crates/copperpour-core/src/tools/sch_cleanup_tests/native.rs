@@ -94,10 +94,8 @@ async fn kicad_keeps_netlist_and_erc_for_replayed_cleanup() {
         include_str!("../../../tests/fixtures/region_cleanup_kicad10/crowded/crowded.kicad_pro");
     const FIELDS_PRO: &str =
         include_str!("../../../tests/fixtures/field_placement_kicad10/field_placement.kicad_pro");
-    let redundant = with_redundant_power();
     let jogged = jogged_power_lead(FIELDS);
     let flag_lead = flag_lead_with_blocked_horizontal_elbow();
-    let no_connect = crowded_with_no_connect();
     let near_miss = crowded_with_near_miss_wire();
     let cli = std::env::var("COPPERPOUR_TEST_KICAD_CLI").unwrap_or_else(|_| {
         crate::kicad_install::find_cli("")
@@ -110,7 +108,13 @@ async fn kicad_keeps_netlist_and_erc_for_replayed_cleanup() {
     for (case, (name, source, project, movable, [x1, y1, x2, y2])) in [
         ("crowded", CROWDED, CROWDED_PRO, &[][..], full),
         ("crowded", CROWDED, CROWDED_PRO, &["C1"][..], full),
-        ("crowded", &no_connect, CROWDED_PRO, &["C1"][..], full),
+        (
+            "crowded",
+            CARRIED_NO_CONNECT,
+            CROWDED_PRO,
+            &["C1"][..],
+            full,
+        ),
         ("crowded", CROWDED, CROWDED_PRO, &["#PWR05"][..], full),
         (
             "crowded",
@@ -119,7 +123,13 @@ async fn kicad_keeps_netlist_and_erc_for_replayed_cleanup() {
             &["C1", "#PWR05"][..],
             [60, 60, 120, 106],
         ),
-        ("crowded", &redundant, CROWDED_PRO, &["#PWR99"][..], full),
+        (
+            "crowded",
+            REDUNDANT_POWER,
+            CROWDED_PRO,
+            &["#PWR99"][..],
+            full,
+        ),
         ("field_placement", FIELDS, FIELDS_PRO, &["#PWR03"][..], full),
         ("field_placement", &jogged, FIELDS_PRO, &[][..], full),
         (
