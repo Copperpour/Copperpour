@@ -1,4 +1,4 @@
-use super::super::tests::{crowded_with_no_connect, with_redundant_power};
+use super::super::tests::{CARRIED_NO_CONNECT, REDUNDANT_POWER};
 use super::*;
 use crate::mcp::handler::McpHandler;
 use crate::tools::project_file_writer_tests::{served_call, text_of};
@@ -31,9 +31,12 @@ struct SavedSheet {
 
 impl SavedSheet {
     async fn new(name: &str) -> Self {
+        Self::from_source(name, fixture(name, "kicad_sch")).await
+    }
+
+    async fn from_source(name: &str, original: String) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(format!("{name}.kicad_sch"));
-        let original = fixture(name, "kicad_sch");
         fs::write(&path, &original).unwrap();
         fs::write(path.with_extension("kicad_pro"), fixture(name, "kicad_pro")).unwrap();
         let handler = McpHandler::new(ServerConfig {
@@ -137,6 +140,12 @@ async fn assert_crowded_apply(movable: &[&str], expected_path: &[(f64, f64)]) {
     assert_eq!(step["route"], json!(expected_path));
     assert_ne!(applied["revision"], preview["revision"]);
     let source = sheet.written();
+    assert!(
+        !source
+            .lines()
+            .any(|line| !line.is_empty() && line.bytes().all(|b| b == b'\t')),
+        "removed blocks left tab-only lines in the saved schematic"
+    );
     assert_eq!(
         applied["revision"],
         DocumentRevision::of(&source).to_string()
@@ -248,8 +257,7 @@ async fn constrained_plan_does_not_disconnect_c1_or_write() {
 
 #[tokio::test]
 async fn apply_carries_the_same_no_connect_to_c1s_new_pin_position() {
-    let mut sheet = SavedSheet::new("crowded").await;
-    sheet.set_source(crowded_with_no_connect());
+    let sheet = SavedSheet::from_source("crowded", CARRIED_NO_CONNECT.to_owned()).await;
     let (preview, args) = sheet.preview(&["C1"]).await;
     let (result, applied) = sheet.apply(args).await;
     assert!(!result.is_error, "{applied}");
@@ -263,12 +271,11 @@ async fn apply_carries_the_same_no_connect_to_c1s_new_pin_position() {
     assert_eq!(parse_at(new), Some((114.3, 83.82, 0.0)));
 }
 
-const REMOVED_DOT: &str = "00000000-0000-4000-8000-000000000103";
-
 #[tokio::test]
 async fn apply_removes_the_redundant_symbol_wire_and_junction() {
-    let mut sheet = SavedSheet::new("crowded").await;
-    sheet.set_source(with_redundant_power());
+    let sheet = SavedSheet::from_source("crowded", REDUNDANT_POWER.to_owned()).await;
+    let before = parse_sexp(&sheet.original).unwrap();
+    let removed_dot = redundant_stub_dot(&before);
     let (preview, args) = sheet.preview(&["#PWR99"]).await;
     let (result, applied) = sheet.apply(args).await;
     assert!(!result.is_error, "{applied}");
@@ -277,9 +284,8 @@ async fn apply_removes_the_redundant_symbol_wire_and_junction() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|step| step["junctions_removed"] == json!([REMOVED_DOT]))
+        .find(|step| step["junctions_removed"] == json!([removed_dot]))
         .expect("the plan removes the redundant stub's dot");
-    let before = parse_sexp(&sheet.original).unwrap();
     let observed = parse_sexp(&sheet.written()).unwrap();
     let removed_wire = removal["wires_removed"][0].as_str().unwrap();
     let point = super::super::schematic_point;
@@ -290,8 +296,7 @@ async fn apply_removes_the_redundant_symbol_wire_and_junction() {
     assert!(!wires(&observed).contains_key(removed_wire));
     assert!(symbols(&before).contains_key("#PWR99"));
     assert!(!symbols(&observed).contains_key("#PWR99"));
-    assert_eq!(junction_at(&before, REMOVED_DOT), Some((139.7, 76.2, 0.0)));
-    assert_eq!(junction_at(&observed, REMOVED_DOT), None);
+    assert_eq!(junction_at(&observed, removed_dot), None);
     let (_, args) = sheet.preview(&["#PWR99"]).await;
     assert_eq!(args["revision"], applied["revision"]);
     assert_no_write(&sheet, args, &sheet.written()).await;
@@ -299,15 +304,16 @@ async fn apply_removes_the_redundant_symbol_wire_and_junction() {
 
 #[tokio::test]
 async fn readback_detects_a_junction_left_behind_by_a_removal() {
-    let mut sheet = SavedSheet::new("crowded").await;
-    sheet.set_source(with_redundant_power());
+    let sheet = SavedSheet::from_source("crowded", REDUNDANT_POWER.to_owned()).await;
+    let before = parse_sexp(&sheet.original).unwrap();
+    let removed_dot = redundant_stub_dot(&before);
     let (_, args) = sheet.preview(&["#PWR99"]).await;
     let dot = find_direct_child_blocks(&sheet.original, "kicad_sch")
         .into_iter()
         .map(|(start, end)| &sheet.original[start..end])
         .find(|block| {
             let node = parse_sexp(block).unwrap();
-            node.head() == Some("junction") && node.find_str("uuid") == Some(REMOVED_DOT)
+            node.head() == Some("junction") && node.find_str("uuid") == Some(removed_dot)
         })
         .unwrap()
         .to_owned();
@@ -315,9 +321,17 @@ async fn readback_detects_a_junction_left_behind_by_a_removal() {
     let observed = assert_uncertain_readback(&sheet, args).await;
     assert!(!symbols(&observed).contains_key("#PWR99"));
     assert_eq!(
-        junction_at(&observed, REMOVED_DOT),
+        junction_at(&observed, removed_dot),
         Some((139.7, 76.2, 0.0))
     );
+}
+
+fn redundant_stub_dot(tree: &SexpNode) -> &str {
+    tree.find_all("junction")
+        .into_iter()
+        .find(|dot| parse_at(dot) == Some((139.7, 76.2, 0.0)))
+        .and_then(|dot| dot.find_str("uuid"))
+        .expect("the input has a dot at the redundant stub's tip")
 }
 
 fn junction_at(tree: &SexpNode, uuid: &str) -> Option<(f64, f64, f64)> {
