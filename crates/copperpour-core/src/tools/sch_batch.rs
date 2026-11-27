@@ -38,8 +38,8 @@ use super::sch_components::{
     ComponentDeleteTargetError, ComponentMutationIntent,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, clear_stub_direction, route_between_pins, route_blocked,
-    PinRoute,
+    add_stub_label, add_stub_wire, clear_stub_direction, contact_instance_paths,
+    route_between_pins, route_blocked, PinRoute,
 };
 use super::PlacedPins;
 
@@ -238,8 +238,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect multiple component pin pairs by reference and pin number, in a single \
              file read/write cycle. Routes as connect_pins does; a pair whose route would \
              join another net, miss a pin or draw a zero-length segment is skipped and listed \
-             in errors. Pins already connected by contact on the saved sheet are listed in \
-             already_connected, not counted as drawn routes.",
+              in errors. Verified contacts on the saved sheet, including hidden pins, are \
+              listed in already_connected, not counted as drawn routes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1057,8 +1057,13 @@ async fn handle_batch_connect_pins(
     let mut new_content = content;
     let mut connected = 0;
     let mut already_connected = Vec::new();
+    let instance_paths = std::cell::OnceCell::new();
     for (pair, from, to) in &resolved {
-        match route_between_pins(&new_content, &tree, from, to)? {
+        match route_between_pins(&new_content, &tree, from, to, || {
+            instance_paths
+                .get_or_init(|| contact_instance_paths(&sch_path, &tree))
+                .as_deref()
+        })? {
             Ok(PinRoute::Drawn(routed)) => {
                 new_content = routed.content;
                 connected += 1;
