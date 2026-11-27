@@ -7,7 +7,7 @@ use super::readback::{
 };
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
-use crate::tools::sch_block_move::{misplaced_item, pin_net_changes, translate_block, Region};
+use crate::tools::sch_block_move::{misplaced_item, move_net_changes, translate_block, Region};
 use crate::tools::sch_wiring::{
     carry_no_connects, observed_no_connect_moves, reconcile_junctions_for_placement,
 };
@@ -517,7 +517,7 @@ pub(crate) async fn handle_move_region(
     // Checked after the junction pass, so a dot it adds where a moved pin lands
     // on a wire outside the box counts as the net change it is.
     if let Some((before_tree, _)) = &block {
-        let changes = pin_net_changes(before_tree, &parse_sexp(&candidate)?);
+        let changes = move_net_changes(before_tree, &parse_sexp(&candidate)?);
         if !changes.is_empty() {
             return Ok(move_region_blocked(changes));
         }

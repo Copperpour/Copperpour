@@ -1,0 +1,159 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "2ed47ea4-0222-4159-8d7f-284742caad1d")
+	(paper "A4")
+	(lib_symbols)
+	(wire
+		(pts
+			(xy 30 40) (xy 50.32 40)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "e25f7047-4cee-4ac3-be37-0b085ed602d1")
+	)
+	(global_label "A"
+		(shape input)
+		(at 40 40.02 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "307e9220-7a50-41ef-99dc-53923d7076cb")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 40 40.02 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "B"
+		(shape input)
+		(at 30 40 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "43c12ee5-d4d6-406e-84ab-9db309968186")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 30 40 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(sheet
+		(at 75 75)
+		(size 15 10)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "6dc3e1fc-8b54-45b9-88b0-e066c29bb2e6")
+		(property "Sheetname" "a"
+			(at 75 74.365 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "a.kicad_sch"
+			(at 75 85.635 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "opamp_stage"
+				(path "/2ed47ea4-0222-4159-8d7f-284742caad1d"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 100 75)
+		(size 15 10)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "ca583359-3a16-434e-a8ec-f1800883ae1f")
+		(property "Sheetname" "b"
+			(at 100 74.365 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "b.kicad_sch"
+			(at 100 85.635 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "opamp_stage"
+				(path "/2ed47ea4-0222-4159-8d7f-284742caad1d"
+					(page "3")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+)
