@@ -1783,8 +1783,8 @@ async fn add_schematic_component_hides_power_reference() {
 /// and a library that shows Value keeps it shown.
 #[tokio::test]
 async fn add_schematic_component_takes_field_visibility_from_library() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("visibility-from-library.kicad_sch");
+    let (symdir, _env) = stub_symbol_dir();
+    let path = symdir.path().join("visibility-from-library.kicad_sch");
     std::fs::write(
         &path,
         "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Graphic:Logo_Open_Hardware_Small\"\n      (property \"Reference\" \"#SYM\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"Logo_Open_Hardware_Small\" (at 0 0 0) (hide yes))\n    )\n    (symbol \"MyPower:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"PWR_FLAG\" (at 0 0 0))\n    )\n  )\n)\n",
