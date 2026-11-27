@@ -27,6 +27,16 @@ const DIAGONAL_TWO: &str =
     include_str!("fixtures/label_attachment_kicad10/diagonal-two/opamp_stage.kicad_sch");
 const DIAGONAL_PASSING_PIN: &str =
     include_str!("fixtures/label_attachment_kicad10/diagonal-passing-pin/opamp_stage.kicad_sch");
+const LABEL_ON_PIN: &str = include_str!(
+    "fixtures/label_attachment_kicad10/label-on-pin-exact-passing/opamp_stage.kicad_sch"
+);
+const NO_CONNECT: &str =
+    include_str!("fixtures/label_attachment_kicad10/label-on-no-connect/opamp_stage.kicad_sch");
+const MULTIPLE_WIRES: &str = include_str!(
+    "fixtures/label_attachment_kicad10/label-on-pin-multiple-wires/opamp_stage.kicad_sch"
+);
+const PIN_ROUTE: &str =
+    include_str!("fixtures/label_attachment_kicad10/label-on-pin-route/opamp_stage.kicad_sch");
 const PROJECT: &str =
     include_str!("fixtures/block_placement_kicad10/opamp_stage/opamp_stage.kicad_pro");
 const POWER_ROUNDED: &str =
@@ -679,6 +689,79 @@ async fn a_lone_passing_diagonal_does_not_authorize_a_route_into_a_pin_label() {
     assert_eq!(
         body["error"]["reasons"],
         json!(["the straight route would join J2 pin 1 and label A at (30.48, 30.48) on net A"]),
+        "{body}"
+    );
+}
+
+async fn pin_one_net(handler: &McpHandler, sheet: &Sheet<'_>, reference: &str) -> Value {
+    call(
+        handler,
+        sheet,
+        "get_pin_connections",
+        json!({"reference": reference, "pin_number": "1"}),
+    )
+    .await["net"]
+        .clone()
+}
+
+#[tokio::test]
+async fn a_pin_label_does_not_name_a_single_passing_wire() {
+    let handler = handler().await;
+    let sheet = Sheet::new(LABEL_ON_PIN);
+    assert_eq!(pin_one_net(&handler, &sheet, "J2").await, "A");
+    assert_eq!(pin_one_net(&handler, &sheet, "J3").await, "B");
+}
+
+#[tokio::test]
+async fn a_label_on_a_no_connect_does_not_name_a_single_passing_wire() {
+    let handler = handler().await;
+    let sheet = Sheet::new(NO_CONNECT);
+    let trace = call(
+        &handler,
+        &sheet,
+        "trace_from_point",
+        json!({"x": 40, "y": 30.0001, "tolerance": 0.00005}),
+    )
+    .await;
+    assert_eq!(trace["net"], "A", "{trace}");
+    assert_eq!(pin_one_net(&handler, &sheet, "J3").await, "B");
+}
+
+#[tokio::test]
+async fn a_label_on_a_pin_still_names_two_overlapping_wires() {
+    let handler = handler().await;
+    let sheet = Sheet::new(MULTIPLE_WIRES);
+    assert_eq!(pin_one_net(&handler, &sheet, "J3").await, "A");
+    let net = call(
+        &handler,
+        &sheet,
+        "get_net_connectivity",
+        json!({"net": "A"}),
+    )
+    .await;
+    let mut ids = net["wires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|wire| wire["uuid"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "09010000-0000-0000-0000-000000000004",
+            "09010000-0000-0000-0000-000000000012",
+        ],
+        "{net}"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_label_one_unit_from_a_pass_does_not_authorize_the_passing_net() {
+    let body = route_refusal(PIN_ROUTE, [40.0, 30.0001], [40.0, 50.0]).await;
+    assert_eq!(
+        body["error"]["reasons"],
+        json!(["the straight route would join J3 pin 1 and label B at (50, 30) on net B"]),
         "{body}"
     );
 }

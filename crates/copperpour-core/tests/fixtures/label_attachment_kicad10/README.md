@@ -61,3 +61,12 @@ and 10.0.8. In `precision-before`, both versions attach `REVIEW_BOUNDARY` to the
 proposed shallow diagonal at the rounding cutoff. The route join calculation
 tests that candidate without removing the public router's diagonal refusal.
 The existing `shallow-wire-route` fixture exercises the exact junction rule.
+
+## Pin label witnesses
+
+The connector sheets were prepared through Copperpour and resaved with
+`kicad-cli sch upgrade --force`. KiCad 10.0.6 and 10.0.8 produced identical files.
+With label A on J2.1 or a no-connect, both versions leave J3.1 on B when only one
+wire passes. With two overlapping wires, both versions put J3.1 on A and report
+`label_multiple_wires`. The route sheet retains two extra wire legs and mirrors J2
+so pin 2 does not independently block the route.

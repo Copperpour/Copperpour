@@ -758,12 +758,11 @@ fn saved_drawn_graph(
             });
         let Some(&[a, b]) = hits.next() else { return };
         let second = hits.next();
-        // Adding diagonals must not create a false baseline join at a pin or
-        // no-connect on a lone passing line. Leave existing orthogonal
-        // attachment unchanged here; #952 covers that case.
+        // In the saved graph, a lone passing wire does not attach to a label
+        // on a pin or no-connect. Endpoints and junctions connect separately.
+        // Keep exact redraw's existing orthogonal attachment.
         if is_label
-            && a.0 != b.0
-            && a.1 != b.1
+            && (allow_label_roundoff || (a.0 != b.0 && a.1 != b.1))
             && second.is_none()
             && occupied
                 .get_or_init(|| {
@@ -1777,6 +1776,29 @@ mod agreement_tests {
     fn a_diagonal_hit_rounds_squared_distance_before_comparing() {
         // (10, 2) is about 3.61 IU² from the segment: it rounds to 4.
         assert!(!super::label_hits_segment((10, 2), (0, 0), (1000, 10)));
+    }
+
+    #[test]
+    fn a_pin_label_counts_both_wires_at_a_mixed_crossing() {
+        let tree = copperpour_sexp::parse_sexp(include_str!(
+            "../../tests/fixtures/label_attachment_kicad10/diagonal-passing-pin/opamp_stage.kicad_sch"
+        ))
+        .unwrap();
+        let mut wires = extract_wires(&tree);
+        let labels = saved_net_labels(&tree);
+        let anchor = (30.48, 30.48);
+        let diagonal_end = (40.64, 40.64);
+        wires.push(Wire {
+            x1: 22.86,
+            y1: 30.48,
+            x2: 38.1,
+            y2: 30.48,
+            uuid: None,
+        });
+        let mut crossing = drawn_net_graph_for(&tree, &wires, &labels);
+        let root = crossing.root_at(anchor.0, anchor.1);
+        assert_eq!(root, crossing.root_at(diagonal_end.0, diagonal_end.1));
+        assert_eq!(root, crossing.root_at(38.1, 30.48));
     }
 
     #[test]

@@ -3308,7 +3308,7 @@ mod net_resolution_tests {
 
     /// A dual amplifier whose power pin lives on a third unit: unit 1 at
     /// (100, 100) and unit 2 at (100, 120) carry only an output, unit 3 at
-    /// (140, 100) carries `V+`, wired to a `VCC` label with C1 on it.
+    /// (140, 100) carries `V+`, wired to a `VCC` label and C1 at the wire's end.
     ///
     /// Every pin sits at its unit's origin, so a walk that superimposes all
     /// three units reports a `V+` pin at (100, 100) and (100, 120) too — where
@@ -3338,7 +3338,7 @@ mod net_resolution_tests {
       )
     )
   )
-  (wire (pts (xy 140 100) (xy 160 100)) (uuid "aaaaaaaa-0000-4000-8000-000000000001"))
+  (wire (pts (xy 140 100) (xy 150 100)) (uuid "aaaaaaaa-0000-4000-8000-000000000001"))
   (label "VCC" (at 150 100 0) (uuid "cccccccc-0000-4000-8000-000000000001"))
   (symbol
     (lib_id "Amplifier:DUAL")
