@@ -1680,11 +1680,13 @@ fn build_updated_instance(
             *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
         } else if is_back && item.type_url.ends_with("kiapi.board.types.BoardText") {
             let mut text = kiapi::board::types::BoardText::decode(item.value.as_slice())?;
+            // KiCad's `PCB_TEXT::Flip` toggles the flag, so a library text
+            // with `(justify mirror)` reads unmirrored on the back.
             if is_side_specific_layer(text.layer) {
                 if let Some(attributes) =
                     text.text.as_mut().and_then(|text| text.attributes.as_mut())
                 {
-                    attributes.mirrored = true;
+                    attributes.mirrored = !attributes.mirrored;
                 }
             }
             *item = copperpour_ipc::builders::pack_any(&text, "kiapi.board.types.BoardText");
@@ -2378,6 +2380,7 @@ fn mirror_graphic(
             size,
             stroke_width_mm,
             keep_upright,
+            style,
         } => Graphic::Text {
             text: text.clone(),
             position: point(*position),
@@ -2386,6 +2389,9 @@ fn mirror_graphic(
             size: *size,
             stroke_width_mm: *stroke_width_mm,
             keep_upright: *keep_upright,
+            // KiCad's `PCB_TEXT::Flip` keeps the justification; the
+            // mirror flag is toggled where the built text is mirrored.
+            style: style.clone(),
         },
     })
 }
@@ -2699,7 +2705,14 @@ fn degrees_in_half_turn(degrees: f64) -> f64 {
 /// Fold a text's angle for comparison: modulo 180° when `keep_upright` is set
 /// (KiCad draws keep-upright text the same at θ and θ + 180° and can store
 /// either depending on flip direction, #319), modulo 360° otherwise.
+///
+/// A keep-upright text turned by 180° also swaps both justifications, as
+/// KiCad's `PCB_TEXT::KeepUpright` does when `FOOTPRINT::Rotate` (and so a
+/// left-right flip) leaves it at 180° or more: `right bottom` at 270° draws as
+/// `left top` at 90°.
 fn normalize_board_text_angle(board_text: &mut kiapi::board::types::BoardText) {
+    use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
     let Some(attributes) = board_text
         .text
         .as_mut()
@@ -2709,6 +2722,18 @@ fn normalize_board_text_angle(board_text: &mut kiapi::board::types::BoardText) {
     };
     let degrees = attributes.angle.map_or(0.0, |angle| angle.value_degrees);
     let normalized = if attributes.keep_upright {
+        if degrees_in_turn(degrees) >= 180.0 {
+            attributes.horizontal_alignment = match attributes.horizontal_alignment() {
+                HorizontalAlignment::HaLeft => HorizontalAlignment::HaRight,
+                HorizontalAlignment::HaRight => HorizontalAlignment::HaLeft,
+                other => other,
+            } as i32;
+            attributes.vertical_alignment = match attributes.vertical_alignment() {
+                VerticalAlignment::VaTop => VerticalAlignment::VaBottom,
+                VerticalAlignment::VaBottom => VerticalAlignment::VaTop,
+                other => other,
+            } as i32;
+        }
         degrees_in_half_turn(degrees)
     } else {
         degrees_in_turn(degrees)
@@ -2883,6 +2908,7 @@ mod tests {
                     size,
                     stroke_width_mm,
                     keep_upright: true,
+                    style: _,
                 } if text == "${REFERENCE}"
                     && *position == (0.0, 1.5)
                     && *rotation == 0.0
@@ -3843,18 +3869,48 @@ mod tests {
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
-                "(effects (font (size 0.8 0.7) (thickness 0.11)))",
-                "non-square",
+                "(effects (font (face \"Arial\") (size 0.8 0.8) (thickness 0.11)))",
+                "font clause 'face' is not supported losslessly",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
-                "(effects (font (size 0.8 0.8) (thickness 0.11)) (justify left))",
-                "justify",
+                "(effects (font (size 0.8 0.8) (thickness 0.11)) (justify left right))",
+                "justification repeats or conflicts at 'right'",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
-                "(effects (font (size 0.8 0.8) (thickness 0.11) (italic yes)))",
-                "italic",
+                "(effects (font (size 0.8 0.8) (thickness 0.11)) (justify mirror mirror))",
+                "justification repeats or conflicts at 'mirror'",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11)) (justify center))",
+                "justification 'center' is not supported losslessly",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11)) (justify left) (justify top))",
+                "duplicate 'justify'",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11) (bold maybe)))",
+                "font 'bold' must be 'yes' or 'no'",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11) (italic yes) (italic yes)))",
+                "duplicate font 'italic'",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11) (line_spacing 0)))",
+                "line spacing must be finite and positive",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11)) (hide yes))",
+                "effects clause 'hide' is not supported losslessly",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
@@ -3875,6 +3931,330 @@ mod tests {
             let unsupported = LIBRARY_FOOTPRINT.replacen(from, to, 1);
             let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    /// The user text's effects that KiCad's API carries: justification,
+    /// mirror, bold, italic, line spacing and a `(size height width)` that is
+    /// not square (#85, item C).
+    const STYLED_USER_TEXT: &str = "(effects (font (size 0.8 0.6) (thickness 0.11) \
+        (bold yes) (italic yes) (line_spacing 1.5)) (justify left bottom mirror))";
+
+    /// The styled user text, and a custom property justified the same way,
+    /// which the property reader already carried.
+    fn styled_library_footprint() -> String {
+        let source = LIBRARY_FOOTPRINT
+            .replacen(
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                STYLED_USER_TEXT,
+                1,
+            )
+            .replacen(
+                "  (property \"Datasheet\"",
+                "  (property \"Note\" \"N\" (at 1 2 0) (layer \"F.Fab\")\n    \
+                 (effects (font (size 1 1) (thickness 0.15)) (justify right bottom)))\n  \
+                 (property \"Datasheet\"",
+                1,
+            );
+        assert_eq!(source.matches("justify").count(), 2, "{source}");
+        source
+    }
+
+    fn user_text_attributes(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> kiapi::common::types::TextAttributes {
+        let texts: Vec<_> = instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.BoardText"))
+            .map(|item| kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        texts[0].text.clone().unwrap().attributes.unwrap()
+    }
+
+    #[test]
+    fn parser_carries_user_text_effects() {
+        use copperpour_ipc::{IpcTextHorizontal, IpcTextStyle, IpcTextVertical};
+
+        let library = parse_library_footprint("Test:Socket", &styled_library_footprint()).unwrap();
+        let (size, style) = library
+            .graphics
+            .iter()
+            .find_map(|graphic| match graphic {
+                copperpour_ipc::IpcGraphicDefinition::Text { size, style, .. } => {
+                    Some((*size, style.clone()))
+                }
+                _ => None,
+            })
+            .expect("the library footprint has a user text");
+        assert_eq!(size, 0.8, "KiCad writes the height first");
+        assert_eq!(
+            style,
+            IpcTextStyle {
+                width: Some(0.6),
+                bold: true,
+                italic: true,
+                line_spacing: 1.5,
+                horizontal: IpcTextHorizontal::Left,
+                vertical: IpcTextVertical::Bottom,
+                mirrored: true,
+            }
+        );
+
+        let plain = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        assert!(plain.graphics.iter().any(|graphic| matches!(
+            graphic,
+            copperpour_ipc::IpcGraphicDefinition::Text { style, .. }
+                if *style == IpcTextStyle::default()
+        )));
+    }
+
+    /// The built text carries every effect as KiCad's `UnpackTextAttributes`
+    /// reads it. On the back, KiCad's `PCB_TEXT::Flip` keeps the
+    /// justification and toggles the mirror flag, so the library's mirrored
+    /// text reads unmirrored there. A second plan over the applied footprint
+    /// changes nothing at any rotation on either side.
+    #[test]
+    fn user_text_effects_build_as_kicad_reads_them_and_converge() {
+        use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+        let library = parse_library_footprint("Test:Socket", &styled_library_footprint()).unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let routed = BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]);
+        for (layer, mirrored) in [
+            (kiapi::board::types::BoardLayer::BlFCu, true),
+            (kiapi::board::types::BoardLayer::BlBCu, false),
+        ] {
+            for rotation in [0.0, 90.0, 180.0, 270.0, 37.0] {
+                let mut current = current_instance(layer);
+                current.orientation = Some(kiapi::common::types::Angle {
+                    value_degrees: rotation,
+                });
+                let first = build_updated_instance(
+                    &current,
+                    &library,
+                    two_layers(),
+                    &net_codes,
+                    &routed,
+                    Resets::default(),
+                )
+                .unwrap();
+                let applied =
+                    kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice())
+                        .unwrap();
+                let attributes = user_text_attributes(&applied);
+                let size = attributes.size.unwrap();
+                assert_eq!((size.x_nm, size.y_nm), (600_000, 800_000), "width, height");
+                assert!(attributes.bold && attributes.italic);
+                assert_eq!(attributes.line_spacing, 1.5);
+                assert_eq!(
+                    attributes.horizontal_alignment,
+                    HorizontalAlignment::HaLeft as i32
+                );
+                assert_eq!(
+                    attributes.vertical_alignment,
+                    VerticalAlignment::VaBottom as i32
+                );
+                assert_eq!(attributes.mirrored, mirrored, "{layer:?} at {rotation}");
+
+                let second = build_updated_instance(
+                    &applied,
+                    &library,
+                    two_layers(),
+                    &net_codes,
+                    &routed,
+                    Resets::default(),
+                )
+                .unwrap();
+                assert!(
+                    second.changed_domains.is_empty(),
+                    "{layer:?} at {rotation} degrees changed again: {:?}",
+                    second.changed_domains
+                );
+            }
+        }
+    }
+
+    /// KiCad's `PCB_TEXT::KeepUpright`, which `FOOTPRINT::Rotate` (and so a
+    /// left-right flip) applies: a keep-upright text at 180° or more turns by
+    /// 180° and swaps both justifications. Seen live on KiCad 10.0.8, where a
+    /// back-side `LEM_LA25-NP` holds its `right bottom` pin numbers as
+    /// `left top`.
+    fn keep_upright_as_kicad(instance: &mut kiapi::board::types::FootprintInstance) -> usize {
+        use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+        let turn = |text: &mut kiapi::board::types::BoardText| {
+            let attributes = text.text.as_mut().unwrap().attributes.as_mut().unwrap();
+            let angle = attributes.angle.unwrap().value_degrees.rem_euclid(360.0);
+            if !attributes.keep_upright || angle < 180.0 {
+                return 0;
+            }
+            attributes.angle = Some(kiapi::common::types::Angle {
+                value_degrees: angle - 180.0,
+            });
+            attributes.horizontal_alignment = match attributes.horizontal_alignment() {
+                HorizontalAlignment::HaLeft => HorizontalAlignment::HaRight,
+                HorizontalAlignment::HaRight => HorizontalAlignment::HaLeft,
+                other => other,
+            } as i32;
+            attributes.vertical_alignment = match attributes.vertical_alignment() {
+                VerticalAlignment::VaTop => VerticalAlignment::VaBottom,
+                VerticalAlignment::VaBottom => VerticalAlignment::VaTop,
+                other => other,
+            } as i32;
+            1
+        };
+        let mut turned = 0;
+        for item in &mut instance.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.BoardText") {
+                let mut text =
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                turned += turn(&mut text);
+                *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
+            } else if item.type_url.ends_with("kiapi.board.types.Field") {
+                let mut field = kiapi::board::types::Field::decode(item.value.as_slice()).unwrap();
+                turned += turn(field.text.as_mut().unwrap());
+                *item = builders::pack_any(&field, "kiapi.board.types.Field");
+            }
+        }
+        turned
+    }
+
+    /// A justified keep-upright text or custom field KiCad turned back
+    /// upright reads as the library's at every rotation on either side; the
+    /// same turn without the swapped justification is a different text and
+    /// plans `graphics`.
+    #[test]
+    fn a_justified_text_kicad_kept_upright_plans_nothing() {
+        let library = parse_library_footprint("Test:Socket", &styled_library_footprint()).unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let routed = BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]);
+        let build = |current: &kiapi::board::types::FootprintInstance| {
+            build_updated_instance(
+                current,
+                &library,
+                two_layers(),
+                &net_codes,
+                &routed,
+                Resets::default(),
+            )
+            .unwrap()
+        };
+        let mut turned_any = 0;
+        for layer in [
+            kiapi::board::types::BoardLayer::BlFCu,
+            kiapi::board::types::BoardLayer::BlBCu,
+        ] {
+            for rotation in [0.0, 90.0, 180.0, 270.0, 37.0, 217.0] {
+                let mut current = current_instance(layer);
+                current.orientation = Some(kiapi::common::types::Angle {
+                    value_degrees: rotation,
+                });
+                let mut held = kiapi::board::types::FootprintInstance::decode(
+                    build(&current).item.value.as_slice(),
+                )
+                .unwrap();
+                let turned = keep_upright_as_kicad(&mut held);
+                turned_any += turned;
+                assert!(
+                    build(&held).changed_domains.is_empty(),
+                    "{layer:?} at {rotation}: {:?}",
+                    build(&held).changed_domains
+                );
+
+                if turned > 0 {
+                    // Turned without swapping: the text now hangs from its
+                    // other corner.
+                    let mut wrong = held.clone();
+                    for item in &mut wrong.definition.as_mut().unwrap().items {
+                        if item.type_url.ends_with("kiapi.board.types.BoardText") {
+                            let mut text =
+                                kiapi::board::types::BoardText::decode(item.value.as_slice())
+                                    .unwrap();
+                            let attributes =
+                                text.text.as_mut().unwrap().attributes.as_mut().unwrap();
+                            attributes.horizontal_alignment =
+                                kiapi::common::types::HorizontalAlignment::HaLeft as i32;
+                            attributes.vertical_alignment =
+                                kiapi::common::types::VerticalAlignment::VaBottom as i32;
+                            *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
+                        }
+                    }
+                    assert!(
+                        build(&wrong)
+                            .changed_domains
+                            .contains(&ChangedDomain::Graphics),
+                        "{layer:?} at {rotation}: an unswapped turn plans nothing"
+                    );
+                }
+            }
+        }
+        assert!(turned_any > 0, "no rotation left the text at 180° or more");
+    }
+
+    /// A text KiCad already holds with the library's effects plans nothing;
+    /// the same text with any one effect lost plans `graphics`, so a refresh
+    /// would put it back.
+    #[test]
+    fn a_lost_user_text_effect_plans_graphics() {
+        let library = parse_library_footprint("Test:Socket", &styled_library_footprint()).unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let routed = BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]);
+        let build = |current: &kiapi::board::types::FootprintInstance| {
+            build_updated_instance(
+                current,
+                &library,
+                two_layers(),
+                &net_codes,
+                &routed,
+                Resets::default(),
+            )
+            .unwrap()
+        };
+        let applied = kiapi::board::types::FootprintInstance::decode(
+            build(&current_instance(kiapi::board::types::BoardLayer::BlFCu))
+                .item
+                .value
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(build(&applied).changed_domains.is_empty());
+
+        type Lose = fn(&mut kiapi::common::types::TextAttributes);
+        let losses: [(&str, Lose); 6] = [
+            ("bold", |attributes| attributes.bold = false),
+            ("italic", |attributes| attributes.italic = false),
+            ("line spacing", |attributes| attributes.line_spacing = 1.0),
+            ("mirror", |attributes| attributes.mirrored = false),
+            ("justification", |attributes| {
+                attributes.horizontal_alignment =
+                    kiapi::common::types::HorizontalAlignment::HaCenter as i32
+            }),
+            ("width", |attributes| {
+                attributes.size = Some(builders::vec2(0.8, 0.8))
+            }),
+        ];
+        for (name, lose) in losses {
+            let mut lost = applied.clone();
+            for item in &mut lost.definition.as_mut().unwrap().items {
+                if item.type_url.ends_with("kiapi.board.types.BoardText") {
+                    let mut text =
+                        kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                    lose(text.text.as_mut().unwrap().attributes.as_mut().unwrap());
+                    *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
+                }
+            }
+            assert!(
+                build(&lost)
+                    .changed_domains
+                    .contains(&ChangedDomain::Graphics),
+                "losing the {name} plans nothing: {:?}",
+                build(&lost).changed_domains
+            );
         }
     }
 

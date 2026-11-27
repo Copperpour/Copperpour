@@ -6862,24 +6862,42 @@ fn build_graphic_child(
             size,
             stroke_width_mm,
             keep_upright,
+            style,
         } => {
+            use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
             let (tx, ty) = xf(*position);
-            let mut text = builders::board_text_with_stroke_width(
+            let mut text = builders::board_text_with_style(
                 layer,
                 text,
                 tx,
                 ty,
                 *size,
-                *stroke_width_mm,
                 // KiCad keeps the angle as placed and turns keep-upright
                 // text for reading itself.
                 (text_rotation + rotation).rem_euclid(360.0),
-                false,
+                builders::BoardTextStyle {
+                    stroke_width_mm: *stroke_width_mm,
+                    mirror: style.mirrored,
+                    bold: style.bold,
+                    italic: style.italic,
+                },
             );
             if let Some(attributes) = text.text.as_mut().and_then(|text| text.attributes.as_mut()) {
                 // KiCad loads footprint text as multiline.
                 attributes.multiline = true;
                 attributes.keep_upright = *keep_upright;
+                attributes.line_spacing = style.line_spacing;
+                attributes.size = Some(builders::vec2(style.width.unwrap_or(*size), *size));
+                attributes.horizontal_alignment = match style.horizontal {
+                    crate::IpcTextHorizontal::Left => HorizontalAlignment::HaLeft,
+                    crate::IpcTextHorizontal::Center => HorizontalAlignment::HaCenter,
+                    crate::IpcTextHorizontal::Right => HorizontalAlignment::HaRight,
+                } as i32;
+                attributes.vertical_alignment = match style.vertical {
+                    crate::IpcTextVertical::Top => VerticalAlignment::VaTop,
+                    crate::IpcTextVertical::Center => VerticalAlignment::VaCenter,
+                    crate::IpcTextVertical::Bottom => VerticalAlignment::VaBottom,
+                } as i32;
             }
             builders::pack_any(&text, "kiapi.board.types.BoardText")
         }
@@ -8393,6 +8411,7 @@ mod footprint_graphics_tests {
                 size: 0.5,
                 stroke_width_mm: 0.075,
                 keep_upright: true,
+                style: Default::default(),
             },
         ];
         let fp = build(&graphics, 100.0, 50.0, 90.0);
@@ -8468,6 +8487,7 @@ mod footprint_graphics_tests {
             size: 0.5,
             stroke_width_mm: 0.075,
             keep_upright,
+            style: Default::default(),
         };
         let graphics = vec![
             line(crate::IpcLineStyle::Default),
@@ -8524,6 +8544,7 @@ mod footprint_graphics_tests {
             size: 0.5,
             stroke_width_mm: 0.075,
             keep_upright: true,
+            style: Default::default(),
         }];
         let fp = build(&graphics, 0.0, 0.0, 180.0);
         let texts = texts(&fp);
@@ -8704,6 +8725,7 @@ mod footprint_graphics_tests {
                 size: 1.0,
                 stroke_width_mm: 0.15,
                 keep_upright: true,
+                style: Default::default(),
             },
         ];
         let any = KiCadIpcClient::build_footprint_item(

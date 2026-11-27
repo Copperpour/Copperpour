@@ -491,14 +491,65 @@ pub enum IpcGraphicDefinition {
         /// Text angle in degrees, footprint-local.
         rotation: f64,
         layer: String,
-        /// Glyph size (width and height) in mm.
+        /// Glyph height in mm, and the width too unless `style.width` says
+        /// otherwise.
         size: f64,
         /// Font stroke width in mm.
         stroke_width_mm: f64,
         /// KiCad turns the text upright for reading; the library's
         /// `(unlocked yes)` clears it.
         keep_upright: bool,
+        /// The rest of the text's `(effects …)`.
+        style: IpcTextStyle,
     },
+}
+
+/// Horizontal text justification, from `(justify left|right)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcTextHorizontal {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// Vertical text justification, from `(justify top|bottom)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcTextVertical {
+    Top,
+    #[default]
+    Center,
+    Bottom,
+}
+
+/// A footprint text's `(effects …)` beyond its glyph height, stroke width and
+/// keep-upright. The default is what KiCad reads when a clause is absent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcTextStyle {
+    /// Glyph width in mm, when the font's `(size height width)` differs from
+    /// the height.
+    pub width: Option<f64>,
+    pub bold: bool,
+    pub italic: bool,
+    pub line_spacing: f64,
+    pub horizontal: IpcTextHorizontal,
+    pub vertical: IpcTextVertical,
+    /// `(justify mirror)`.
+    pub mirrored: bool,
+}
+
+impl Default for IpcTextStyle {
+    fn default() -> Self {
+        Self {
+            width: None,
+            bold: false,
+            italic: false,
+            line_spacing: 1.0,
+            horizontal: IpcTextHorizontal::Center,
+            vertical: IpcTextVertical::Center,
+            mirrored: false,
+        }
+    }
 }
 
 impl IpcGraphicDefinition {

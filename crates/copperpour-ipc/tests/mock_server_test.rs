@@ -785,6 +785,7 @@ fn place_footprint_sends_graphics_children() {
             size: 0.26,
             stroke_width_mm: 0.04,
             keep_upright: true,
+            style: Default::default(),
         },
     ];
 
