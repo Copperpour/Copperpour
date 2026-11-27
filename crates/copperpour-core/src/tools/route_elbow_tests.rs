@@ -6,6 +6,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 const FIXTURE: &str = "route_elbows_kicad10.kicad_sch";
+const LEGACY_ELBOW_NAME: &str = "legacy_route_elbows.kicad_sch";
+const LEGACY_ELBOW_SEED: &str =
+    include_str!("../../tests/fixtures/pin_contact_kicad10/legacy_route_elbows.kicad_sch");
+const NEARBY_TAP: &str =
+    include_str!("../../tests/fixtures/pin_contact_kicad10/nearby_wire_tap.kicad_sch");
 type Point = [f64; 2];
 const BODY_PATH: [Point; 3] = [[50.8, 54.61], [50.8, 63.5], [76.2, 63.5]];
 const TEXT_PATH: [Point; 3] = [[101.6, 54.61], [101.6, 63.5], [127.0, 63.5]];
@@ -25,15 +30,16 @@ struct Sheet {
 
 impl Sheet {
     async fn new() -> Self {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(FIXTURE);
+        Self::with_source(FIXTURE, &std::fs::read(source).unwrap()).await
+    }
+
+    async fn with_source(name: &str, source: &[u8]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(FIXTURE);
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures")
-                .join(FIXTURE),
-            &path,
-        )
-        .unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, source).unwrap();
         let handler = McpHandler::new(ServerConfig {
             eager_toolsets: true,
             ..ServerConfig::default()
@@ -293,4 +299,121 @@ async fn two_unsafe_elbows_keep_reason_order_even_when_vertical_is_clearer() {
             .starts_with("the vertical-first route would join "),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn connect_pins_does_not_join_legacy_mirrored_pins_at_elbows() {
+    assert_legacy_mirrored_pins_block_route("connect_pins").await;
+}
+
+#[tokio::test]
+async fn batch_connect_pins_does_not_join_legacy_mirrored_pins_at_elbows() {
+    assert_legacy_mirrored_pins_block_route("batch_connect_pins").await;
+}
+
+async fn assert_legacy_mirrored_pins_block_route(tool: &str) {
+    let legacy = LEGACY_ELBOW_SEED
+        .replace(
+            "(at 41.91 25.4 90)\n\t\t(mirror x)",
+            "(at 41.91 25.4 90.5)\n\t\t(mirror x)",
+        )
+        .replace(
+            "(at 21.59 38.1 270)\n\t\t(mirror x)",
+            "(at 21.59 38.1 90.5)\n\t\t(mirror y)",
+        );
+    assert_eq!(legacy.matches("90.5)").count(), 2);
+    let reasons = [
+        "the horizontal-first route would join R32 pin 1 at (38.1, 25.4)",
+        "the vertical-first route would join R33 pin 1 at (25.4, 38.1)",
+    ];
+    let request = json!({"ref1": "R30", "pin1": "1", "ref2": "R31", "pin2": "1"});
+    let sheet = Sheet::with_source(LEGACY_ELBOW_NAME, legacy.as_bytes()).await;
+    let args = if tool == "connect_pins" {
+        request
+    } else {
+        json!({"connections": [request]})
+    };
+    let (is_error, body) = sheet.call(tool, args).await;
+    assert!(is_error, "{body}");
+    if tool == "connect_pins" {
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(body["error"]["reasons"], json!(reasons), "{body}");
+    } else {
+        assert_eq!(body["connected_count"], 0, "{body}");
+        assert_eq!(
+            body["errors"],
+            json!([format!("R30.1 -> R31.1: {}", reasons.join("; "))]),
+            "{body}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), legacy);
+}
+
+fn first_pin_pair(from: &str, to: &str) -> Value {
+    json!({"ref1": from, "pin1": "1", "ref2": to, "pin2": "1"})
+}
+
+#[tokio::test]
+async fn named_pin_route_does_not_treat_a_nearby_wire_as_a_requested_tap() {
+    // The requested vertical route starts at (25.4, 25.4). The nearby wire
+    // meets that route at a dot 0.005 mm later, not at its requested start.
+    let sheet = Sheet::with_source("nearby_wire_tap.kicad_sch", NEARBY_TAP.as_bytes()).await;
+    let (is_error, body) = sheet
+        .call("connect_pins", first_pin_pair("R30", "R33"))
+        .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+    assert_eq!(
+        body["error"]["reasons"],
+        json!(["the straight route would join label FOREIGN at (20.32, 25.405) on net FOREIGN"]),
+        "{body}"
+    );
+    assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), NEARBY_TAP);
+}
+
+#[tokio::test]
+async fn a_later_batch_pair_can_extend_an_earlier_pairs_net() {
+    let sheet = Sheet::with_source(LEGACY_ELBOW_NAME, LEGACY_ELBOW_SEED.as_bytes()).await;
+    let (is_error, body) = sheet
+        .call(
+            "batch_connect_pins",
+            json!({"connections": [first_pin_pair("R30", "R33"), first_pin_pair("R33", "R31")]}),
+        )
+        .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["connected_count"], 2, "{body}");
+    assert_eq!(body["errors"], json!([]), "{body}");
+    sheet.assert_wires(&[&[[25.4, 25.4], [25.4, 38.1]], &[[25.4, 38.1], [38.1, 38.1]]]);
+}
+
+#[tokio::test]
+async fn named_pin_routes_refuse_an_unloadable_unrelated_symbol_without_writing() {
+    let token = "(at 41.91 25.4 90)\n\t\t(mirror x)";
+    assert_eq!(LEGACY_ELBOW_SEED.matches(token).count(), 1);
+    let reason = "R32 has a saved symbol angle KiCad cannot load";
+    for angle in [" 45", " bad", "", " \"90\""] {
+        let unloadable =
+            LEGACY_ELBOW_SEED.replace(token, &format!("(at 41.91 25.4{angle})\n\t\t(mirror x)"));
+        let sheet = Sheet::with_source(LEGACY_ELBOW_NAME, unloadable.as_bytes()).await;
+        let pair = first_pin_pair("R30", "R33");
+        for (tool, args) in [
+            ("connect_pins", pair.clone()),
+            ("batch_connect_pins", json!({"connections": [pair]})),
+        ] {
+            let (is_error, body) = sheet.call(tool, args).await;
+            assert!(is_error, "{tool} with {angle:?}: {body}");
+            if tool == "connect_pins" {
+                assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+                assert_eq!(body["error"]["reasons"], json!([reason]), "{body}");
+            } else {
+                assert_eq!(body["connected_count"], 0, "{body}");
+                assert_eq!(
+                    body["errors"],
+                    json!([format!("R30.1 -> R33.1: {reason}")]),
+                    "{body}"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), unloadable);
+        }
+    }
 }

@@ -72,8 +72,18 @@ const SCHEMATICS: &[(&str, &str, &str)] = &[
         "eeschema",
     ),
     (
+        "pin_contact_kicad10/legacy_route_elbows.kicad_sch",
+        "pin_contact_kicad10/legacy_route_elbows.README.md",
+        "eeschema",
+    ),
+    (
         "pin_contact_kicad10/pin_contact.kicad_sch",
         "pin_contact_kicad10/README.md",
+        "eeschema",
+    ),
+    (
+        "pin_contact_kicad10/nearby_wire_tap.kicad_sch",
+        "pin_contact_kicad10/nearby_wire_tap.README.md",
         "eeschema",
     ),
     (

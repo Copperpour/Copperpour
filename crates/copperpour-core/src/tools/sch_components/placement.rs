@@ -5,7 +5,7 @@ use super::readback::{
     tool_error_summary, wants_verbose, ComponentTargetUnit,
 };
 use crate::mcp::protocol::CallToolResult;
-use crate::tools::{get_path, opt_f64, opt_str, opt_u32, require_f64, require_str, ToolContext};
+use crate::tools::{get_path, opt_str, opt_u32, require_f64, require_str, ToolContext};
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::geometry::snap_point;
 use serde_json::json;
@@ -27,7 +27,6 @@ pub(crate) async fn handle_add_schematic_component(
         Ok(v) => v,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
     let mirror = match mirror_arg(args, "mirror") {
         Ok(mirror) => mirror,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -93,7 +92,7 @@ pub(crate) async fn handle_add_schematic_component(
         &lib_id,
         x,
         y,
-        rotation,
+        args.get("rotation"),
         mirror,
         reference,
         value,
@@ -114,7 +113,7 @@ pub(crate) async fn handle_add_schematic_component(
         &lib_id,
         expected_x,
         expected_y,
-        rotation,
+        placed.requested_rotation,
         mirror,
         &placed.reference,
         &placed.fields,
@@ -321,7 +320,7 @@ pub(crate) fn place_one_component(
     lib_id: &str,
     x: f64,
     y: f64,
-    rotation: f64,
+    rotation: Option<&serde_json::Value>,
     mirror: Option<&str>,
     reference: Option<&str>,
     value: Option<&str>,
@@ -331,6 +330,11 @@ pub(crate) fn place_one_component(
     extras: ComponentPlacementExtras<'_>,
     in_use: &mut crate::tools::sch_annotate::DesignatorsInUse,
 ) -> Result<PlacedComponent, CallToolResult> {
+    let rotation = rotation
+        .filter(|value| !value.is_null())
+        .map_or(Ok(0.0), |value| {
+            crate::tools::symbol_rotation_arg(value, "rotation")
+        })?;
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
 
@@ -560,6 +564,7 @@ pub(crate) fn place_one_component(
     Ok(PlacedComponent {
         uuid,
         reference,
+        requested_rotation: rotation,
         fields,
         lcsc_catalog,
     })
@@ -613,10 +618,11 @@ impl PlacementFields {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct PlacedComponent {
     pub(crate) uuid: String,
     pub(crate) reference: String,
+    pub(crate) requested_rotation: f64,
     pub(crate) fields: PlacementFields,
     /// The catalog's report on the symbol's LCSC number, when it has one.
     pub(crate) lcsc_catalog: Option<serde_json::Value>,

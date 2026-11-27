@@ -1980,6 +1980,24 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+pub(super) fn is_symbol_quarter_turn(rotation: f64) -> bool {
+    rotation % 90.0 == 0.0
+}
+
+pub(super) fn normalize_symbol_rotation(rotation: f64, field: &str) -> Result<f64, CallToolResult> {
+    if !is_symbol_quarter_turn(rotation) {
+        return Err(invalid_arg(field, "must be a multiple of 90 degrees"));
+    }
+    Ok(rotation.rem_euclid(360.0))
+}
+
+pub(super) fn symbol_rotation_arg(value: &Value, field: &str) -> Result<f64, CallToolResult> {
+    let rotation = value
+        .as_f64()
+        .ok_or_else(|| invalid_arg(field, "missing or not a number"))?;
+    normalize_symbol_rotation(rotation, field)
+}
+
 /// A persistence step whose result cannot say what is on disk.
 pub(crate) fn file_outcome_uncertain(
     path: &std::path::Path,

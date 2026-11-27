@@ -529,7 +529,7 @@ async fn handle_apply_template(
                 lib_id,
                 x,
                 y,
-                0.0,
+                None,
                 None,
                 Some(&reference),
                 Some(value),
