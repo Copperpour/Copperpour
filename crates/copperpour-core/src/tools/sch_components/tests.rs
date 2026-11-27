@@ -81,6 +81,11 @@ fn stub_symbol_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) 
             ),
         )
         .unwrap();
+    std::fs::write(
+        symdir.join("WITH_LEGACY_HIDDEN_FIELD.kicad_sym"),
+        "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"eeschema\")\n\t(symbol \"WITH_LEGACY_HIDDEN_FIELD\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"Legacy hidden value\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n\t\t(symbol \"WITH_LEGACY_HIDDEN_FIELD_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+    )
+    .unwrap();
     // LM2904-style multi-unit part: unit 1 = pins 1-3, unit 2 = pins 5-7,
     // unit 3 = power pins 4/8 (#35 repro shape).
     let pin = |num: &str, x: f64, y: f64, angle: u32| {
@@ -1789,6 +1794,7 @@ async fn add_schematic_component_takes_field_visibility_from_library() {
     for (lib_id, reference) in [
         ("Graphic:Logo_Open_Hardware_Small", "#SYM1"),
         ("MyPower:PWR_FLAG", "#FLG02"),
+        ("Device:WITH_LEGACY_HIDDEN_FIELD", "U3"),
     ] {
         let result = handle_add_schematic_component(
             &json!({
@@ -1845,6 +1851,17 @@ async fn add_schematic_component_takes_field_visibility_from_library() {
         !field_sexp(flag, "Value").contains("hide"),
         "the library shows the PWR_FLAG Value, so it must stay shown: {}",
         field_sexp(flag, "Value")
+    );
+
+    let legacy = sch
+        .symbols
+        .iter()
+        .find(|s| s.reference() == Some("U3"))
+        .expect("legacy-hidden-field instance");
+    assert!(
+        field_sexp(legacy, "Value").contains("(hide yes)"),
+        "the KiCad 6/7 library hides Value with a bare hide inside effects: {}",
+        field_sexp(legacy, "Value")
     );
 }
 

@@ -511,25 +511,17 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
 /// embedded `lib_id` definition has no such property.
 ///
 /// eeschema copies each field's visibility from the library when it places a
-/// symbol, so a placement reads it here instead of applying a rule. Both
-/// spellings KiCad uses count: the property-level `(hide yes)` / bare `hide`,
-/// and the `(hide yes)` nested in the property's `(effects …)`.
+/// symbol, so a placement reads it here instead of applying a rule. The shared
+/// property reader recognizes the property-level flag and both KiCad spellings
+/// inside `(effects …)`, including the bare `hide` from KiCad 6/7 libraries.
 pub fn field_hidden(schematic: &Schematic, lib_id: &str, name: &str) -> Option<bool> {
     let symbol = embedded_lib_symbol(schematic, lib_id)?;
-    let property = symbol
+    symbol
         .find_all("property")
         .into_iter()
-        .find(|p| crate::types::parse_property_header(p).is_some_and(|(_, n, _, _)| n == name))?;
-    let (_, _, _, rest) = crate::types::parse_property_header(property)?;
-    let hide_flag = |n: &SexpNode| n.tag() == Some("hide") && n.value().is_none_or(|v| v == "yes");
-    let hidden = rest
-        .iter()
-        .any(|n| n.text() == Some("hide") || hide_flag(n))
-        || rest
-            .iter()
-            .filter(|n| n.tag() == Some("effects"))
-            .any(|e| e.children().iter().any(hide_flag));
-    Some(hidden)
+        .filter_map(crate::types::Property::from_sexp)
+        .find(|property| property.name == name)
+        .map(|property| property.is_hidden())
 }
 
 /// [`FieldAnchors`] of a resolved symbol node.

@@ -8047,6 +8047,48 @@ mod power_symbol_tests {
         );
     }
 
+    #[tokio::test]
+    async fn add_power_symbol_copies_legacy_hidden_value_from_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-legacy-hidden-value.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0) (hide yes))\n      (property \"Value\" \"GND\" (at 0 -3.81 0) (effects (font (size 1.27 1.27)) hide))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR01"))
+            .expect("power symbol instance");
+        let value = cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|property| property.name == "Value")
+                .unwrap()
+                .to_sexp(),
+        );
+        assert!(
+            value.contains("(hide yes)"),
+            "add_power_symbol must copy a hidden Value from a KiCad 6/7 library: {value}"
+        );
+    }
+
     /// An up-pointing rail anchors its Value *above* the graphic, where a
     /// fixed +3.81 offset used to put it below (#101). VCC's library anchor is
     /// (0, +3.556) in Y-up space, so the sheet coordinate is y − 3.556.
