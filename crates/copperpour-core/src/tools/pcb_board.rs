@@ -395,22 +395,51 @@ where
         // observed instead of claiming one might (#83).
         LiveBoard::Unserved {
             absence: crate::tools::BoardEditorAbsence::NoPcbEditor,
+            message,
             ..
-        } => BoardWrite::Refused(CallToolResult::error(no_pcb_editor_write_refusal(what))),
+        } => BoardWrite::Refused(CallToolResult::error_kind_with_recovery(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: message.clone(),
+            },
+            no_pcb_editor_write_refusal(what),
+            super::ipc_recovery::for_board_editor_absence(
+                crate::tools::BoardEditorAbsence::NoPcbEditor,
+                &message,
+            ),
+        )),
         LiveBoard::Rejected { message, status } => {
             let what_failed = if status.is_some() {
                 format!("KiCAD rejected the {what} over IPC: {message}. The board file was not modified — KiCAD is reachable and may hold this board open")
             } else {
                 format!("The live {what} failed: {message}. The board file was not modified — KiCad may hold this board open")
             };
-            BoardWrite::Refused(CallToolResult::error(format!(
-                "{what_failed}, so editing the file directly could be silently overwritten."
-            )))
+            let recovery =
+                super::ipc_recovery::for_ipc_failure(&copperpour_ipc::IpcFailure::Rejected {
+                    message: message.clone(),
+                    status,
+                });
+            BoardWrite::Refused(CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::HandlerError { reason: message },
+                format!(
+                    "{what_failed}, so editing the file directly could be silently overwritten."
+                ),
+                recovery,
+            ))
         }
-        LiveBoard::Unserved { message, .. } => BoardWrite::Refused(CallToolResult::error(format!(
-            "The live {what} failed: {message}. The board file was not modified — KiCad may \
+        LiveBoard::Unserved {
+            absence, message, ..
+        } => BoardWrite::Refused(CallToolResult::error_kind_with_recovery(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: message.clone(),
+            },
+            format!(
+                "The live {what} failed: {message}. The board file was not modified — KiCad may \
                  hold this board open, so editing the file directly could be silently overwritten."
-        ))),
+            ),
+            super::ipc_recovery::for_board_editor_absence(absence, &message),
+        )),
         LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
         LiveBoard::Unresolved(error) => {
             BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
@@ -444,14 +473,16 @@ pub(crate) fn preflight_refusal_result(
         "The {what} was not written: {}. The board file was not modified.",
         refusal.reason
     );
-    match kind {
-        Some(kind) if refusal.kicad_status.is_some() => CallToolResult::error_kind_with_recovery(
+    let kind =
+        kind.unwrap_or_else(|| preflight_refusal_kind(what, refusal, |_, field| field.to_string()));
+    if refusal.kicad_status.is_some() {
+        CallToolResult::error_kind_with_recovery(
             kind,
             message,
             super::ipc_recovery::for_preflight_refusal(refusal),
-        ),
-        Some(kind) => CallToolResult::error_kind(kind, message),
-        None => CallToolResult::error(message),
+        )
+    } else {
+        CallToolResult::error_kind(kind, message)
     }
 }
 
@@ -674,11 +705,16 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
 ) -> anyhow::Result<Option<CallToolResult>> {
     Ok(
         match live_board::observe(ctx, board_path, |_, _| Ok(())).await? {
-            LiveBoard::Answered(()) => Some(CallToolResult::error(format!(
-                "KiCAD currently holds this board open, and a {what} written to the file would \
-                 be discarded by KiCAD's next save. Close the board in KiCAD (or make the edit \
-                 there) and retry — this tool has no IPC path for a live board yet."
-            ))),
+            LiveBoard::Answered(()) => Some(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![board_path.display().to_string()],
+                },
+                format!(
+                    "KiCAD currently holds this board open, and a {what} written to the file would \
+                     be discarded by KiCAD's next save. Close the board in KiCAD (or make the edit \
+                     there) and retry — this tool has no IPC path for a live board yet."
+                ),
+            )),
             // KiCad answered at all, so it may hold this board; a rejection is
             // not the proof of absence this guard needs, and it is not proof of
             // presence either. It refuses nothing.
@@ -1163,35 +1199,81 @@ fn insert_mounting_hole_file(
                 "add_mounting_hole",
             ));
         }
-        return Err(CallToolResult::error(format!(
-            "Could not add mounting hole {} to {}: {error:#}",
-            spec.reference,
-            board_path.display()
-        )));
+        let kind = match error.downcast_ref::<copperpour_sexp::SexpError>() {
+            Some(copperpour_sexp::SexpError::Conflict { path, .. }) => ToolErrorKind::Conflict {
+                paths: vec![path.display().to_string()],
+            },
+            Some(copperpour_sexp::SexpError::Io(io_err))
+                if io_err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                ToolErrorKind::file_not_found(board_path)
+            }
+            Some(copperpour_sexp::SexpError::Parse { .. }) => ToolErrorKind::MalformedFile {
+                path: board_path.display().to_string(),
+                reason: format!("{error:#}"),
+            },
+            _ => ToolErrorKind::HandlerError {
+                reason: format!("{error:#}"),
+            },
+        };
+        return Err(CallToolResult::error_kind(
+            kind,
+            format!(
+                "Could not add mounting hole {} to {}: {error:#}",
+                spec.reference,
+                board_path.display()
+            ),
+        ));
     }
 
+    verify_mounting_hole_readback(board_path, &spec.reference)
+}
+
+fn verify_mounting_hole_readback(
+    board_path: &Path,
+    reference: &str,
+) -> Result<String, CallToolResult> {
     let written = match std::fs::read_to_string(board_path) {
         Ok(written) => written,
         Err(error) => {
-            return Err(CallToolResult::error(format!(
-                "Mounting hole {} was committed but {} could not be read back: {error}",
-                spec.reference,
+            let message = format!(
+                "Mounting hole {reference} was committed but {} could not be read back: {error}",
                 board_path.display()
-            )))
+            );
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::MutationOutcomeUncertain {
+                    operation: "add_mounting_hole".to_string(),
+                    path: board_path.display().to_string(),
+                    reason: format!("could not read back after commit: {error}"),
+                },
+                message,
+            ));
         }
     };
-    match written_footprint_lib_id(&written, &spec.reference) {
+    match written_footprint_lib_id(&written, reference) {
         Ok(Some(lib_id)) => Ok(lib_id),
-        Ok(None) => Err(CallToolResult::error(format!(
-            "Mounting hole {} was committed but is absent from readback of {}",
-            spec.reference,
-            board_path.display()
-        ))),
-        Err(error) => Err(CallToolResult::error(format!(
-            "Mounting hole {} was committed but readback from {} was ambiguous: {error:#}",
-            spec.reference,
-            board_path.display()
-        ))),
+        Ok(None) => Err(CallToolResult::error_kind(
+            ToolErrorKind::MutationOutcomeUncertain {
+                operation: "add_mounting_hole".to_string(),
+                path: board_path.display().to_string(),
+                reason: format!("mounting hole '{reference}' is absent from readback"),
+            },
+            format!(
+                "Mounting hole {reference} was committed but is absent from readback of {}",
+                board_path.display()
+            ),
+        )),
+        Err(error) => Err(CallToolResult::error_kind(
+            ToolErrorKind::MutationOutcomeUncertain {
+                operation: "add_mounting_hole".to_string(),
+                path: board_path.display().to_string(),
+                reason: format!("readback was ambiguous: {error:#}"),
+            },
+            format!(
+                "Mounting hole {reference} was committed but readback from {} was ambiguous: {error:#}",
+                board_path.display()
+            ),
+        )),
     }
 }
 
@@ -1715,12 +1797,20 @@ fn partition_edge_cuts_shapes(items: &[prost_types::Any]) -> (Vec<String>, Vec<&
 
 /// The refusal both write paths share when the outline is not plain segments.
 fn outline_not_replaceable(kinds: &str) -> CallToolResult {
-    CallToolResult::error(format!(
-        "The existing board outline includes {kinds} on Edge.Cuts, which a plain \
-         rectangle cannot honestly replace — Copperpour refused before writing \
-         anything. Edit the outline in pcbnew, or delete the old outline first \
-         if the rectangle is really what you want."
-    ))
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: "set_board_size".to_string(),
+            reasons: vec![format!(
+                "existing board outline includes {kinds} on Edge.Cuts"
+            )],
+        },
+        format!(
+            "The existing board outline includes {kinds} on Edge.Cuts, which a plain \
+             rectangle cannot honestly replace — Copperpour refused before writing \
+             anything. Edit the outline in pcbnew, or delete the old outline first \
+             if the rectangle is really what you want."
+        ),
+    )
 }
 
 async fn handle_set_board_size(
@@ -2485,16 +2575,40 @@ fn saved_board_extents(
     board_path: &std::path::Path,
     why: &board_source::SavedBoard,
 ) -> CallToolResult {
-    let tree = match std::fs::read_to_string(board_path)
-        .map_err(|e| e.to_string())
-        .and_then(|content| parse_sexp(&content).map_err(|e| e.to_string()))
-    {
+    let content = match std::fs::read_to_string(board_path) {
+        Ok(content) => content,
+        Err(error) => {
+            let reason = error.to_string();
+            let kind = if error.kind() == std::io::ErrorKind::NotFound {
+                ToolErrorKind::file_not_found(board_path)
+            } else {
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                }
+            };
+            return CallToolResult::error_kind(
+                kind,
+                format!(
+                    "The board extents could not be read from '{}': {reason}.",
+                    board_path.display()
+                ),
+            );
+        }
+    };
+    let tree = match parse_sexp(&content) {
         Ok(tree) => tree,
-        Err(reason) => {
-            return CallToolResult::error(format!(
-                "The board extents could not be read from '{}': {reason}.",
-                board_path.display()
-            ))
+        Err(error) => {
+            let reason = error.to_string();
+            return CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "The board extents could not be read from '{}': {reason}.",
+                    board_path.display()
+                ),
+            );
         }
     };
     let bounds = copperpour_sexp::bounds::board_item_bounds(&tree);
@@ -2514,17 +2628,33 @@ fn saved_board_extents(
     )
 }
 
+enum SavedStackupError {
+    Io(std::io::Error),
+    Malformed(String),
+}
+
+impl std::fmt::Display for SavedStackupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Malformed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
 /// The stackup as the saved board file declares it, or why it could not be
 /// read. A live answer still wants this: KiCad's IPC API reports which layers
 /// are enabled and what each is called, but not a layer's `signal`/`power`/
 /// `user` type, which stays file-backed and is reported as such.
 fn saved_stackup(
     board_path: &std::path::Path,
-) -> Result<Vec<copperpour_sexp::layers::Layer>, String> {
-    let content = std::fs::read_to_string(board_path).map_err(|e| format!("{e}"))?;
-    let tree = parse_sexp(&content).map_err(|e| format!("{e}"))?;
+) -> Result<Vec<copperpour_sexp::layers::Layer>, SavedStackupError> {
+    let content = std::fs::read_to_string(board_path).map_err(SavedStackupError::Io)?;
+    let tree = parse_sexp(&content).map_err(|e| SavedStackupError::Malformed(format!("{e}")))?;
     if tree.find("layers").is_none() {
-        return Err("no (layers) section in the board file".to_string());
+        return Err(SavedStackupError::Malformed(
+            "no (layers) section in the board file".to_string(),
+        ));
     }
     Ok(copperpour_sexp::layers::layers(&tree))
 }
@@ -2576,11 +2706,27 @@ fn saved_layer_list(
 ) -> CallToolResult {
     let stack = match saved_stackup(board_path) {
         Ok(stack) => stack,
-        Err(reason) => {
-            return CallToolResult::error(format!(
-                "The layer list could not be read from '{}': {reason}.",
-                board_path.display()
-            ))
+        Err(error) => {
+            let reason = error.to_string();
+            let kind = match &error {
+                SavedStackupError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    ToolErrorKind::file_not_found(board_path)
+                }
+                SavedStackupError::Io(_) => ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                SavedStackupError::Malformed(_) => ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: reason.clone(),
+                },
+            };
+            return CallToolResult::error_kind(
+                kind,
+                format!(
+                    "The layer list could not be read from '{}': {reason}.",
+                    board_path.display()
+                ),
+            );
         }
     };
     let layers: Vec<serde_json::Value> = stack
@@ -2691,13 +2837,19 @@ async fn handle_add_layer(
     // against KiCAD 10: `(53 "User.8" user)` loads, `(53 "TestLayer" user)` is
     // refused with "Failed to load board".
     if !copperpour_sexp::layers::is_canonical_name(&layer_name) {
-        return Ok(CallToolResult::error(format!(
-            "'{layer_name}' is not a KiCAD layer name, and a board containing one \
-             cannot be opened. Names are fixed: F.Cu, B.Cu, In1.Cu..In30.Cu, \
-             User.1..User.45, and the technical layers (Edge.Cuts, F.Mask, …). \
-             To give a layer your own label, add the canonical layer and set its \
-             user name — `(53 \"User.8\" user \"{layer_name}\")`."
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "layer_name".to_string(),
+                reason: format!("'{layer_name}' is not a canonical KiCad layer name"),
+            },
+            format!(
+                "'{layer_name}' is not a KiCAD layer name, and a board containing one \
+                 cannot be opened. Names are fixed: F.Cu, B.Cu, In1.Cu..In30.Cu, \
+                 User.1..User.45, and the technical layers (Edge.Cuts, F.Mask, …). \
+                 To give a layer your own label, add the canonical layer and set its \
+                 user name — `(53 \"User.8\" user \"{layer_name}\")`."
+            ),
+        ));
     }
 
     let content = read_consistent(&board_path)?;
@@ -2705,23 +2857,13 @@ async fn handle_add_layer(
     // Find the (layers ...) block and insert before its closing paren
     let layers_pos = match content.find("(layers") {
         Some(p) => p,
-        None => return Ok(CallToolResult::error("No (layers) section found")),
-    };
-
-    // Determine the next available inner copper ID (first unused ID in 1-30 range).
-    // The ids have to be read by shape — see copperpour_sexp::layers. Reading them
-    // with find_all("") returned nothing, so every call allocated id 1 and
-    // duplicated In1.Cu on any board that already had an inner layer.
-    let tree = parse_sexp(&content)?;
-    let used_ids: std::collections::HashSet<i32> = copperpour_sexp::layers::layers(&tree)
-        .iter()
-        .map(|l| l.id)
-        .collect();
-    let new_id = match (1..=30).find(|id| !used_ids.contains(id)) {
-        Some(id) => id,
         None => {
-            return Ok(CallToolResult::error(
-                "No free inner copper layer id: 1-30 are all in use",
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: "No (layers) section found".to_string(),
+                },
+                "No (layers) section found".to_string(),
             ))
         }
     };
@@ -2733,8 +2875,46 @@ async fn handle_add_layer(
     let close = match close_of_block(&content, layers_pos) {
         Some(p) => p,
         None => {
-            return Ok(CallToolResult::error(
-                "Unbalanced (layers) block; refusing to write",
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: "Unbalanced (layers) block; refusing to write".to_string(),
+                },
+                "Unbalanced (layers) block; refusing to write".to_string(),
+            ))
+        }
+    };
+
+    // Determine the next available inner copper ID (first unused ID in 1-30 range).
+    // The ids have to be read by shape — see copperpour_sexp::layers. Reading them
+    // with find_all("") returned nothing, so every call allocated id 1 and
+    // duplicated In1.Cu on any board that already had an inner layer.
+    let tree = match parse_sexp(&content) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let reason = error.to_string();
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: board_path.display().to_string(),
+                    reason: reason.clone(),
+                },
+                reason,
+            ));
+        }
+    };
+    let used_ids: std::collections::HashSet<i32> = copperpour_sexp::layers::layers(&tree)
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    let new_id = match (1..=30).find(|id| !used_ids.contains(id)) {
+        Some(id) => id,
+        None => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: "add_layer".to_string(),
+                    reasons: vec!["No free inner copper layer id: 1-30 are all in use".to_string()],
+                },
+                "No free inner copper layer id: 1-30 are all in use".to_string(),
             ))
         }
     };
@@ -3131,8 +3311,13 @@ async fn handle_add_mounting_hole(
     // nothing to say. Without a resolvable library, Copperpour's own NPTH
     // geometry is written under the same shipped name and the response says
     // so.
-    let library_source =
-        super::pcb_components::resolve_footprint_source(&spec.lib_id, &board_path).ok();
+    let library_source = super::pcb_components::resolve_footprint_file(&spec.lib_id, &board_path)
+        .ok()
+        .and_then(|path| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|source| (path, source))
+        });
     let geometry = if library_source.is_some() {
         "library"
     } else {
@@ -3140,7 +3325,7 @@ async fn handle_add_mounting_hole(
     };
     let text_offset = mounting_hole_text_offset(spec.drill_diameter_mm);
     let prepared = match &library_source {
-        Some(source) => {
+        Some((library_path, source)) => {
             match super::pcb_components::PreparedFootprintPlacement::from_library(
                 source,
                 &spec.lib_id,
@@ -3153,7 +3338,16 @@ async fn handle_add_mounting_hole(
                 board_path.parent(),
             ) {
                 Ok(prepared) => prepared,
-                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+                Err(error) => {
+                    let message = error.to_string();
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::MalformedFile {
+                            path: library_path.display().to_string(),
+                            reason: message.clone(),
+                        },
+                        message,
+                    ));
+                }
             }
         }
         None => super::pcb_components::PreparedFootprintPlacement::from_inline(
@@ -3616,11 +3810,27 @@ pub(crate) async fn add_zone_impl(
     let priority = args["priority"].as_u64().unwrap_or(0) as u32;
     let connection = match PadConnection::parse(args["pad_connection"].as_str()) {
         Ok(v) => v,
-        Err(message) => return Ok(CallToolResult::error(message)),
+        Err(message) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "pad_connection".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+            ))
+        }
     };
     let pts_arr = match args["points"].as_array() {
         Some(a) => a.clone(),
-        None => return Ok(CallToolResult::error("Missing 'points' array")),
+        None => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "points".to_string(),
+                    reason: "must be an array".to_string(),
+                },
+                "Missing 'points' array".to_string(),
+            ))
+        }
     };
 
     // A polygon is not a batch: a zone without one of its vertices covers
@@ -3637,7 +3847,13 @@ pub(crate) async fn add_zone_impl(
     }
 
     if points.len() < 3 {
-        return Ok(CallToolResult::error("Zone requires at least 3 points"));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "points".to_string(),
+                reason: "must contain at least 3 points".to_string(),
+            },
+            "Zone requires at least 3 points".to_string(),
+        ));
     }
 
     let describe = || {
@@ -3686,13 +3902,19 @@ pub(crate) async fn add_zone_impl(
     let content = read_consistent(&board_path)?;
     let tree = copperpour_sexp::parse_sexp(&content)?;
     let Some(net) = copperpour_sexp::net::net_ref_for_write(&tree, &net_name) else {
-        return Ok(CallToolResult::error(format!(
-            "Net '{net_name}' is not declared in {}'s net table. On this legacy-format board \
-             a zone must reference a declared net id — writing it anyway would attach the \
-             copper to net 0, the unconnected pseudo-net (#192). Declare it first with \
-             add_net, or check the name with get_nets_list.",
-            board_path.display()
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "net_name".to_string(),
+                reason: format!("net '{net_name}' is not declared in the board's net table"),
+            },
+            format!(
+                "Net '{net_name}' is not declared in {}'s net table. On this legacy-format board \
+                 a zone must reference a declared net id — writing it anyway would attach the \
+                 copper to net 0, the unconnected pseudo-net (#192). Declare it first with \
+                 add_net, or check the name with get_nets_list.",
+                board_path.display()
+            ),
+        ));
     };
     let zone_sexp = format_zone_polygon(
         &net, &layer, clearance, min_width, &points, &zone_name, priority, connection,
@@ -3742,8 +3964,13 @@ async fn handle_import_svg_logo(
     let svg_content = std::fs::read_to_string(&svg_path)?;
     let logo = crate::tools::svg_import::extract_polygons(&svg_content)?;
     if logo.polygons.is_empty() {
-        return Ok(CallToolResult::error(
-            "No fillable paths found in the SVG (only <path> elements are supported).",
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "svg".to_string(),
+                reason: "No fillable paths found in the SVG (only <path> elements are supported)."
+                    .to_string(),
+            },
+            "No fillable paths found in the SVG (only <path> elements are supported).".to_string(),
         ));
     }
 
@@ -5208,8 +5435,12 @@ mod board_session_safety_tests {
         let BoardWrite::Refused(result) = answer else {
             panic!("a refusal must not permit the file write")
         };
+        let text = super::mounting_hole_tests::result_text(&result);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["error"]["kind"], "invalid_argument");
+        assert_eq!(value["error"]["field"], "reference");
         assert_eq!(
-            super::mounting_hole_tests::result_text(&result),
+            value["message"],
             "The test write was not written: footprint R9 not found on board. The board file was \
              not modified."
         );
@@ -8349,5 +8580,459 @@ mod board_revision_tests {
                 "{name}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod structured_error_kind_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    async fn served_handler(ipc_address: String) -> McpHandler {
+        McpHandler::new(ServerConfig {
+            ipc_address,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn call_served(
+        handler: &McpHandler,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "{name} unexpectedly succeeded: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("{name} did not return structured JSON ({e}): {text}"))
+    }
+
+    #[tokio::test]
+    async fn served_pcb_board_refusals_return_structured_error_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = served_handler(String::new()).await;
+
+        // 1. add_layer: non-canonical layer name -> invalid_argument
+        let valid_board = dir.path().join("valid.kicad_pcb");
+        std::fs::write(
+            &valid_board,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\")\n  (layers\n    (0 \"F.Cu\" signal)\n    (31 \"B.Cu\" signal)\n  )\n)\n",
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "add_layer",
+            json!({ "board": valid_board, "layer_name": "NotAKiCadLayer" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "invalid_argument");
+        assert_eq!(err["error"]["field"], "layer_name");
+
+        // 2. add_layer: missing (layers) section -> malformed_file
+        let no_layers = dir.path().join("no_layers.kicad_pcb");
+        std::fs::write(
+            &no_layers,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\"))\n",
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "add_layer",
+            json!({ "board": no_layers, "layer_name": "In1.Cu" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "malformed_file");
+        assert!(err["message"]
+            .as_str()
+            .unwrap()
+            .contains("No (layers) section found"));
+
+        // 3. add_layer: all inner copper IDs 1..=30 in use -> plan_blocked
+        let full_layers = dir.path().join("full_layers.kicad_pcb");
+        let mut entries = String::from("    (0 \"F.Cu\" signal)\n");
+        for id in 1..=30 {
+            entries.push_str(&format!("    ({id} \"In{id}.Cu\" signal)\n"));
+        }
+        entries.push_str("    (31 \"B.Cu\" signal)\n");
+        std::fs::write(
+            &full_layers,
+            format!("(kicad_pcb (version 20241229) (generator \"pcbnew\")\n  (layers\n{entries}  )\n)\n"),
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "add_layer",
+            json!({ "board": full_layers, "layer_name": "User.1" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "plan_blocked");
+        assert_eq!(err["error"]["operation"], "add_layer");
+
+        // 4. add_layer: unbalanced (layers) block -> malformed_file
+        let unbalanced_layers = dir.path().join("unbalanced_layers.kicad_pcb");
+        std::fs::write(
+            &unbalanced_layers,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\")\n  (layers\n    (0 \"F.Cu\" signal)\n",
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "add_layer",
+            json!({ "board": unbalanced_layers, "layer_name": "In1.Cu" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "malformed_file");
+        assert!(err["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unbalanced (layers) block"));
+
+        // 5. set_board_size: non-segment Edge.Cuts -> plan_blocked
+        let arc_outline = dir.path().join("arc_outline.kicad_pcb");
+        std::fs::write(
+            &arc_outline,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\")\n  (gr_rect (start 0 0) (end 10 10) (layer \"Edge.Cuts\"))\n)\n",
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "set_board_size",
+            json!({ "board": arc_outline, "width": 50.0, "height": 40.0 }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "plan_blocked");
+        assert_eq!(err["error"]["operation"], "set_board_size");
+
+        // 6. get_board_extents: missing file -> file_not_found; malformed file -> malformed_file
+        let missing = dir.path().join("does_not_exist.kicad_pcb");
+        let err = call_served(
+            &handler,
+            "get_board_extents",
+            json!({ "board": missing, "board_source": "saved" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "file_not_found");
+
+        let malformed = dir.path().join("malformed.kicad_pcb");
+        std::fs::write(&malformed, "(kicad_pcb (unclosed").unwrap();
+        let err = call_served(
+            &handler,
+            "get_board_extents",
+            json!({ "board": malformed, "board_source": "saved" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "malformed_file");
+
+        // 7. get_layer_list: missing file -> file_not_found; missing (layers) -> malformed_file
+        let err = call_served(
+            &handler,
+            "get_layer_list",
+            json!({ "board": missing, "board_source": "saved" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "file_not_found");
+
+        let err = call_served(
+            &handler,
+            "get_layer_list",
+            json!({ "board": no_layers, "board_source": "saved" }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "malformed_file");
+
+        // 8. add_zone: invalid pad_connection, < 3 points, undeclared legacy net -> invalid_argument
+        let err = call_served(
+            &handler,
+            "add_zone",
+            json!({
+                "board": valid_board,
+                "net_name": "GND",
+                "layer": "F.Cu",
+                "pad_connection": "bogus",
+                "points": [{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0}]
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "invalid_argument");
+        assert_eq!(err["error"]["field"], "pad_connection");
+
+        let err = call_served(
+            &handler,
+            "add_zone",
+            json!({
+                "board": valid_board,
+                "net_name": "GND",
+                "layer": "F.Cu",
+                "points": [{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}]
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "invalid_argument");
+        assert_eq!(err["error"]["field"], "points");
+
+        let legacy_board = dir.path().join("legacy.kicad_pcb");
+        std::fs::write(
+            &legacy_board,
+            "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n  (net 0 \"\")\n  (net 1 \"VCC\")\n)\n",
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "add_zone",
+            json!({
+                "board": legacy_board,
+                "net_name": "GND",
+                "layer": "F.Cu",
+                "points": [{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0}]
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "invalid_argument");
+        assert_eq!(err["error"]["field"], "net_name");
+
+        // 9. import_svg_logo: SVG with no fillable <path> elements -> invalid_argument
+        let empty_svg = dir.path().join("empty.svg");
+        std::fs::write(
+            &empty_svg,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>",
+        )
+        .unwrap();
+        let err = call_served(
+            &handler,
+            "import_svg_logo",
+            json!({ "board": valid_board, "svg": empty_svg, "width_mm": 10.0 }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "invalid_argument");
+        assert_eq!(err["error"]["field"], "svg");
+
+        // 10. add_mounting_hole: malformed library footprint -> malformed_file (resolved .kicad_mod path);
+        //     missing board -> file_not_found; malformed board -> malformed_file; concurrent edit -> conflict
+        let hole_dir = dir.path().join("hole_lib");
+        let pretty = hole_dir.join("MountingHole.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let bad_mod = pretty.join("MountingHole_2.2mm_M2.kicad_mod");
+        std::fs::write(&bad_mod, "(footprint (broken").unwrap();
+        std::fs::write(
+            hole_dir.join("fp-lib-table"),
+            "(fp_lib_table\n  (version 7)\n  (lib (name \"MountingHole\")(type \"KiCad\")(uri \"${KIPRJMOD}/MountingHole.pretty\")(options \"\")(descr \"\")))\n",
+        )
+        .unwrap();
+        let hole_board = hole_dir.join("board.kicad_pcb");
+        std::fs::write(&hole_board, "(kicad_pcb (version 20241229))\n").unwrap();
+        let err = call_served(
+            &handler,
+            "add_mounting_hole",
+            json!({
+                "board": hole_board,
+                "x": 10.0,
+                "y": 10.0,
+                "drill_diameter": 2.2,
+                "reference": "H1"
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "malformed_file");
+        assert!(
+            err["error"]["path"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("MountingHole_2.2mm_M2.kicad_mod"),
+            "{err}"
+        );
+
+        let err = call_served(
+            &handler,
+            "add_mounting_hole",
+            json!({
+                "board": missing,
+                "x": 10.0,
+                "y": 10.0,
+                "drill_diameter": 2.2,
+                "reference": "H1"
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "file_not_found");
+
+        let err = call_served(
+            &handler,
+            "add_mounting_hole",
+            json!({
+                "board": malformed,
+                "x": 10.0,
+                "y": 10.0,
+                "drill_diameter": 2.2,
+                "reference": "H1"
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["kind"], "malformed_file");
+
+        let conflict_board = dir.path().join("conflict_hole.kicad_pcb");
+        let original = "(kicad_pcb (version 20241229) (generator \"pcbnew\"))\n";
+        let concurrent = "(kicad_pcb (version 20241229) (generator \"pcbnew\") (net 0 \"\"))\n";
+        std::fs::write(&conflict_board, original).unwrap();
+        crate::tools::write_hook::set(concurrent.to_string());
+        let err = call_served(
+            &handler,
+            "add_mounting_hole",
+            json!({
+                "board": conflict_board,
+                "x": 10.0,
+                "y": 10.0,
+                "drill_diameter": 2.2,
+                "reference": "H1"
+            }),
+        )
+        .await;
+        assert!(!crate::tools::write_hook::armed());
+        assert_eq!(err["error"]["kind"], "conflict");
+        assert_eq!(
+            err["error"]["paths"],
+            json!([conflict_board.display().to_string()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(&conflict_board).unwrap(),
+            concurrent
+        );
+
+        // 11. list_zones (pcb_board_zones): missing board -> file_not_found
+        let err = call_served(&handler, "list_zones", json!({ "board": missing })).await;
+        assert_eq!(err["error"]["kind"], "file_not_found");
+    }
+
+    #[tokio::test]
+    async fn direct_write_gates_and_readback_return_structured_kinds() {
+        use crate::test_support::MockIpcServer;
+        use board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+        use copperpour_ipc::gen::kiapi::common::{ApiResponse, ApiResponseStatus, ApiStatusCode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = mounting_hole_tests::blank_board(dir.path());
+
+        // 1. add_zone_impl with missing 'points' array -> invalid_argument
+        let ctx = ctx_talking_to(String::new());
+        let missing_points = add_zone_impl(
+            &json!({ "board": board, "net_name": "GND", "layer": "F.Cu" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&missing_points).as_deref(),
+            Some("invalid_argument")
+        );
+
+        // 2. refuse_if_board_open_in_kicad when exact board is open -> conflict
+        let open_server = spawn_kicad_holding_board(&board, |_| None);
+        let open_ctx = ctx_talking_to(open_server.address().to_string());
+        let refusal = refuse_if_board_open_in_kicad(&open_ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("open board must refuse");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("conflict")
+        );
+
+        // 3. attempt_ipc_write_in: LiveBoard::Unserved (NoPcbEditor & OpenDocumentsUnimplemented) -> editor_unavailable + recovery
+        for status_code in [ApiStatusCode::AsUnhandled, ApiStatusCode::AsUnimplemented] {
+            let unserved_server =
+                MockIpcServer::spawn("unserved-write-kind", move |_| ApiResponse {
+                    status: Some(ApiResponseStatus {
+                        status: status_code as i32,
+                        error_message: format!("status {status_code:?}"),
+                    }),
+                    header: None,
+                    message: None,
+                });
+            let unserved_ctx = ctx_talking_to(unserved_server.address().to_string());
+            let BoardWrite::Refused(res) =
+                attempt_ipc_write(&unserved_ctx, &board, "zone", |_| Ok(()))
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected refused for {status_code:?}");
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&mounting_hole_tests::result_text(&res)).unwrap();
+            assert_eq!(parsed["error"]["kind"], "editor_unavailable");
+            assert!(parsed["recovery"].is_object());
+        }
+
+        // 4. attempt_ipc_write_in: LiveBoard::Rejected -> handler_error + recovery
+        let reject_server = spawn_kicad_holding_board(&board, |_| None);
+        let reject_ctx = ctx_talking_to(reject_server.address().to_string());
+        let BoardWrite::Refused(res) =
+            attempt_ipc_write::<(), _>(&reject_ctx, &board, "zone", |_| {
+                Err(anyhow::anyhow!("synthetic rejection"))
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected refused for rejected write");
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&mounting_hole_tests::result_text(&res)).unwrap();
+        assert_eq!(parsed["error"]["kind"], "handler_error");
+        assert!(parsed["recovery"].is_object());
+
+        // 5. preflight_refusal_result with None kind -> plan_blocked (with recovery when kicad_status present)
+        let mut refusal = copperpour_ipc::PreflightRefusal::new(
+            copperpour_ipc::PreflightCause::CheckIncomplete,
+            "incomplete check",
+        );
+        refusal.kicad_status = Some("AS_BUSY".to_string());
+        let res = preflight_refusal_result("zone", &refusal, None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&mounting_hole_tests::result_text(&res)).unwrap();
+        assert_eq!(parsed["error"]["kind"], "plan_blocked");
+        assert!(parsed["recovery"].is_object());
+
+        // 6. verify_mounting_hole_readback: unreadable, absent, ambiguous -> mutation_outcome_uncertain
+        let missing_path = dir.path().join("gone.kicad_pcb");
+        let err = verify_mounting_hole_readback(&missing_path, "H1").unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&err).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+
+        let absent_err = verify_mounting_hole_readback(&board, "H99").unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&absent_err).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+
+        let dup_board = dir.path().join("dup.kicad_pcb");
+        std::fs::write(
+            &dup_board,
+            "(kicad_pcb (version 20241229)\n  (footprint \"MountingHole:M2\" (property \"Reference\" \"H1\"))\n  (footprint \"MountingHole:M2\" (property \"Reference\" \"H1\"))\n)\n",
+        )
+        .unwrap();
+        let dup_err = verify_mounting_hole_readback(&dup_board, "H1").unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&dup_err).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
     }
 }

@@ -958,12 +958,26 @@ fn zone_json(zone: &ZoneRecord) -> Value {
 }
 
 fn canonical_board(args: &Value) -> Result<PathBuf, CallToolResult> {
-    let path = get_path(args, "board").map_err(|error| CallToolResult::error(error.to_string()))?;
+    let path = get_path(args, "board").map_err(|error| {
+        let message = error.to_string();
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "board".to_string(),
+                reason: message.clone(),
+            },
+            message,
+        )
+    })?;
     path.canonicalize().map_err(|error| {
-        CallToolResult::error(format!(
-            "Could not resolve board path '{}': {error}",
-            path.display()
-        ))
+        let message = format!("Could not resolve board path '{}': {error}", path.display());
+        let kind = if error.kind() == std::io::ErrorKind::NotFound {
+            ToolErrorKind::file_not_found(&path)
+        } else {
+            ToolErrorKind::HandlerError {
+                reason: message.clone(),
+            }
+        };
+        CallToolResult::error_kind(kind, message)
     })
 }
 
@@ -1592,6 +1606,22 @@ mod tests {
         let error = decode_ipc_zones(&[item])
             .expect_err("wrong Any type URL must not be decoded as a zone");
         assert!(format!("{error:#}").contains("unexpected type URL"));
+    }
+
+    #[test]
+    fn canonical_board_errors_carry_structured_kinds() {
+        let missing_arg = canonical_board(&json!({})).unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&missing_arg).as_deref(),
+            Some("invalid_argument")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing.kicad_pcb");
+        let not_found = canonical_board(&json!({ "board": missing_path })).unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&not_found).as_deref(),
+            Some("file_not_found")
+        );
     }
 
     #[tokio::test]
