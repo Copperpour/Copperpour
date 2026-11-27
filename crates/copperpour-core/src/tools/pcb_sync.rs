@@ -6783,6 +6783,7 @@ mod tests {
                     size: 1.0,
                     stroke_width_mm: 0.15,
                     keep_upright: true,
+                    style: Default::default(),
                 },
             ],
             &copperpour_ipc::IpcFieldPlacement::default(),

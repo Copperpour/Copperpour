@@ -417,6 +417,51 @@ fn text_size(node: &copperpour_sexp::SexpNode) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// The rest of a text's `(effects …)`: glyph width, bold, italic, line
+/// spacing and `(justify …)`. KiCad writes the font size as `(size height
+/// width)`. A flag is `(bold yes)` from KiCad 8, a bare `bold` before.
+fn text_style(node: &copperpour_sexp::SexpNode) -> copperpour_ipc::IpcTextStyle {
+    use copperpour_ipc::{IpcTextHorizontal, IpcTextStyle, IpcTextVertical};
+
+    let mut style = IpcTextStyle::default();
+    let Some(effects) = node.find("effects") else {
+        return style;
+    };
+    if let Some(font) = effects.find("font") {
+        let flag = |name: &str| {
+            font.find_str(name) == Some("yes")
+                || font
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|child| child.as_str() == Some(name))
+        };
+        style.bold = flag("bold");
+        style.italic = flag("italic");
+        if let Some(spacing) = font.find_f64("line_spacing") {
+            style.line_spacing = spacing;
+        }
+        if let Some(size) = font.find("size") {
+            if let (Some(height), Some(width)) = (size.get_f64(1), size.get_f64(2)) {
+                style.width = (width != height).then_some(width);
+            }
+        }
+    }
+    if let Some(justify) = effects.find("justify") {
+        for value in justify.children().unwrap_or_default().iter().skip(1) {
+            match value.as_str() {
+                Some("left") => style.horizontal = IpcTextHorizontal::Left,
+                Some("right") => style.horizontal = IpcTextHorizontal::Right,
+                Some("top") => style.vertical = IpcTextVertical::Top,
+                Some("bottom") => style.vertical = IpcTextVertical::Bottom,
+                Some("mirror") => style.mirrored = true,
+                _ => {}
+            }
+        }
+    }
+    style
+}
+
 /// Explicit font stroke width, falling back to KiCad's 15%-of-size default.
 fn text_stroke_width(node: &copperpour_sexp::SexpNode) -> f64 {
     node.find("effects")
@@ -587,6 +632,7 @@ fn extract_graphic_definitions_with_properties(
             size: text_size(text),
             stroke_width_mm: text_stroke_width(text),
             keep_upright: text_keeps_upright(text),
+            style: text_style(text),
         });
     }
     let properties = if include_properties {
@@ -618,6 +664,7 @@ fn extract_graphic_definitions_with_properties(
             size: text_size(property),
             stroke_width_mm: text_stroke_width(property),
             keep_upright: text_keeps_upright(property),
+            style: text_style(property),
         });
     }
     Ok(graphics)
@@ -11124,7 +11171,7 @@ mod nanometre_rounding_tests {
     }
 
     /// A footprint with features typed placement cannot carry (footprint zone,
-    /// `fp_text user` with `justify`) is still placed (`isError: false`) and
+    /// `fp_text user` with a font face) is still placed (`isError: false`) and
     /// every uncarried feature is listed in `not_carried`.
     #[tokio::test]
     async fn place_component_with_unsupported_clauses_places_and_reports_not_carried() {
@@ -11137,7 +11184,7 @@ mod nanometre_rounding_tests {
   (layer "F.Cu")
   (property "Reference" "REF**" (at 0 -2 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
   (property "Value" "Test_Part" (at 0 2 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
-  (fp_text user "NOTE" (at 0 0 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15)) (justify left)))
+  (fp_text user "NOTE" (at 0 0 0) (layer "F.SilkS") (effects (font (face "Arial") (size 1 1) (thickness 0.15)) (justify left)))
   (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu" "F.Mask"))
   (zone (net 0) (net_name "") (layer "F.Cu"))
 )"#;
@@ -11167,7 +11214,8 @@ mod nanometre_rounding_tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         let joined = not_carried.join(" | ");
-        assert!(joined.contains("justify"), "{joined}");
+        assert!(joined.contains("font clause 'face'"), "{joined}");
+        assert!(!joined.contains("justify"), "{joined}");
         assert!(joined.contains("zone"), "{joined}");
     }
 
