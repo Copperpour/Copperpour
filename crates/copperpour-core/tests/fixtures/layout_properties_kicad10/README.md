@@ -39,8 +39,8 @@ independent KiCad export result.
 | `formatting_and_reordering_variant_records_is_allowed` | Served-only normalization control with the same literal key and value. |
 | `parent_variant_dnp_affects_its_children` | Prior KiCad 10.0.8 [review evidence] verified the fitted `Lite` BOM drops D1 for this saved placement override. |
 | Placement and Component Class comparisons | See the rule-area cases below for the current guard. |
-| `changed_saved_input_to_exported_expression_blocks` | Served-only coarse refusal for changed saved page input. |
-| `field_move_with_a_substituted_variant_override_is_not_proven_layout` | Served-only coarse refusal. No claim that the move changes the expansion. |
+| `changed_saved_input_to_exported_expression_blocks` | Served-only refusal naming the field that reads the changed page. |
+| `field_move_with_a_substituted_variant_override_is_layout_only` | Served-only acceptance when the move leaves the saved `Lite` page dependency unchanged. |
 | `competing_instance_records_keep_their_order_and_multiplicity` and `repeated_child_instances_do_not_hide_an_order_change` | Served-only instance ambiguity cases from the split review. The guard does not guess which record KiCad uses. |
 | `legacy_and_default_instance_export_inputs_are_guarded` and `duplicate_field_suffixes_cannot_hide_reordered_exports` | Served-only cases from the split review. No native result is claimed for these exact edits. |
 | Root UUID, legacy simulation order, legacy defaults with variant overrides, and repeated instance text | Served-only parser-compatibility regressions. They exercise saved inputs that the normalized view does not resolve. |
@@ -61,8 +61,8 @@ literal-variant pair uses these SHA-256 hashes:
 The served tests can copy their exact before and after schematics to an empty
 audit directory for KiCad XML and BOM exports. The comparator reads only the
 test's two input files, not the audit copies or project used for native exports.
-This increment adds no fixture files. The copies below start from the KiCad-saved
-inputs listed in `SHA256SUMS`. Deliberately ambiguous records are parser controls,
+The copies below start from the KiCad-saved inputs listed in `SHA256SUMS`.
+Deliberately ambiguous records are parser controls,
 not examples of normal KiCad output.
 
 | String-built case | Native evidence |
@@ -106,3 +106,10 @@ not examples of normal KiCad output.
 [appends the points]: https://github.com/KiCad/kicad-source-mirror/blob/10.0.8/eeschema/sch_io/kicad_sexpr/sch_io_kicad_sexpr_parser.cpp#L4190-L4207
 [applies each directive position]: https://github.com/KiCad/kicad-source-mirror/blob/10.0.8/eeschema/sch_io/kicad_sexpr/sch_io_kicad_sexpr_parser.cpp#L4672-L4696
 [loads legacy `~` as empty]: https://github.com/KiCad/kicad-source-mirror/blob/10.0.8/eeschema/sch_io/kicad_sexpr/sch_io_kicad_sexpr_parser.cpp#L2327-L2333
+
+## Saved text expressions
+
+[`net-name`](net-name/sparse.kicad_sch.README.md) contains the KiCad-saved
+directive move pair. Both tested KiCad versions export R2's `${NET_NAME(1)}`
+as `/SIG_C` on both sides. The remaining expression probes check the served
+comparator only; they make no claims about exact native output.

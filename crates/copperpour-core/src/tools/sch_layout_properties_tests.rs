@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "sch_layout_expression_tests.rs"]
+mod expressions;
+
 async fn edit(handler: &McpHandler, sheet: &Sheet, mut args: Value) {
     args["reference"] = json!("R1");
     ok(handler, sheet, "edit_schematic_component", args).await;
@@ -1264,10 +1267,13 @@ async fn changed_saved_input_to_exported_expression_blocks() {
     replace_once(&now, "(page \"1\")", "(page \"2\")");
     let result = compare(&handler, &was, &now, &[]).await;
     assert_verdict(&result, "blocked");
-    assert_eq!(result["reasons"], json!([format!(
-        "symbol {} (R1) cannot establish unchanged field \"BOM Comments\": exported text uses a substitution",
-        symbol_uuid(&was, "R1"),
-    )]));
+    assert_eq!(
+        result["reasons"],
+        json!([format!(
+            "symbol {} (R1) changed field \"BOM Comments\"",
+            symbol_uuid(&was, "R1"),
+        )])
+    );
     assert_eq!(
         compare(&handler, &was, &was.fork(), &[]).await["reasons"],
         json!([])
@@ -1275,15 +1281,12 @@ async fn changed_saved_input_to_exported_expression_blocks() {
 }
 
 #[tokio::test]
-async fn field_move_with_a_substituted_variant_override_is_not_proven_layout() {
+async fn field_move_with_a_substituted_variant_override_is_layout_only() {
     let was = native_sheet("variant-value");
     replace_once(&was, "(value \"1\")", "(value \"${#}\")");
     let now = was.fork();
     move_r1_reference(&now);
     let result = compare(&handler().await, &was, &now, &[]).await;
-    assert_verdict(&result, "blocked");
-    assert_eq!(result["reasons"], json!([format!(
-        "symbol {} (R1) cannot establish unchanged field \"Value\": exported text uses a substitution",
-        symbol_uuid(&was, "R1"),
-    )]));
+    assert_verdict(&result, "unchanged");
+    assert_eq!(result["reasons"], json!([]));
 }

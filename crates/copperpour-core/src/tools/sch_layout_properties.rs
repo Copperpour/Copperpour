@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "sch_layout_areas.rs"]
 mod areas;
+#[path = "sch_layout_expressions.rs"]
+mod expressions;
 
 type Instances<'a> = BTreeMap<(&'a str, &'a str), &'a SexpNode>;
 type Fields<'a> = BTreeMap<&'a str, &'a str>;
@@ -532,41 +534,6 @@ fn opaque_expression(value: &str) -> bool {
     value.contains("${") || value.contains("@{") || value.contains("{dollar}")
 }
 
-fn expression_field(item: &SexpNode, version: u32) -> Option<&str> {
-    // Include forwarded duplicate fields and raw variant overrides. An
-    // exported expression can also refer to private text on another item.
-    fields(item, version)
-        .into_iter()
-        .chain(ordered_fields(item).filter_map(|(name, value, private)| {
-            (!private || item.head() == Some("sheet")).then_some((name, value))
-        }))
-        .chain(instance_records(item).flat_map(|(_, record)| {
-            ["reference", "value", "footprint"]
-                .into_iter()
-                .flat_map(|name| record_values(record, name).map(move |value| (name, value)))
-        }))
-        .chain(
-            item.find_all("default_instance")
-                .into_iter()
-                .flat_map(|record| {
-                    ["value", "footprint"].into_iter().flat_map(|name| {
-                        record_values(record, name).map(move |value| (name, value))
-                    })
-                }),
-        )
-        .chain(
-            instance_records(item)
-                .flat_map(|(_, path)| path.find_all("variant"))
-                .flat_map(|variant| {
-                    variant.find_all("field").into_iter().flat_map(|field| {
-                        let name = field.find_str("name").unwrap_or("variant field");
-                        record_values(field, "value").map(move |value| (name, value))
-                    })
-                }),
-        )
-        .find_map(|(name, value)| opaque_expression(value).then_some(name))
-}
-
 fn record_values<'a>(record: &'a SexpNode, name: &str) -> impl Iterator<Item = &'a str> {
     record
         .find_all(name)
@@ -574,87 +541,11 @@ fn record_values<'a>(record: &'a SexpNode, name: &str) -> impl Iterator<Item = &
         .filter_map(|node| node.get(1)?.as_str())
 }
 
-fn class_field(item: &SexpNode) -> bool {
-    item.find_all("property")
-        .into_iter()
-        .filter_map(property)
-        .any(|(name, value, _)| {
-            name.eq_ignore_ascii_case("Component Class") && opaque_expression(value)
-        })
-        || instance_records(item)
-            .flat_map(|(_, path)| path.find_all("variant"))
-            .any(|variant| {
-                variant.find_all("field").into_iter().any(|field| {
-                    field
-                        .find_str("name")
-                        .is_some_and(|name| name.eq_ignore_ascii_case("Component Class"))
-                        && field.find_str("value").is_some_and(opaque_expression)
-                })
-            })
-}
-
-fn area_has_indirect_inputs(tree: &SexpNode) -> bool {
-    placements(tree).any(|item| {
-        item.find_all("property")
-            .into_iter()
-            .filter_map(property)
-            .any(|(_, value, _)| opaque_expression(value))
-    }) || ["directive_label", "netclass_flag"]
-        .into_iter()
-        .any(|tag| tree.find_all(tag).into_iter().any(class_field))
-}
-
 pub(super) fn uncertain_changes((old, new): (&Source<'_>, &Source<'_>), reasons: &mut Vec<String>) {
     if old.tree == new.tree {
         return;
     }
-    // Do not guess what an expression reads. The identical-input shortcut is
-    // above; otherwise any saved edit could have changed its expansion.
-    for source in [old, new] {
-        for item in placements(source.tree) {
-            let uuid = item.find_str("uuid").unwrap_or("?");
-            if let Some(field) = expression_field(item, source.version) {
-                reasons.push(format!(
-                    "{} cannot establish unchanged field {field:?}: exported text uses a substitution",
-                    subject(item, source, uuid),
-                ));
-                return;
-            }
-            if class_field(item) {
-                reasons.push(format!(
-                    "{} cannot establish unchanged Component Class: its saved text uses a substitution",
-                    subject(item, source, uuid),
-                ));
-                return;
-            }
-        }
-    }
-    // Without area bounds we cannot prove a changed placement is out of reach.
-    // Include library and area records too: either can change reachability.
-    if [old, new].iter().any(|source| {
-        source.tree.find("rule_area").is_some() && area_has_indirect_inputs(source.tree)
-    }) {
-        let previous: BTreeMap<_, _> = placements(old.tree)
-            .filter_map(|item| Some(((item.head()?, item.find_str("uuid")?), item)))
-            .collect();
-        let with_id = |item: &SexpNode| item.find_str("uuid").is_some();
-        let changed = placements(new.tree)
-            .filter(|item| with_id(item))
-            .find(|item| {
-                let key = (
-                    item.head().unwrap_or_default(),
-                    item.find_str("uuid").unwrap_or_default(),
-                );
-                previous.get(&key).copied() != Some(*item)
-            });
-        if let Some(item) = changed.or_else(|| placements(new.tree).find(|item| with_id(item))) {
-            let uuid = item.find_str("uuid").unwrap_or_default();
-            reasons.push(format!(
-                "{} cannot establish unchanged rule-area effects: saved text uses a substitution",
-                subject(item, new, uuid),
-            ));
-            return;
-        }
-    }
-    areas::changes(old, new, reasons);
+    let comparison = expressions::Comparison::new(old, new);
+    areas::changes(old, new, &comparison, reasons);
+    expressions::changes(&comparison, reasons);
 }
