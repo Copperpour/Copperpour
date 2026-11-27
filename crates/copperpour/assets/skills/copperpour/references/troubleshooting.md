@@ -25,10 +25,12 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
    MCP server. For installed guidance drift, use `copperpour status`.
 3. **Perform an already-authorized, safe recovery step** when its prerequisites
    are established: for example, call `load_toolset` when the client supports
-   dynamic discovery, pass an absolute filesystem path, or give the user the
-   returned `url` when `open_schematic_viewer` reports `browser_launch_error`
-   with a running loopback service. Avoid unnecessary confirmation for read-only
-   diagnostics and already-authorized safe steps.
+   dynamic discovery, pass an absolute filesystem path, call `open_board` (from
+   `verification`) with the requested `.kicad_pcb` path when no PCB editor holds
+   that board, or give the user the returned `url` when `open_schematic_viewer`
+   reports `browser_launch_error` with a running loopback service. Avoid
+   unnecessary confirmation for read-only diagnostics and already-authorized
+   safe steps.
 4. **Retry only when outcome and operation semantics establish safety**, after
    correcting the cause. Never loop blindly, replay already-applied batch
    items, or automatically replay recovered/aborted IPC batches
@@ -95,9 +97,13 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
   when evidence is unavailable, and preserve uncertainty about the cause.
   A responding endpoint can still lack a ready PCB Editor or open PCB
   document. Verify the exact board before calling live tools.
-- **Wrong board or "KiCAD must be running with the board loaded":** Ask the
-  user to open the exact `.kicad_pcb` in PCB Editor with KiCad IPC enabled.
-  Do not substitute another open board or edit the saved file.
+- **Wrong board, no PCB editor, or "KiCAD must be running with the board loaded":**
+  Load `verification` and call `open_board` with the exact `.kicad_pcb` path
+  first so Copperpour finds an existing `pcbnew` endpoint holding that board or
+  launches PCB Editor and binds its IPC endpoint. Only if `open_board` cannot
+  reach the board (for example, IPC API disabled or no display), ask the user to
+  open the exact `.kicad_pcb` in PCB Editor with KiCad IPC enabled. Do not
+  substitute another open board or edit the saved file.
 - **Ambiguous endpoints / stale `api.lock`:** When `ipc_failure` lists multiple
   candidate sockets, report the candidates and ask the user to either close
   extra KiCad instances or set `ipc_address` (from KiCad Preferences ->

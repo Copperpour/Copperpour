@@ -57,7 +57,7 @@ When a call fails, returns partial/uncertain results, or tools/KiCad behave unex
 
 1. **Classify before acting** — inspect the complete response (`error.kind` or status, target, source, and mutation outcome). Consume structured recovery fields when present (the `recovery` block on IPC failures, `retry_safe`, `board_state`, `drop_confirmed`, `browser_launch_error`, `absolute_path`) without inventing missing fields on older responses.
 2. **Diagnose read-only** — inspect `prerequisite_health` from `get_installation_info` for cached KiCad CLI and IPC findings. After repairing setup, request `refresh_prerequisite_health: true` or restart the MCP server for a fresh observation. Use `get_recent_calls`, `check_kicad_ui`, or exact target inspection for operation-specific failures.
-3. **Take safe, already-authorized steps** — e.g. `load_toolset` when discovery is supported, pass absolute paths, or share the returned `url` when `open_schematic_viewer` reports `browser_launch_error`.
+3. **Take safe, already-authorized steps** — e.g. `load_toolset` when discovery is supported, pass absolute paths, call `open_board` (in `verification`) when a live PCB tool reports the requested board is not open in a PCB editor, or share the returned `url` when `open_schematic_viewer` reports `browser_launch_error`.
 4. **Retry only when safe** — fix the cause first and retry only when outcome semantics allow it; never loop, replay applied batch items, or auto-replay `ipc_batch_recovered`.
 5. **Escalate with exact context** — state what happened, what changed or remains uncertain, and the exact next command, config change, or reference; ask only for what cannot be resolved from evidence.
 6. **Verify recovery** — confirm with a fresh observation before resuming dependent work.
@@ -98,7 +98,7 @@ Never send pending reports without the user's answer. If the user does not choos
 
 ## KiCAD 10 IPC API Reality
 
-**PCB Editor (pcbnew):** Full CRUD via NNG + protobuf. Real-time communication with running KiCAD instance. Create, read, update, delete any PCB item with immediate UI refresh. **Requires KiCAD to be running.**
+**PCB Editor (pcbnew):** Full CRUD via NNG + protobuf. Real-time communication with running KiCAD instance. Create, read, update, delete any PCB item with immediate UI refresh. **Requires KiCAD to be running** — load `verification` and call `open_board` with the `.kicad_pcb` path to open it in `pcbnew` and bind its IPC endpoint before live PCB work.
 
 **Schematic Editor (eeschema):** No item-level IPC API. Copperpour uses a validated S-expression engine (SchematicBuilder) that enforces correct structure, ordering, and UUID integrity. File-based — **does not require KiCAD to be running.**
 
