@@ -17,6 +17,8 @@ const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";
 const DIRECT_LANES: &str = "direct_lanes_kicad10/direct_lanes.kicad_sch";
 const TOOL: &str = "compare_schematic_layout";
 
+#[path = "sch_layout_area_style_tests.rs"]
+mod area_style;
 #[path = "sch_layout_properties_tests.rs"]
 mod properties;
 

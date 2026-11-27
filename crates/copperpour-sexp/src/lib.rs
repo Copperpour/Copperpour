@@ -11,6 +11,7 @@ pub mod parser;
 pub mod paths;
 pub mod prettify;
 pub mod schematic;
+pub mod schematic_rule_area;
 pub mod text_bounds;
 pub mod title_block;
 pub mod transaction;

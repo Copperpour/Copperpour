@@ -27,9 +27,14 @@ The comparison checks saved fields and export flags, including per-project and
 per-path variant overrides and settings on child-sheet placements. It does not
 open child sheets or project files. Moving field text on a placement with a
 literal variant override is allowed when no unresolved inputs can affect exports.
-For now, a placement edit on a sheet with a rule area, an edit to a possible
-Component Class input, or a saved change that could affect an exported text
-expression is refused. The comparison does not evaluate those effects.
+When the saved root instance supplies an unambiguous reference, changing only
+the superseded placed Reference does not itself change symbol identity.
+The comparison uses saved rule-area outlines and placement bounds to compare
+effective export flags and Component Classes. If it cannot prove a placement's
+membership, it refuses the change. It also refuses edits when an attached
+directive may assign a Netclass, since the comparison cannot prove those
+assignments are unchanged. It still refuses saved edits that could affect
+exported text expressions without evaluating their expansion.
 
 For each retained symbol, the comparison checks `lib_name`, the embedded
 definition's jumper flag and groups, included library fields, and unit or
