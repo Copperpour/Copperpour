@@ -586,9 +586,11 @@ async fn power_lead_shortens_and_the_cleaned_sheet_has_no_second_step() {
 
     let (steps, _, candidate) = plan_with_candidate(
         FIELDS,
+        &Sheet::new(&tree).unwrap(),
         Region::new(0.0, 0.0, 200.0, 200.0),
         &BTreeSet::from(["#PWR03".into()]),
         MAX_CLEANUP_STEPS,
+        |_, _| {},
     )
     .unwrap()
     .unwrap();
@@ -887,9 +889,11 @@ async fn zero_length_lead_gets_a_stub_that_removes_one_pin_contact() {
     assert_eq!(power["length_before_mm"], 0.0);
     let (_, _, candidate) = plan_with_candidate(
         CROWDED,
+        &Sheet::new(&parse_sexp(CROWDED).unwrap()).unwrap(),
         Region::new(0.0, 0.0, 200.0, 200.0),
         &BTreeSet::from(["#PWR05".into()]),
         MAX_CLEANUP_STEPS,
+        |_, _| {},
     )
     .unwrap()
     .unwrap();
@@ -1143,7 +1147,7 @@ fn clearance_refuses_a_new_wire_through_a_symbol_body() {
     );
 }
 
-fn with_redundant_power() -> String {
+pub(super) fn with_redundant_power() -> String {
     let source = insert_before_close(
         CROWDED,
         r##"(symbol (lib_id "power:+3V3") (at 139.7 68.58 0) (unit 1)
@@ -1231,7 +1235,7 @@ async fn another_copy_of_the_rail_elsewhere_is_not_redundancy() {
         .all(|step| step["power_symbols_removed"] == json!([])));
 }
 
-fn crowded_with_no_connect() -> String {
+pub(super) fn crowded_with_no_connect() -> String {
     let source = insert_before_close(
         CROWDED,
         r#"(no_connect (at 63.5 113.03) (uuid "00000000-0000-4000-8000-000000000100"))"#,

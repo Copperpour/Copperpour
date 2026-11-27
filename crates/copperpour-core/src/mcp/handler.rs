@@ -873,6 +873,13 @@ impl McpHandler {
                     classify_transaction_conflict(path, journal, kind, name)
                 }
                 Err(e) => {
+                    if let Some(refusal) = e
+                        .chain()
+                        .find_map(|cause| crate::tools::non_regular_write_refusal(cause, name))
+                    {
+                        let kind = extract_error_kind(&refusal);
+                        return (refusal, CallStatus::Error, kind);
+                    }
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
                     let kind = ToolErrorKind::HandlerError {
                         reason: e.to_string(),

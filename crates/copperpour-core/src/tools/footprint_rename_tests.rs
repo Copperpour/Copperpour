@@ -147,6 +147,43 @@ async fn a_rename_that_changes_only_the_case_is_allowed() {
     assert!(files[0].1.contains("ffc_fh12.step"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn case_only_rename_refuses_the_existing_link_before_moving_it() {
+    assert_case_only_rename_refuses_link(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_case_only_rename_refuses_a_link_at_the_new_name() {
+    assert_case_only_rename_refuses_link(true).await;
+}
+
+#[cfg(unix)]
+async fn assert_case_only_rename_refuses_link(interrupted: bool) {
+    let (dir, library) = library(&[]);
+    let upper = OLD.to_ascii_uppercase();
+    let (linked, absent) = if interrupted {
+        (upper.as_str(), OLD)
+    } else {
+        (OLD, upper.as_str())
+    };
+    let target = dir.path().join("standalone.kicad_mod");
+    std::fs::write(&target, SOURCE).unwrap();
+    let link = library.join(format!("{linked}.kicad_mod"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let (error, body) = rename(&library, OLD, &upper).await;
+    assert!(error, "{body}");
+    assert_eq!(body["error"]["kind"], "invalid_write_target", "{body}");
+    assert_eq!(body["error"]["path"], json!(link), "{body}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    let entries = files(&library);
+    assert_eq!(entries.len(), 1);
+    assert_ne!(entries[0].0, format!("{absent}.kicad_mod"));
+    assert_eq!(std::fs::read(target).unwrap(), SOURCE.as_bytes());
+}
+
 #[tokio::test]
 async fn a_name_already_in_the_library_is_refused() {
     let (_dir, library) = library(&[(OLD, SOURCE), ("Other", OTHER)]);

@@ -502,13 +502,16 @@ therefore carries a warning describing that cold-start limitation.
 `error.kind: "invalid_configuration"` when a Copperpour preferences file exists
 but cannot be used. `error.path` names the file and `error.reason` starts with
 `malformed_json:` (invalid JSON, or a root that is not an object — often a
-truncated write or a hand edit) or `unreadable:` (permissions, a directory at
-that path, invalid UTF-8).
+truncated write or a hand edit), `unreadable:` (permissions, a directory at
+that path, invalid UTF-8), or `non_regular_file:` (a save target is a symbolic
+link or another non-regular entry).
 
 Older versions answered with their defaults here, and the next save then replaced
 the file with them. It now refuses and writes nothing, so your settings are
-still in the file. Open it, fix the JSON (or move it aside to start again from
-the defaults), and retry. The user file is `%APPDATA%\copperpour\config.json` on
+still in the file. For `non_regular_file:`, use a regular file at the config
+path; fixing the JSON does not fix a symbolic link. Otherwise fix the JSON or
+the read error (or move the file aside to start again from defaults), then
+retry. The user file is `%APPDATA%\copperpour\config.json` on
 Windows, `~/Library/Application Support/copperpour/config.json` on macOS and
 `~/.copperpour/config.json` elsewhere; a project's is
 `<project_dir>/.copperpour/project.json`.

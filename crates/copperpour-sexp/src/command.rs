@@ -29,11 +29,17 @@ impl DocumentRevision {
     /// Compute a deterministic revision token for `source`.
     #[must_use]
     pub fn of(source: &str) -> Self {
+        Self::of_bytes(source.as_bytes())
+    }
+
+    /// Compute the revision before attempting to decode the saved bytes.
+    #[must_use]
+    pub fn of_bytes(source: &[u8]) -> Self {
         // FNV-1a is deliberately implemented locally: this token is an
         // identity hint, not a security boundary, and exact strings remain the
         // transaction precondition.
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in source.as_bytes() {
+        for byte in source {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }

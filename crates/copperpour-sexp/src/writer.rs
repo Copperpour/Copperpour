@@ -147,18 +147,23 @@ pub(crate) fn write_atomic_unlocked_with(
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
     after_publish();
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::check_after_publish(path)?;
     sync_parent_directory(parent_directory(path))?;
     Ok(())
 }
 
 /// Atomically replace `path` only when it still contains `expected`.
 ///
-/// A stable sibling lock serializes participating writers. The exact source
-/// comparison also catches changes made by applications that do not honor the
-/// advisory lock, including KiCad itself.
+/// A document lock serializes participating writers. The exact source
+/// comparison also catches outside saves visible before the final check;
+/// writers that ignore the lock can still race the subsequent rename. The
+/// replacement target must be a regular file, not a symbolic link. A
+/// non-regular entry at the first check is invalid input; one found at the
+/// final check is a conflict.
 ///
 /// `Conflict` means nothing was written. `ReadbackMismatch` means the file
-/// was replaced but no longer holds `content`, so the outcome is uncertain.
+/// was replaced but the directory sync or readback could not verify the result.
 pub fn write_atomic_if_unchanged(
     path: &Path,
     expected: &str,
@@ -168,19 +173,59 @@ pub fn write_atomic_if_unchanged(
 
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks::run_before_compare(path);
-    let current = read_string_unlocked(path)?;
-    if current != expected {
-        return Err(SexpError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
+    let check_revision = |initial: bool| {
+        let matches_expected = || -> Result<bool, SexpError> {
+            // Refuse non-files before opening: reads would follow symlinks
+            // or block on a pipe, but rename would replace the entry itself.
+            if !std::fs::symlink_metadata(path)?.is_file() {
+                if initial {
+                    return Err(SexpError::NonRegularWriteTarget {
+                        path: path.to_path_buf(),
+                    });
+                }
+                return Ok(false);
+            }
+            Ok(std::fs::read(path)? == expected.as_bytes())
+        };
+        match matches_expected() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(SexpError::Conflict {
+                path: path.to_path_buf(),
+            }),
+            Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(SexpError::Conflict {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    };
+    check_revision(true)?;
 
-    write_atomic_unlocked(path, content)?;
+    // Saving the scratch file can take time. Check again after staging so an
+    // outside writer that changed the destination during that time wins.
+    let mut replaced = false;
+    let result = write_atomic_unlocked_with(
+        path,
+        content,
+        || Ok(()),
+        || check_revision(false),
+        || replaced = true,
+    );
+    result.map_err(|error| {
+        if replaced {
+            SexpError::ReadbackMismatch {
+                path: path.to_path_buf(),
+            }
+        } else {
+            error
+        }
+    })?;
     read_back(path, content)
 }
 
-/// Delete `path` if it still holds `expected`, under the same lock and
-/// comparison as [`write_atomic_if_unchanged`].
+/// Delete `path` under the document lock if its current text matches `expected`.
+/// Failure to read the file, including a missing file, is an I/O error.
 ///
 /// `Conflict` means the file changed after the caller read it, and nothing
 /// was deleted.
@@ -228,11 +273,17 @@ pub mod test_hooks {
         BeforeCompare,
         BeforeReplace,
         BeforeFinalCheck,
+        RemoveBeforeFinalCheck,
+        DirectoryBeforeFinalCheck,
+        SyncFailure,
+        #[cfg(unix)]
+        LinkBeforeFinalCheck,
     }
 
-    static SAVES: Mutex<Vec<(PathBuf, Moment, String)>> = Mutex::new(Vec::new());
+    type Armed = (PathBuf, Moment, Vec<u8>);
+    static SAVES: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
 
-    fn saves() -> MutexGuard<'static, Vec<(PathBuf, Moment, String)>> {
+    fn saves() -> MutexGuard<'static, Vec<Armed>> {
         SAVES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -245,27 +296,68 @@ pub mod test_hooks {
         directory.join(path.file_name().unwrap_or_default())
     }
 
+    fn arm(path: &Path, when: Moment, bytes: Vec<u8>) {
+        saves().push((key(path), when, bytes));
+    }
+
     /// Save `content` to `path` after the next write replaces it, before
     /// that write reads it back.
     pub fn save_after_replace(path: &Path, content: impl Into<String>) {
-        saves().push((key(path), Moment::AfterReplace, content.into()));
+        arm(path, Moment::AfterReplace, content.into().into_bytes());
     }
 
     /// Save `content` to `path` once the next write holds its lock, before
     /// that write compares the file with what its caller read.
     pub fn save_before_compare(path: &Path, content: impl Into<String>) {
-        saves().push((key(path), Moment::BeforeCompare, content.into()));
+        arm(path, Moment::BeforeCompare, content.into().into_bytes());
     }
 
     /// Create `path`'s KiCad editor lock file with `content` right before the
     /// next write's final lock recheck and rename.
     pub fn lock_before_replace(path: &Path, content: impl Into<String>) {
-        saves().push((key(path), Moment::BeforeReplace, content.into()));
+        arm(path, Moment::BeforeReplace, content.into().into_bytes());
     }
 
     /// Save to a replacement target after the scratch write and final lock check.
     pub fn save_before_final_check(path: &Path, content: impl Into<String>) {
-        saves().push((key(path), Moment::BeforeFinalCheck, content.into()));
+        save_bytes_before_final_check(path, content.into().into_bytes());
+    }
+
+    /// Play back bytes that are not necessarily valid UTF-8.
+    pub fn save_bytes_before_final_check(path: &Path, bytes: Vec<u8>) {
+        arm(path, Moment::BeforeFinalCheck, bytes);
+    }
+
+    /// Delete the target after staging but before the final revision check.
+    pub fn remove_before_final_check(path: &Path) {
+        arm(path, Moment::RemoveBeforeFinalCheck, Vec::new());
+    }
+
+    /// Swap the target for a directory containing `sentinel` before the final check.
+    pub fn directory_before_final_check(path: &Path, sentinel: &str) {
+        arm(
+            path,
+            Moment::DirectoryBeforeFinalCheck,
+            sentinel.as_bytes().to_vec(),
+        );
+    }
+
+    /// Replace the target entry with a symbolic link before the final check.
+    #[cfg(unix)]
+    pub fn link_before_final_check(path: &Path, target: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        arm(
+            path,
+            Moment::LinkBeforeFinalCheck,
+            target.as_os_str().as_bytes().to_vec(),
+        );
+    }
+
+    /// Fail directory sync after the next rename already published this file.
+    /// This path-keyed hook is also available to dependent crates, unlike the
+    /// thread-local sync fault used by the writer's own tests.
+    pub fn fail_directory_sync_after_replace(path: &Path) {
+        arm(path, Moment::SyncFailure, Vec::new());
     }
 
     /// Whether a save armed for `path` is still waiting for a write.
@@ -288,25 +380,51 @@ pub mod test_hooks {
 
     pub(super) fn run_before_final_check(path: &Path) {
         run_at(path, Moment::BeforeFinalCheck);
+        if take(path, Moment::RemoveBeforeFinalCheck).is_some() {
+            std::fs::remove_file(path).unwrap();
+        }
+        if let Some(sentinel) = take(path, Moment::DirectoryBeforeFinalCheck) {
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("sentinel"), sentinel).unwrap();
+        }
+        #[cfg(unix)]
+        if let Some(target) = take(path, Moment::LinkBeforeFinalCheck) {
+            use std::os::unix::{ffi::OsStrExt, fs::symlink};
+            std::fs::remove_file(path).unwrap();
+            symlink(std::ffi::OsStr::from_bytes(&target), path).unwrap();
+        }
+    }
+
+    pub(super) fn check_after_publish(path: &Path) -> Result<(), super::SexpError> {
+        if take(path, Moment::SyncFailure).is_some() {
+            return Err(std::io::Error::other("injected directory sync failure").into());
+        }
+        Ok(())
+    }
+
+    fn take(path: &Path, moment: Moment) -> Option<Vec<u8>> {
+        let mut saves = saves();
+        if saves.is_empty() {
+            return None;
+        }
+        let key = key(path);
+        let index = saves
+            .iter()
+            .position(|(armed, when, _)| *armed == key && *when == moment)?;
+        Some(saves.remove(index).2)
     }
 
     fn run_at(path: &Path, moment: Moment) {
-        let mut saves = saves();
-        if saves.is_empty() {
-            return;
-        }
-        let key = key(path);
-        if let Some(index) = saves
-            .iter()
-            .position(|(armed, when, _)| *armed == key && *when == moment)
-        {
-            let (_, _, content) = saves.remove(index);
-            let target = if moment == Moment::BeforeReplace {
-                super::kicad_editor_lock_path(path).expect("document has a KiCad lock path")
+        let editor_lock = moment == Moment::BeforeReplace;
+        if let Some(content) = take(path, moment) {
+            if editor_lock {
+                let lock =
+                    super::kicad_editor_lock_path(path).expect("document has a KiCad lock path");
+                std::fs::write(lock, content).unwrap();
             } else {
-                path.to_path_buf()
-            };
-            std::fs::write(target, content).unwrap();
+                std::fs::write(path, content).unwrap();
+            }
         }
     }
 }

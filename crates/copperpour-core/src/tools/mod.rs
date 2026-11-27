@@ -2065,14 +2065,34 @@ pub(crate) fn revision_conflict_result(path: &std::path::Path, operation: &str) 
     changed_after_read(path, what, operation)
 }
 
+pub(crate) fn non_regular_write_refusal(
+    error: &(dyn std::error::Error + 'static),
+    operation: &str,
+) -> Option<CallToolResult> {
+    let path = match (error.downcast_ref(), error.downcast_ref()) {
+        (Some(copperpour_sexp::SexpError::NonRegularWriteTarget { path }), _)
+        | (_, Some(copperpour_schematic_editor::Error::NonRegularWriteTarget(path))) => path,
+        _ => return None,
+    };
+    let path = copperpour_sexp::paths::display_path(path);
+    let reason = "use the actual file path, not a symbolic link or another non-regular entry";
+    Some(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidWriteTarget {
+            path: path.clone(),
+            reason: reason.to_owned(),
+        },
+        format!("{operation} wrote nothing to '{path}': {reason}."),
+    ))
+}
+
 /// The `mutation_outcome_uncertain` result for a write `operation` that
 /// replaced `path` but could not read it back as written.
 pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) -> CallToolResult {
     mutation_outcome_uncertain(
         path,
         operation,
-        "the file was replaced, but did not read back as written; another program may have \
-         saved it in between",
+        "the file was replaced, but directory sync or readback could not verify it. \
+         Another program may have saved it in between",
     )
 }
 
@@ -2226,9 +2246,9 @@ pub(crate) fn install_schematic_editor_owners() {
     copperpour_sexp::writer::set_editor_owners(schematic_editor_owners);
 }
 
-/// The `conflict` refusal for a schematic write that `error` shows never
-/// happened: KiCad's editor lock blocked it, or the file changed after it was
-/// read. Single-file writers check both before the rename, so the file is as
+/// The refusal for a schematic write that `error` shows never happened:
+/// KiCad's editor lock blocked it, the path was not a regular file, or the
+/// file changed after it was read. The checks precede rename, so the file is as
 /// it was (#427); a transaction only before its journal. `None` for any other
 /// error, which may come after the rename.
 pub(crate) fn unwritten_schematic_refusal(
@@ -2237,6 +2257,9 @@ pub(crate) fn unwritten_schematic_refusal(
 ) -> Option<CallToolResult> {
     use copperpour_schematic_editor::Error as EditorError;
     use copperpour_sexp::SexpError;
+    if let Some(refusal) = non_regular_write_refusal(error, operation) {
+        return Some(refusal);
+    }
     if let Some(locked) = kicad_editor_lock(error) {
         // `paths` names the schematic, as dispatch's lock refusal does.
         let shown = copperpour_sexp::paths::display_path(locked.path);

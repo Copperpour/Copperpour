@@ -47,6 +47,7 @@ use super::PlacedPins;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::sch_cleanup::apply::definition(),
         tool!(
             "batch_connect_to_net",
             "Connect multiple component pins to a named net. By default it adds a net label \

@@ -1180,7 +1180,7 @@ impl RouteGuard {
 
     /// Each point whose items `after` puts on `a`'s net although they were on
     /// no allowed net before.
-    fn foreign_joins(&self, after: &copperpour_sexp::SexpNode) -> Vec<String> {
+    pub(super) fn foreign_joins(&self, after: &copperpour_sexp::SexpNode) -> Vec<String> {
         let labels = copperpour_sexp::schematic::extract_all_net_labels(after);
         let mut graph =
             crate::tools::sch_connectivity::net_graph_for(after, &extract_wires(after), &labels);
