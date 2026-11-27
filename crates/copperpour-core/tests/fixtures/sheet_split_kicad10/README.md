@@ -61,3 +61,45 @@ Selecting just the four LED symbols leaves C1 alone on the parent. C1.1 shares t
 to support, and U1 reaches those rails by power names alone. A split that includes C1
 keeps the whole drawn supply branch, and the sheet interface is still one signal and two
 global rails. After a split of the LED driver, KiCad names `/LED_K` as `/LED/LED_K`.
+
+## Planner controls
+
+The served split tests reconstruct variants and check each SHA-256 against the file
+KiCad 10.0.8 wrote with `kicad-cli sch upgrade --force`. This avoids storing nearly
+identical copies. The variants keep the `split` project file and sheet basename:
+
+- Replace `LED_EN` with the bus label `DATA[0..7]`, without adding bus segments.
+- Change the embedded `+5V` power symbol from global to sheet-local.
+- Rename the internal `LED_K` local label to `SER`. That is the name the planner
+  would otherwise suggest for the separate signal on `R3.2`.
+- Change the embedded electrical type of `U1.15` from `tri_state` to
+  `bidirectional`, then select the two sides of the `LED_EN` boundary separately.
+- Change C1's first embedded pin from `passive` to `input`. The drawn branch remains.
+- Replace the drawn link from C1 to R2 with a separate `+5V` placement at the R2
+  end. The supply name still joins their pins, but the drawn islands are separate.
+- Make `LED_EN` global without changing the wires, to check the scope decision.
+- Add another `LED_EN` label on an island with no component pins. The existing
+  drawn crossing remains.
+- Set `#PWR08`'s value to `${LED_RAIL}`, with the saved project variable set to
+  `+5V`. The planner refuses the expression rather than treating it as a net name.
+- Add an output alternate `SER_OUT` to `U1.14`, then activate it in a second copy.
+- Use `A/B` and `A{slash}B`, then `A|B` and `A{bar}B`, as an embedded pin and a
+  local label or as two embedded pin names. The planner refuses equivalent ports.
+- Hide `U1.16` and name its library pin `+5V`, then activate its `VDD_ALT`
+  alternate in a second copy. The alternate changes the pin display, not the rail.
+- Add a drawn wire from the `U1.16` supply island to the C1 and R2 branch.
+  `U1.16` is no longer a name-only alternative, but the `+5V` pin set is unchanged.
+- On that wired variant, extend the `U1.16` pin and adjust its wire and power
+  symbol. C1.1 and U1.16 are within 25.4 mm even though their symbol origins
+  are farther apart. Both KiCad versions export the same `+5V` members.
+- Change R3 and R4 to `R?` in their properties and instance records to check
+  that unannotated pull-ups do not block a plan for the LED driver.
+- Remove C1's embedded pins and its matching placed pin records. A genuine
+  pinless symbol differs from a placed symbol whose saved geometry is unresolved.
+- Rename the embedded `SER` pin `DATA[0..7]` or `${SER}`. KiCad still exports
+  the existing scalar net; neither spelling is safe to suggest as a new port.
+
+The sheet-exit test similarly adds a `SPLIT` local label to the retained sheet-pin
+wire in a copy of `single_pin_nets.kicad_sch` and checks the KiCad-resaved bytes.
+Tests that deliberately corrupt fields start from saved fixtures, but their invalid
+copies are not KiCad output.

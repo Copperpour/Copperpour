@@ -107,7 +107,7 @@ fn brace_depth(text: &str) -> usize {
 /// back to its character. Formatting (`~{…}`, `_{…}`, `^{…}`) and variables
 /// (`${…}`) are kept as written. A name nested deeper than
 /// [`MAX_BRACE_DEPTH`] is returned as it is.
-fn unescaped(source: &str) -> String {
+pub(super) fn unescaped(source: &str) -> String {
     let chars: Vec<char> = source.chars().collect();
     if chars.len() <= 2 || brace_depth(source) > MAX_BRACE_DEPTH {
         return source.to_string();
@@ -402,7 +402,7 @@ fn bus_group(group: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// KiCad's `SCH_CONNECTION::IsBusLabel`, which reads the unescaped name.
-fn is_bus_name(name: &str) -> bool {
+pub(super) fn is_bus_name(name: &str) -> bool {
     let text = unescaped(name);
     bus_vector(&text).is_some() || bus_group(&text).is_some()
 }
