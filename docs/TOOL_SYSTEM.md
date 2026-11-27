@@ -96,8 +96,8 @@ A response must describe what the backend observed or committed, not merely echo
 what the caller requested. This rule is especially important across IPC and CLI
 boundaries:
 
-- `tools/pcb_sync.rs` compares the post-commit board with the footprint shapes
-  it sent and reports or refuses mismatches.
+- `tools/pcb_sync/live_board.rs` compares the post-commit board with the
+  footprint shapes sent to the editor and identifies mismatches.
 - `tools/cli.rs` derives DRC results from every category KiCad reports rather
   than treating an absent finding in one category as a clean board.
 - `tools/design_review.rs` and `tools/manufacturing.rs` require DRC evidence for

@@ -665,14 +665,6 @@ fn unlinked_instance(
     instance
 }
 
-// The two branches below test `symbol_path.is_none()`, so before #452 they
-// were unreachable for a board-only footprint: every one of them wore the
-// synthetic identity `/`. Reading absence correctly wakes both, which
-// changes plans on boards that never hit the duplicate-identity bug at all.
-// They are pinned here so the consequence is a decision rather than a
-// discovery. Note `board_resistor` leaves `not_in_schematic` false — a
-// footprint KiCad has not flagged — which is what makes them reachable.
-
 /// R1 linked to its symbol, R3 whose symbol left the schematic, and MH1,
 /// which has no symbol and the board-only attribute (#861).
 fn footprints_without_symbols() -> (ExportedDesign, BoardState) {

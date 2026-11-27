@@ -57,7 +57,7 @@ Treat success, counts, and verdicts as claims that require evidence.
   `tools/cli.rs` must retain design-rule violations, unconnected items, and
   schematic parity because each category can independently make a board fail.
 - After a risky IPC transformation, compare a bounded post-state with what was
-  sent. `tools/pcb_sync.rs` is the reference for a commit plus read-back check.
+  sent. See the post-commit read-back check in `tools/pcb_sync/live_board.rs`.
 
 ## Errors And Compatibility
 
