@@ -34,8 +34,8 @@ that field. Reference cases include:
 - complete DRC category parsing in `tools/cli.rs`;
 - DRC-backed review/readiness decisions in `tools/design_review.rs` and
   `tools/manufacturing.rs`;
-- footprint-type discrimination and post-commit read-back in
-  `tools/pcb_sync.rs` and `copperpour-ipc/src/builders.rs`;
+- footprint-type discrimination in `copperpour-ipc/src/builders.rs` and
+  post-commit read-back in `tools/pcb_sync/live_board.rs`;
 - closed-board placement and flip refusal cases in `tools/pcb_components.rs`.
 
 Use real KiCad-generated fixtures for formats KiCad owns. For an IPC path, unit

@@ -1144,6 +1144,10 @@ fn a_schematic_backed_footprint_still_reads_its_identity() {
     );
 }
 
+// The adoption and possible-rename tests below exercise planner branches that
+// require `symbol_path.is_none()`. Before #452, empty sheet paths decoded as
+// `/`, so neither branch was reachable for these footprints. The captured
+// footprint has `not_in_schematic` set to false, which lets it match a symbol.
 #[test]
 fn issue_452_an_unlinked_footprint_the_schematic_names_is_adopted_not_refused() {
     let design = ExportedDesign {
