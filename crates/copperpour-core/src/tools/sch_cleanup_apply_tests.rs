@@ -529,6 +529,26 @@ async fn apply_checks_foreign_joins_in_a_drawn_step() {
 }
 
 #[tokio::test]
+async fn apply_refuses_a_step_whose_route_geometry_cannot_be_checked() {
+    let sheet = SavedSheet::new("crowded").await;
+    let project = fs::read(sheet.path.with_extension("kicad_pro")).unwrap();
+    let (preview, args) = sheet.preview(&[]).await;
+    assert_eq!(preview["steps"].as_array().unwrap().len(), 1);
+    sheet.arm_fault(Fault::ShallowDiagonal);
+    let refusal = sheet.refuses(args, "plan_blocked").await;
+    assert_eq!(refusal["operation"], TOOL);
+    assert_eq!(
+        refusal["reasons"],
+        json!(["the cleanup route cannot be checked on a sheet with a near-axis diagonal wire"])
+    );
+    assert_eq!(sheet.written(), sheet.original);
+    assert_eq!(
+        fs::read(sheet.path.with_extension("kicad_pro")).unwrap(),
+        project
+    );
+}
+
+#[tokio::test]
 async fn unfinished_plan_is_blocked_without_writing_a_prefix() {
     let sheet = SavedSheet::new("crowded").await;
     let (_, args) = sheet.preview(&["C1", "#PWR05"]).await;
@@ -677,6 +697,7 @@ pub(super) enum Fault {
     None,
     DropRoute,
     JoinSigA,
+    ShallowDiagonal,
     LoseDot,
     RetainDot(String),
     StepLimit(usize),
@@ -718,6 +739,27 @@ impl Fault {
             )
             .unwrap()
             .into(),
+            Self::ShallowDiagonal => {
+                // Copy the diagonal from the KiCad-resaved route witness into
+                // the in-memory candidate, where the apply recheck sees it.
+                let fixture = include_str!(
+                    "../../tests/fixtures/label_attachment_kicad10/shallow-wire-route/opamp_stage.kicad_sch"
+                );
+                let diagonal = find_direct_child_blocks(fixture, "kicad_sch")
+                    .into_iter()
+                    .map(|(start, end)| &fixture[start..end])
+                    .find(|block| {
+                        let node = parse_sexp(block).unwrap();
+                        node.head() == Some("wire") && {
+                            let points = node.find("pts").unwrap().find_all("xy");
+                            points[0].get_f64(1) != points[1].get_f64(1)
+                                && points[0].get_f64(2) != points[1].get_f64(2)
+                        }
+                    })
+                    .expect("the shallow-wire fixture contains a diagonal");
+                let at = source.rfind(')').unwrap();
+                format!("{}\n{diagonal}\n{}", &source[..at], &source[at..]).into()
+            }
             _ => source.into(),
         }
     }

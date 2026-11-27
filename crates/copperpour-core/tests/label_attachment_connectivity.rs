@@ -7,6 +7,8 @@ const EXACT: &str = include_str!("fixtures/label_attachment_kicad10/exact/opamp_
 const OFFSET: &str = include_str!("fixtures/label_attachment_kicad10/offset/opamp_stage.kicad_sch");
 const ENDPOINT_OFFSET: &str =
     include_str!("fixtures/label_attachment_kicad10/endpoint-offset/opamp_stage.kicad_sch");
+const PAST_TRUNK_END: &str =
+    include_str!("fixtures/label_attachment_kicad10/past-trunk-end/opamp_stage.kicad_sch");
 const CROSSING: &str =
     include_str!("fixtures/label_attachment_kicad10/crossing/opamp_stage.kicad_sch");
 const JUNCTION: &str =
@@ -199,6 +201,11 @@ async fn an_exact_label_names_j2s_wire() {
 #[tokio::test]
 async fn a_label_at_a_distinct_saved_endpoint_coordinate_stays_separate() {
     assert_membership(ENDPOINT_OFFSET, false).await;
+}
+
+#[tokio::test]
+async fn a_label_two_saved_units_past_the_trunk_end_does_not_name_it() {
+    assert_membership(PAST_TRUNK_END, false).await;
 }
 
 #[tokio::test]
