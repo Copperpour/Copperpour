@@ -3457,6 +3457,143 @@ mod schema_validation_dispatch_tests {
     }
 
     #[tokio::test]
+    async fn create_footprint_silkscreen_and_courtyards_over_json_rpc() {
+        use copperpour_sexp::parser::{parse_sexp, SexpNode};
+
+        let handler = handler().await;
+        let load = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1150, "method": "tools/call",
+                "params": {"name": "load_toolset", "arguments": {"name": ["library"]}}
+            }))
+            .await
+            .unwrap();
+        assert!(load.error.is_none(), "{load:?}");
+        let directory = tempfile::tempdir().unwrap();
+
+        for (mode, pad_layers, second_layers, plated, expected_courtyards) in [
+            (
+                None,
+                json!(["B.Cu", "B.Mask"]),
+                json!(["B.Cu"]),
+                false,
+                ["B.CrtYd"].as_slice(),
+            ),
+            (
+                Some("none"),
+                json!(["B.Cu"]),
+                json!(["B.Cu"]),
+                false,
+                &["B.CrtYd"],
+            ),
+            (
+                Some("pin1_only"),
+                json!(["F.Cu"]),
+                json!(["F.Cu"]),
+                false,
+                &["F.CrtYd"],
+            ),
+            (
+                Some("outline"),
+                json!(["*.Cu"]),
+                json!(["F.Cu"]),
+                false,
+                &["B.CrtYd", "F.CrtYd"],
+            ),
+            (
+                None,
+                json!(["F.Cu"]),
+                json!(["B.Cu"]),
+                false,
+                &["B.CrtYd", "F.CrtYd"],
+            ),
+            (
+                None,
+                json!(["F.Cu"]),
+                json!(["F.Cu"]),
+                true,
+                &["B.CrtYd", "F.CrtYd"],
+            ),
+        ] {
+            let output = directory.path().join("created.kicad_mod");
+            let mut pad = json!({"number": "1", "type": "smd", "shape": "rect",
+                "x": -2, "y": 0, "width": 1, "height": 1, "layers": pad_layers});
+            if plated {
+                pad["type"] = json!("thru_hole");
+                pad["drill"] = json!(0.5);
+            }
+            let mut arguments = json!({
+                "output": output, "name": "Test", "replace_existing": true,
+                "pads": [pad, {"number": "2", "type": "smd", "shape": "rect",
+                    "x": 2, "y": 0, "width": 1, "height": 1, "layers": second_layers}]
+            });
+            if let Some(mode) = mode {
+                arguments["silkscreen"] = json!(mode);
+            }
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1151, "method": "tools/call",
+                    "params": {"name": "create_footprint", "arguments": arguments}
+                }))
+                .await
+                .unwrap();
+            let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+            assert!(!result.is_error, "{mode:?}: {result:?}");
+            let content = std::fs::read_to_string(&output).unwrap();
+            let fp = parse_sexp(&content).unwrap();
+            fn layer(item: &SexpNode) -> Option<&str> {
+                item.find("layer")
+                    .and_then(|layer| layer.get(1))
+                    .and_then(SexpNode::as_str)
+            }
+            let rectangles: Vec<_> = fp
+                .find_all("fp_rect")
+                .iter()
+                .filter_map(|item| layer(item))
+                .collect();
+            let courtyards: Vec<_> = rectangles
+                .iter()
+                .copied()
+                .filter(|layer| layer.ends_with(".CrtYd"))
+                .collect();
+            assert_eq!(courtyards, expected_courtyards, "{arguments:?}");
+            let outline = matches!(mode, None | Some("outline"));
+            assert_eq!(rectangles.contains(&"F.SilkS"), outline, "{mode:?}");
+            let marker = mode != Some("none");
+            let dots = fp.find_all("fp_circle");
+            assert_eq!(dots.len(), usize::from(marker), "{mode:?}");
+            if let Some(dot) = dots.first() {
+                assert_eq!(layer(dot), Some("F.SilkS"));
+                let center = dot.find("center").unwrap();
+                let x = center.get_f64(1).unwrap();
+                assert!((-1.11..0.0).contains(&x), "pin-1 dot center: {x}");
+            }
+            assert_eq!(layer(fp.find("property").unwrap()), Some("F.SilkS"));
+            assert!(fp.find("fp_poly").is_some(), "fab chamfer for {mode:?}");
+            assert_eq!(error_json(&result)["pin1_marked"], marker);
+
+            if mode == Some("none") {
+                let mut invalid = arguments;
+                invalid["silkscreen"] = json!("invalid");
+                let response = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0", "id": 1152, "method": "tools/call",
+                        "params": {"name": "create_footprint", "arguments": invalid}
+                    }))
+                    .await
+                    .unwrap();
+                let result: CallToolResult =
+                    serde_json::from_value(response.result.unwrap()).unwrap();
+                assert!(result.is_error);
+                let error = error_json(&result);
+                assert_eq!(error["error"]["kind"], "invalid_argument");
+                assert_eq!(error["error"]["field"], "silkscreen");
+                assert_eq!(std::fs::read_to_string(&output).unwrap(), content);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn create_footprint_refuses_existing_file_and_allows_explicit_replace_over_json_rpc() {
         let handler = handler().await;
         let load = handler
