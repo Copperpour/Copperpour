@@ -35,11 +35,18 @@ use copperpour_sexp::{
     geometry::{point_on_segment, points_coincident, PinTransform},
     schematic::{
         extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
-        pin_endpoint, wire_end_needs_junction, Label, LabelKind, LibPin, SymbolInstance, Wire,
+        extract_symbol_instances, find_lib_symbol, pin_endpoint, wire_end_needs_junction, Label,
+        LabelKind, LibPin, SymbolInstance, Wire,
     },
     SexpNode,
 };
+use std::cell::OnceCell;
+use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+#[cfg(test)]
+#[path = "sch_power_driver_tests.rs"]
+mod power_driver_tests;
 
 /// The coincidence tolerance the connectivity tools have always used, in mm.
 /// `find_orphan_items` takes its own as an argument; the rest use this.
@@ -267,20 +274,17 @@ struct NetName {
     power_local: bool,
 }
 
-/// KiCad's net-name precedence, highest first: a global label outranks a power
-/// symbol, which outranks a local label, which outranks a hierarchical one.
+/// KiCad's same-sheet driver order, from `CONNECTION_SUBGRAPH::PRIORITY`.
+/// Sheet pins and ordinary pins are below these ranks and resolved separately.
 ///
-/// Verified against KiCad 10.0.5 by netlisting one net carrying each pair:
-/// `+3V3` power symbol with a `LOCAL_VCC` label nets as `+3V3`, either with a
-/// `GLOBAL_SYS` global label nets as `GLOBAL_SYS`, and a local label beats a
-/// hierarchical one. It is `CONNECTION_SUBGRAPH`'s driver priority, minus the
-/// sheet-pin and pin ranks below it — neither names a net here.
-fn driver_priority(kind: LabelKind) -> u8 {
-    match kind {
-        LabelKind::GlobalLabel => 3,
-        LabelKind::PowerSymbol => 2,
-        LabelKind::NetLabel => 1,
-        LabelKind::HierarchicalLabel => 0,
+/// The mixed power and label cases have netlist witnesses on 10.0.6 and 10.0.8.
+fn driver_priority(driver: &NetName) -> u8 {
+    match (driver.kind, driver.power_local) {
+        (LabelKind::GlobalLabel, _) => 4,
+        (LabelKind::PowerSymbol, false) => 3,
+        (LabelKind::PowerSymbol, true) => 2,
+        (LabelKind::NetLabel, _) => 1,
+        (LabelKind::HierarchicalLabel, _) => 0,
     }
 }
 
@@ -288,8 +292,7 @@ fn driver_priority(kind: LabelKind) -> u8 {
 /// the name, ascending, which is KiCad's own tie-break (two local labels on one
 /// net gave `AAA` over `LOCAL_VCC`, and `LOCAL_VCC` over `ZZZ`).
 fn names_ahead_of(a: &NetName, b: &NetName) -> bool {
-    let (pa, pb) = (driver_priority(a.kind), driver_priority(b.kind));
-    pa > pb || (pa == pb && (&a.name, a.power_local) < (&b.name, b.power_local))
+    (Reverse(driver_priority(a)), &a.name) < (Reverse(driver_priority(b)), &b.name)
 }
 
 /// A net's identity: the union-find root every point on that net resolves to.
@@ -377,10 +380,6 @@ impl NetGraph {
         self.union(a, b);
     }
 
-    fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
-        self.add_driver(x, y, net, kind, false);
-    }
-
     fn add_driver(&mut self, x: f64, y: f64, net: &str, kind: LabelKind, power_local: bool) {
         let k = (self.point_key)(x, y);
         self.ensure(k);
@@ -427,6 +426,15 @@ impl NetGraph {
 
     pub(super) fn scoped_name_of_root(&self, root: NetRoot) -> Option<ScopedNetName> {
         self.root_names.get(&root).map(scoped_name)
+    }
+
+    pub(super) fn primary_name_is_global(&self, root: NetRoot) -> bool {
+        self.root_names.get(&root).is_some_and(|name| {
+            matches!(
+                (name.kind, name.power_local),
+                (LabelKind::GlobalLabel, _) | (LabelKind::PowerSymbol, false)
+            )
+        })
     }
 
     /// The winner and each scoped alias on its net. Roots are local to one
@@ -560,12 +568,11 @@ fn scoped_name(name: &NetName) -> (String, u8) {
     (name.name.clone(), scope)
 }
 
-/// Seed a graph from the terminals that name and join nets. Both
-/// [`net_graph_for`] and [`ConnectivityIndex::net_graph`] come through here, so
-/// the two cannot answer differently.
+/// Seed a graph from the terminals that name and join nets.
 ///
-/// Labels and junction dots connect anywhere along a wire, not only at an
-/// endpoint, so each is unioned with every wire it lies on.
+/// Drawn labels and junction dots connect anywhere along a wire, not only at
+/// an endpoint. Power symbols name the node at their pin, which needs an
+/// endpoint or junction to reach a wire.
 ///
 /// Sheet pins are only *registered*, never attached mid-span. A hierarchical
 /// sheet pin is a pin, and KiCad connects a pin landing mid-wire only through a
@@ -576,57 +583,57 @@ fn scoped_name(name: &NetName) -> (String, u8) {
 /// that pin carries, inventing a short KiCad does not see. Registering the
 /// point is still worth doing, so a query at a sheet pin resolves its net.
 fn seed_net_graph(
+    tree: &SexpNode,
     wires: &[Wire],
     labels: &[Label],
-    junctions: &[(f64, f64)],
-    sheet_pins: &[(f64, f64)],
     on_wire: &WireIndex,
 ) -> NetGraph {
-    seed_drawn_graph(wires, labels, junctions, sheet_pins, on_wire).into_named_nets()
+    seed_drawn_graph(tree, wires, labels, on_wire).into_named_nets()
 }
 
 fn seed_drawn_graph(
+    tree: &SexpNode,
     wires: &[Wire],
     labels: &[Label],
-    junctions: &[(f64, f64)],
-    sheet_pins: &[(f64, f64)],
     on_wire: &WireIndex,
 ) -> NetGraph {
-    seed_drawn_graph_with(
-        wires,
-        labels,
-        junctions,
-        sheet_pins,
-        pt_key,
-        |graph, x, y, _| {
-            for w in on_wire.hits(x, y) {
-                graph.union(pt_key(x, y), pt_key(w.x1, w.y1));
-            }
-        },
-    )
+    seed_drawn_graph_with(tree, wires, labels, pt_key, |graph, x, y| {
+        for w in on_wire.hits(x, y) {
+            graph.union(pt_key(x, y), pt_key(w.x1, w.y1));
+        }
+    })
 }
 
 fn seed_drawn_graph_with(
+    tree: &SexpNode,
     wires: &[Wire],
     labels: &[Label],
-    junctions: &[(f64, f64)],
-    sheet_pins: &[(f64, f64)],
     point_key: fn(f64, f64) -> NetRoot,
-    attach: impl Fn(&mut NetGraph, f64, f64, Option<LabelKind>),
+    attach: impl Fn(&mut NetGraph, f64, f64),
 ) -> NetGraph {
     let mut graph = NetGraph::new(point_key);
     for wire in wires {
         graph.add_wire(wire);
     }
+    let local_power = OnceCell::new();
     for label in labels {
-        graph.add_label(label.x, label.y, &label.net, label.kind);
-        attach(&mut graph, label.x, label.y, Some(label.kind));
+        // Recover the power scope from the placed symbol.
+        let power_local = match (label.kind, label.uuid.as_deref()) {
+            (LabelKind::PowerSymbol, Some(uuid)) => local_power
+                .get_or_init(|| local_power_symbol_uuids(tree))
+                .contains(uuid),
+            _ => false,
+        };
+        graph.add_driver(label.x, label.y, &label.net, label.kind, power_local);
+        if label.kind != LabelKind::PowerSymbol {
+            attach(&mut graph, label.x, label.y);
+        }
     }
-    for &(x, y) in junctions {
+    for (x, y) in extract_junctions(tree) {
         graph.ensure(point_key(x, y));
-        attach(&mut graph, x, y, None);
+        attach(&mut graph, x, y);
     }
-    for &(x, y) in sheet_pins {
+    for (x, y) in extract_sheet_pins(tree) {
         graph.ensure(point_key(x, y));
     }
     graph
@@ -660,10 +667,9 @@ pub(crate) fn label_roots<'a>(
 /// read-only tools use.
 pub(crate) fn net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
     seed_net_graph(
+        tree,
         wires,
         labels,
-        &extract_junctions(tree),
-        &extract_sheet_pins(tree),
         &WireIndex::build(wires, COINCIDENT_TOLERANCE),
     )
 }
@@ -672,10 +678,9 @@ pub(crate) fn net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -
 /// symbols are queried as pins, not attached mid-span as labels.
 pub(super) fn drawn_net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
     seed_drawn_graph(
+        tree,
         wires,
         labels,
-        &extract_junctions(tree),
-        &extract_sheet_pins(tree),
         &WireIndex::build(wires, COINCIDENT_TOLERANCE),
     )
 }
@@ -695,18 +700,11 @@ pub(super) fn kicad_schematic_mm(mm: f64) -> f64 {
 /// Use saved-coordinate equality for redraws without changing legacy queries.
 pub(super) fn redraw_net_graph(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
     let index = WireIndex::with_coordinates(wires, DRAWN_ATTACHMENT_TOLERANCE, kicad_schematic_mm);
-    seed_drawn_graph_with(
-        wires,
-        labels,
-        &extract_junctions(tree),
-        &extract_sheet_pins(tree),
-        redraw_point_key,
-        |graph, x, y, _| {
-            for wire in index.hits(x, y) {
-                graph.union(redraw_point_key(x, y), redraw_point_key(wire.x1, wire.y1));
-            }
-        },
-    )
+    seed_drawn_graph_with(tree, wires, labels, redraw_point_key, |graph, x, y| {
+        for wire in index.hits(x, y) {
+            graph.union(redraw_point_key(x, y), redraw_point_key(wire.x1, wire.y1));
+        }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -724,6 +722,23 @@ impl SymbolPower {
             Some(_) => Self::Global,
         }
     }
+}
+
+fn local_power_symbol_uuids(tree: &SexpNode) -> HashSet<String> {
+    let libraries = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    extract_symbol_instances(tree)
+        .into_iter()
+        .filter_map(|instance| {
+            let lib = find_lib_symbol(&libraries, &instance)?;
+            match SymbolPower::from_library(lib) {
+                SymbolPower::Local => instance.uuid,
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Add node-only drivers from the pins chosen by the caller. A hidden power
@@ -780,24 +795,17 @@ pub(super) fn cleanup_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
 /// Cleanup's electrical graph uses saved schematic units for both keyed
 /// endpoints and drawn attachments, including those along diagonal wires.
 pub(super) fn exact_drawn_net_graph(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
-    let mut graph = seed_drawn_graph_with(
-        wires,
-        labels,
-        &extract_junctions(tree),
-        &extract_sheet_pins(tree),
-        schematic_point,
-        |graph, x, y, _| {
-            for wire in wires.iter().filter(|w| schematic_point_on_wire((x, y), w)) {
-                graph.union(schematic_point(x, y), schematic_point(wire.x1, wire.y1));
-            }
-        },
-    );
+    let mut graph = seed_drawn_graph_with(tree, wires, labels, schematic_point, |graph, x, y| {
+        for wire in wires.iter().filter(|w| schematic_point_on_wire((x, y), w)) {
+            graph.union(schematic_point(x, y), schematic_point(wire.x1, wire.y1));
+        }
+    });
     graph.pin_endpoint = schematic_pin_endpoint;
     graph
 }
 
 fn snapshot_graph(tree: &SexpNode, wires: &[Wire], exact: bool) -> NetGraph {
-    use copperpour_sexp::schematic::{extract_labels, find_lib_symbol};
+    use copperpour_sexp::schematic::extract_labels;
 
     let labels = extract_labels(tree);
     let mut graph = if exact {
@@ -809,10 +817,13 @@ fn snapshot_graph(tree: &SexpNode, wires: &[Wire], exact: bool) -> NetGraph {
         .find("lib_symbols")
         .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
-    let placed = if exact {
-        super::drawn_symbol_pins(tree).unwrap_or_default()
+    let placed: super::PlacedPinsByReference = if exact {
+        super::drawn_pins_for_power_drivers(tree)
+            .into_iter()
+            .collect::<Option<_>>()
+            .unwrap_or_default()
     } else {
-        super::placed_pins_by_reference(tree)
+        super::placed_pins_for_power_drivers(tree)
     };
     let pin_endpoint = graph.pin_endpoint;
     for (inst, pins) in placed {
@@ -845,22 +856,11 @@ pub(super) fn wire_run_net_graph(
     point_key: fn(f64, f64) -> NetRoot,
 ) -> NetGraph {
     let index = WireIndex::build(wires, COINCIDENT_TOLERANCE);
-    let mut graph = seed_drawn_graph_with(
-        wires,
-        labels,
-        &extract_junctions(tree),
-        &extract_sheet_pins(tree),
-        point_key,
-        |graph, x, y, kind| {
-            // A power symbol names its pin; only a junction or drawn label joins
-            // that coordinate to a wire that passes through it.
-            if kind != Some(LabelKind::PowerSymbol) {
-                for w in index.interior_hits(x, y, point_key) {
-                    graph.union(point_key(x, y), point_key(w.x1, w.y1));
-                }
-            }
-        },
-    );
+    let mut graph = seed_drawn_graph_with(tree, wires, labels, point_key, |graph, x, y| {
+        for w in index.interior_hits(x, y, point_key) {
+            graph.union(point_key(x, y), point_key(w.x1, w.y1));
+        }
+    });
     graph.merge_named_nets();
     graph.name_nets();
     graph
@@ -1040,25 +1040,44 @@ pub(crate) struct PinNetNames {
     names: HashMap<NetRoot, String>,
 }
 
+pub(super) struct NamingPin {
+    pub(super) pin: LibPin,
+    pub(super) alternate_name: Option<String>,
+    pub(super) global_power: bool,
+}
+
 impl PinNetNames {
     pub(crate) fn build(tree: &SexpNode, graph: &mut NetGraph, notation: UnitNotation) -> Self {
-        use copperpour_sexp::schematic::extract_lib_pins_for_unit_and_body_style;
+        use copperpour_sexp::schematic::{
+            lib_pin_nodes_for_body_style, parse_lib_pin, placed_pin_electrical_type,
+        };
         Self::build_with_pins(tree, graph, notation, false, |_, node, lib, unit| {
-            extract_lib_pins_for_unit_and_body_style(lib, unit, super::symbol_body_style(node))
+            lib_pin_nodes_for_body_style(lib, unit, super::symbol_body_style(node))
                 .into_iter()
-                .map(|pin| (pin, None))
+                .filter_map(|lib_pin| {
+                    let pin = parse_lib_pin(lib_pin)?;
+                    // Only driver qualification uses the alternate here. The
+                    // legacy queries still use base pin types for no-connects.
+                    let global_power =
+                        pin.hidden && placed_pin_electrical_type(node, lib_pin, &pin) == "power_in";
+                    Some(NamingPin {
+                        pin,
+                        alternate_name: None,
+                        global_power,
+                    })
+                })
                 .collect()
         })
     }
 
     /// `pins_for_symbol` receives the index in the sheet's top-level symbol
     /// list, before skipping any unresolved symbols.
-    pub(crate) fn build_with_pins(
+    pub(super) fn build_with_pins(
         tree: &SexpNode,
         graph: &mut NetGraph,
         notation: UnitNotation,
         include_single_pin_names: bool,
-        pins_for_symbol: impl Fn(usize, &SexpNode, &SexpNode, u32) -> Vec<(LibPin, Option<String>)>,
+        pins_for_symbol: impl Fn(usize, &SexpNode, &SexpNode, u32) -> Vec<NamingPin>,
     ) -> Self {
         use super::symbol_pins::{stacked, Stacked, TILDE_IS_TEXT};
         use copperpour_sexp::schematic::{find_lib_symbol, parse_subsymbol_unit, symbol_instance};
@@ -1109,18 +1128,24 @@ impl PinNetNames {
             let unannotated = instance.reference.is_empty() || instance.reference.ends_with('?');
             let pins: Vec<_> = pins_for_symbol(i, node, lib, instance.unit)
                 .into_iter()
-                .map(|(mut pin, alternate)| {
-                    for text in [&mut pin.name, &mut pin.number] {
-                        if tilde_is_empty && *text == "~" {
-                            text.clear();
+                .map(
+                    |NamingPin {
+                         mut pin,
+                         alternate_name,
+                         global_power,
+                     }| {
+                        for text in [&mut pin.name, &mut pin.number] {
+                            if tilde_is_empty && *text == "~" {
+                                text.clear();
+                            }
                         }
-                    }
-                    let shown_name = alternate.unwrap_or_else(|| pin.name.clone());
-                    (pin, shown_name)
-                })
+                        let shown_name = alternate_name.unwrap_or_else(|| pin.name.clone());
+                        (pin, shown_name, global_power)
+                    },
+                )
                 .collect();
             let t = instance.pin_transform();
-            for (pin, shown_name) in &pins {
+            for (pin, shown_name, global_power) in &pins {
                 // `SCH_PIN::ConnectionPropagatesTo`: a `no_connect` pin
                 // connects to nothing.
                 if pin.electrical_type == "no_connect" {
@@ -1128,8 +1153,7 @@ impl PinNetNames {
                 }
                 // `SCH_PIN::IsGlobalPower`. A power symbol's own pin is a label
                 // in this graph, and its net is named already.
-                let global_power = pin.electrical_type == "power_in" && pin.hidden;
-                let priority = if global_power {
+                let priority = if *global_power {
                     GLOBAL_POWER_PIN_PRIORITY
                 } else if off_board || lib_reference.starts_with('#') {
                     NO_PRIORITY
@@ -1139,7 +1163,7 @@ impl PinNetNames {
                 // KiCad names the net from the library name but detects
                 // duplicates using the actual names shown on the sheet.
                 let sharing = |no_connect: bool| {
-                    pins.iter().any(|(other, other_shown_name)| {
+                    pins.iter().any(|(other, other_shown_name, _)| {
                         other_shown_name == shown_name
                             && other.number != pin.number
                             && (other.electrical_type == "no_connect") == no_connect
@@ -2078,13 +2102,7 @@ mod agreement_tests {
         labels: &[Label],
         tol: f64,
     ) -> NetGraph {
-        seed_net_graph(
-            wires,
-            labels,
-            &extract_junctions(tree),
-            &extract_sheet_pins(tree),
-            &WireIndex::build(wires, tol),
-        )
+        seed_net_graph(tree, wires, labels, &WireIndex::build(wires, tol))
     }
 
     fn index_for(sch: &str) -> (copperpour_sexp::SexpNode, Vec<Wire>, Vec<Label>) {

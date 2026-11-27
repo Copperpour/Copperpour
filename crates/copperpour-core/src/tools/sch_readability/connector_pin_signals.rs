@@ -4,8 +4,8 @@ use crate::tools::{
     get_path, opt_str_list,
     placement::ref_prefix,
     sch_connectivity::{
-        add_symbol_power_drivers, drawn_net_graph_for, label_roots, ConnectivityIndex, NetRoot,
-        PinNetNames, SymbolPower, UnitNotation, COINCIDENT_TOLERANCE,
+        add_symbol_power_drivers, drawn_net_graph_for, label_roots, ConnectivityIndex, NamingPin,
+        NetRoot, PinNetNames, SymbolPower, UnitNotation, COINCIDENT_TOLERANCE,
     },
     sch_hierarchy::natural_compare,
     symbol_body_style, ToolContext, ToolDef, UNRESOLVED_PIN_GEOMETRY,
@@ -270,7 +270,11 @@ async fn handle_check_connector_pin_signals(
             placed[index]
                 .pins
                 .iter()
-                .map(|drawn| (drawn.pin.clone(), drawn.alternate_name.clone()))
+                .map(|drawn| NamingPin {
+                    pin: drawn.pin.clone(),
+                    alternate_name: drawn.alternate_name.clone(),
+                    global_power: drawn.pin.hidden && drawn.pin.electrical_type == "power_in",
+                })
                 .collect()
         },
     );

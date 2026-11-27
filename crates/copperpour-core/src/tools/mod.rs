@@ -2726,7 +2726,15 @@ pub(crate) type UnitPins = Vec<(
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
 pub(crate) fn placed_pins_by_reference(tree: &copperpour_sexp::SexpNode) -> PlacedPinsByReference {
-    placed_symbols_with_pins(tree)
+    placed_symbols_with_pins(tree, false)
+        .into_iter()
+        .filter_map(|(inst, pins)| Some((inst, pins?)))
+        .collect()
+}
+
+/// The legacy placement geometry, with the selected pin function for power drivers.
+fn placed_pins_for_power_drivers(tree: &copperpour_sexp::SexpNode) -> PlacedPinsByReference {
+    placed_symbols_with_pins(tree, true)
         .into_iter()
         .filter_map(|(inst, pins)| Some((inst, pins?)))
         .collect()
@@ -2736,38 +2744,37 @@ pub(crate) fn placed_pins_by_reference(tree: &copperpour_sexp::SexpNode) -> Plac
 /// definition is not embedded.
 fn placed_symbols_with_pins(
     tree: &copperpour_sexp::SexpNode,
+    resolve_alternates: bool,
 ) -> Vec<(copperpour_sexp::schematic::SymbolInstance, Option<UnitPins>)> {
     use copperpour_sexp::schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
+        extract_lib_pins_for_unit, extract_placed_pins, find_lib_symbol, symbol_instance,
     };
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    extract_symbol_instances(tree)
+    tree.find_all("symbol")
         .into_iter()
-        .map(|inst| {
+        .filter_map(|node| {
+            let inst = symbol_instance(node)?;
             // find_lib_symbol, not a lib_id match: an instance carrying a
             // (lib_name …) is a sheet-local derived symbol whose pins can sit
             // elsewhere than the base definition's (#143).
             let pins = find_lib_symbol(&lib_syms, &inst).map(|sym| {
                 let t = inst.pin_transform();
-                extract_lib_pins_for_unit(sym, inst.unit)
-                    .into_iter()
-                    .map(|p| (p, t))
-                    .collect()
+                let pins = if resolve_alternates {
+                    extract_placed_pins(node, sym, inst.unit)
+                } else {
+                    extract_lib_pins_for_unit(sym, inst.unit)
+                };
+                pins.into_iter().map(|p| (p, t)).collect()
             });
-            (inst, pins)
+            Some((inst, pins))
         })
         .collect()
 }
 
-pub(crate) fn symbol_body_style(node: &copperpour_sexp::SexpNode) -> u32 {
-    node.find_str("body_style")
-        .or_else(|| node.find_str("convert"))
-        .and_then(|style| style.parse().ok())
-        .unwrap_or(1)
-}
+pub(crate) use copperpour_sexp::schematic::symbol_body_style;
 
 /// Resolve the pins actually drawn by the selected unit and body style.
 fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByReference> {
@@ -2778,8 +2785,23 @@ fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByRef
 fn drawn_symbol_pin_inventory(
     tree: &copperpour_sexp::SexpNode,
 ) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
+    drawn_pin_inventory(tree, false)
+}
+
+/// Saved geometry with the selected pin function for power drivers.
+fn drawn_pins_for_power_drivers(
+    tree: &copperpour_sexp::SexpNode,
+) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
+    drawn_pin_inventory(tree, true)
+}
+
+fn drawn_pin_inventory(
+    tree: &copperpour_sexp::SexpNode,
+    resolve_alternates: bool,
+) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
     use copperpour_sexp::schematic::{
-        find_lib_symbol, resolve_lib_pins_for_unit_and_body_style, symbol_instance,
+        find_lib_symbol, resolve_lib_pins_for_unit_and_body_style,
+        resolve_placed_pins_for_unit_and_body_style, symbol_instance,
     };
     let lib_syms = tree
         .find("lib_symbols")
@@ -2797,8 +2819,12 @@ fn drawn_symbol_pin_inventory(
             }
             let lib = find_lib_symbol(&lib_syms, &inst)?;
             let transform = inst.pin_transform();
-            let pins =
-                resolve_lib_pins_for_unit_and_body_style(lib, inst.unit, symbol_body_style(node))?;
+            let style = symbol_body_style(node);
+            let pins = if resolve_alternates {
+                resolve_placed_pins_for_unit_and_body_style(node, lib, inst.unit, style)?
+            } else {
+                resolve_lib_pins_for_unit_and_body_style(lib, inst.unit, style)?
+            };
             Some((inst, pins.into_iter().map(|pin| (pin, transform)).collect()))
         })
         .collect()
@@ -2881,7 +2907,7 @@ pub(crate) struct PlacedPins {
 impl PlacedPins {
     pub(crate) fn new(tree: &copperpour_sexp::SexpNode) -> Self {
         Self {
-            symbols: placed_symbols_with_pins(tree),
+            symbols: placed_symbols_with_pins(tree, false),
         }
     }
 

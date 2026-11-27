@@ -79,7 +79,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Check power rail integrity: missing bulk capacitance, no test points on power rails, \
              voltage regulator output caps missing. Defaults to one file; set schematic_scope \
              to 'hierarchy' to audit every reachable sheet instance. There, a rail named by a \
-             power symbol or global label is one net across the design, so its capacitors and \
+             global power symbol or global label is pooled by its primary name, so its capacitors and \
              test points are counted on every sheet and it is reported once.",
             json!({
                 "type": "object",
@@ -246,7 +246,9 @@ async fn handle_audit_decoupling_file(
     let placed = placed_pins_by_reference(&tree);
     let wires = extract_wires(&tree);
     let mut labels = extract_all_net_labels(&tree);
-    labels.extend(hidden_power_pin_labels(&placed));
+    labels.extend(hidden_power_pin_labels(
+        &super::placed_pins_for_power_drivers(&tree),
+    ));
     let no_connects = extract_no_connects(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
 
@@ -1875,12 +1877,7 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
     // depend on label order: a rail claimed by the `+3V3` symbol lost the `VCC`
     // label read before it.
     let mut rail_roots: BTreeSet<NetRoot> = BTreeSet::new();
-    let mut global_roots: BTreeSet<NetRoot> = BTreeSet::new();
     for label in labels {
-        let global = matches!(label.kind, LabelKind::PowerSymbol | LabelKind::GlobalLabel);
-        if global {
-            global_roots.insert(graph.root_at(label.x, label.y));
-        }
         if label.kind == LabelKind::PowerSymbol || is_power_net_name(&label.net) {
             rail_roots.insert(graph.root_at(label.x, label.y));
         }
@@ -1896,7 +1893,7 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
                     .unwrap_or_default(),
                 root,
                 names,
-                global: global_roots.contains(&root),
+                global: graph.primary_name_is_global(root),
             }
         })
         .collect();

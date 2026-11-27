@@ -1234,7 +1234,10 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
         .unwrap_or_default();
 
     let mut labels = Vec::new();
-    for inst in extract_symbol_instances(tree) {
+    for placed in tree.find_all("symbol") {
+        let Some(inst) = symbol_instance(placed) else {
+            continue;
+        };
         if inst.value.is_empty() {
             continue;
         }
@@ -1247,7 +1250,7 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
             continue;
         }
         let t = inst.pin_transform();
-        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+        for pin in extract_placed_pins(placed, sym, inst.unit) {
             if pin.electrical_type != "power_in" {
                 continue;
             }
@@ -1325,6 +1328,22 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
     out
 }
 
+/// Pins of the placed unit and body style, with the types of its selected alternates.
+pub fn extract_placed_pins(placed: &SexpNode, sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
+    lib_pin_nodes_for_body_style(sym_node, unit, symbol_body_style(placed))
+        .into_iter()
+        .filter_map(|node| parse_placed_pin(node, placed))
+        .collect()
+}
+
+/// The body style selected by a placed symbol, defaulting to the standard style.
+pub fn symbol_body_style(node: &SexpNode) -> u32 {
+    node.find_str("body_style")
+        .or_else(|| node.find_str("convert"))
+        .and_then(|style| style.parse().ok())
+        .unwrap_or(1)
+}
+
 /// [`extract_lib_pins_for_unit`] of one body style too: eeschema places only
 /// the pins of sub-symbols whose `M` is `0` or the placed symbol's body style
 /// (`SCH_SYMBOL::UpdatePins`), so a De Morgan symbol's other style puts no
@@ -1347,10 +1366,31 @@ pub fn resolve_lib_pins_for_unit_and_body_style(
     unit: u32,
     body_style: u32,
 ) -> Option<Vec<LibPin>> {
+    resolve_pin_nodes(sym_node, unit, body_style, parse_lib_pin)
+}
+
+/// Resolve the drawn pins and their effective electrical types on this instance.
+pub fn resolve_placed_pins_for_unit_and_body_style(
+    placed: &SexpNode,
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Option<Vec<LibPin>> {
+    resolve_pin_nodes(sym_node, unit, body_style, |node| {
+        parse_placed_pin(node, placed)
+    })
+}
+
+fn resolve_pin_nodes(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+    parse: impl Fn(&SexpNode) -> Option<LibPin>,
+) -> Option<Vec<LibPin>> {
     lib_pin_nodes_for_body_style(sym_node, unit, body_style)
         .into_iter()
         .map(|node| {
-            let pin = parse_lib_pin(node)?;
+            let pin = parse(node)?;
             (pin.local_x.is_finite() && pin.local_y.is_finite()).then_some(pin)
         })
         .collect()
@@ -1362,18 +1402,59 @@ pub fn lib_pin_nodes_for_body_style(
     unit: u32,
     body_style: u32,
 ) -> Vec<&SexpNode> {
-    fn collect_nodes<'a>(node: &'a SexpNode, out: &mut Vec<&'a SexpNode>) {
-        out.extend(node.find_all("pin"));
-        for sub in node.find_all("symbol") {
-            collect_nodes(sub, out);
-        }
-    }
-
     let mut out = sym_node.find_all("pin");
     for sub in unit_body_children(sym_node, unit, body_style) {
-        collect_nodes(sub, &mut out);
+        collect_pin_nodes(sub, &mut out);
     }
     out
+}
+
+fn collect_pin_nodes<'a>(node: &'a SexpNode, out: &mut Vec<&'a SexpNode>) {
+    out.extend(node.find_all("pin"));
+    for sub in node.find_all("symbol") {
+        collect_pin_nodes(sub, out);
+    }
+}
+
+fn parse_placed_pin(node: &SexpNode, placed: &SexpNode) -> Option<LibPin> {
+    let mut pin = parse_lib_pin(node)?;
+    let kind = placed_pin_electrical_type(placed, node, &pin);
+    if kind != pin.electrical_type {
+        pin.electrical_type = kind.to_owned();
+    }
+    Some(pin)
+}
+
+/// Electrical type of the selected placed pin function, or the base pin type.
+pub fn placed_pin_electrical_type<'a>(
+    placed: &SexpNode,
+    lib_pin: &'a SexpNode,
+    pin: &'a LibPin,
+) -> &'a str {
+    // SCH_PIN::GetType() uses the placed pin's selected library alternate.
+    let alternate = selected_pin_alternate(placed, lib_pin, &pin.number)
+        .and_then(|alternate| alternate.get(2)?.as_str());
+    alternate.unwrap_or(&pin.electrical_type)
+}
+
+fn selected_pin_alternate<'a>(
+    placed: &SexpNode,
+    lib_pin: &'a SexpNode,
+    number: &str,
+) -> Option<&'a SexpNode> {
+    let alternates = lib_pin.find_all("alternate");
+    if alternates.is_empty() {
+        return None;
+    }
+    let name = placed
+        .find_all("pin")
+        .into_iter()
+        .find(|pin| pin.get(1).and_then(SexpNode::as_str) == Some(number))?
+        .find_str("alternate")
+        .filter(|name| !name.is_empty())?;
+    alternates
+        .into_iter()
+        .find(|alt| alt.get(1).and_then(SexpNode::as_str) == Some(name))
 }
 
 fn unit_body_children(

@@ -80,7 +80,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_pin_connections",
-            "Get the net connected to a specific pin on a component by tracing wires from the pin endpoint.",
+            "Get the primary net name at a specific pin; global power takes precedence over local power.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -92,7 +92,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_pin_net_name",
-            "Return just the net name for a specific pin on a component.",
+            "Return the primary net name for a specific pin; global power takes precedence over local power.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -104,7 +104,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_component_nets",
-            "Get all nets connected to every pin of a component.",
+            "Get the primary net name for each pin; global power takes precedence over local power.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },

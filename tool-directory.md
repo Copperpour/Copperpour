@@ -152,8 +152,8 @@ and Windows servers do not.
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect; a point that already has one is reported as `already_present` and not rewritten. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle, skipping points that already have one; `added` counts the dots written. |
 | `connect_to_net` | Connect a pin to a named net with a short stub and label. Name the pin (`reference` + `pin_number`) or give its coordinates. For clearance, `direction: "auto"` tries outward before turning across, and omitting `stub_length` lets the tool try 2.54, 5.08 and 7.62 mm in each direction. Fixed arguments stay fixed; `stub_length: 0` adds only the label. Returns the length used, new `text_overlaps` and `bounds_unresolved` for unchecked symbol bounds. If none clear, writes the first electrically safe stub or refuses with `plan_blocked` if none is safe. |
-| `connect_pins` | Connect two pins by reference and pin number. Prefers the elbow that crosses fewer symbol bodies, then fewer label and field text runs. Reports the drawn path, or `already_connected` with `x` and `y` for verified pin-tip contact on the saved sheet, including hidden pins. Refuses (`plan_blocked`) unverified contact, a zero-length route, a wire end that would miss its pin, or a route that would join another net. |
-| `add_schematic_connection` | Connect two points by coordinates. Uses the same elbow choice as `connect_pins`. Reports the drawn path; refuses a zero-length route or a route that would join another net. |
+| `connect_pins` | Connect two pins by reference and pin number. Prefers the elbow that crosses fewer symbol bodies, then fewer label and field text runs. Reports the drawn path, or `already_connected` with `x` and `y` for verified pin-tip contact on the saved sheet, including hidden pins. Refuses (`plan_blocked`) unverified contact, a zero-length route, a wire end that would miss its pin, or a route that would join another net. Conflict diagnostics use the net's primary name. |
+| `add_schematic_connection` | Connect two points by coordinates. Uses the same elbow choice and primary net names in diagnostics as `connect_pins`. Reports the drawn path; refuses a zero-length route or a route that would join another net. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -177,15 +177,15 @@ and Windows servers do not.
 | `list_schematic_labels` | List all net, global, and hierarchical labels with positions, net names, types, and UUIDs (usable with `batch_delete`). |
 | `get_net_connections` | Get all pins and labels connected to a named net. |
 | `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations. |
-| `get_pin_connections` | Get the net connected to a specific pin by tracing wires from the pin endpoint. |
-| `get_pin_net_name` | Return just the net name for a specific pin on a component. |
-| `get_component_nets` | Get all nets connected to every pin of a component. |
+| `get_pin_connections` | Get the primary net name at a specific pin; global power takes precedence over local power. |
+| `get_pin_net_name` | Return the primary net name for a specific pin; global power takes precedence over local power. |
+| `get_component_nets` | Get the primary net name for each pin; global power takes precedence over local power. |
 | `get_net_components` | Get all components (and their pins) connected to a named net. |
-| `trace_from_point` | Trace connectivity from any (X,Y) point — returns the wires, labels, component pins and junction dots at that point, and the net it belongs to. Hierarchical sheet pins and no-connect flags are not reported, so an empty pins_here does not prove a wire dangles. |
+| `trace_from_point` | Trace connectivity from any (X,Y) point: returns the wires, labels, component pins and junction dots there, and the net's primary name. Hierarchical sheet pins and no-connect flags are not reported, so an empty `pins_here` does not prove a wire dangles. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
-| `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
+| `get_connected_items` | Get all wires, labels and components connected to a component by tracing each pin. Reports the primary names separately from the attached labels. |
 
 ### `sch_readability` · 4 tools
 **Purpose:** Read-only drawing and layout checks on saved schematic sheets.
@@ -197,8 +197,8 @@ and Windows servers do not.
 | `check_placement` | Report the overlaps `check_schematic_overlaps` finds, placed symbol pin tips off KiCad's nominal 1.27 mm grid, and caller-specified pin pairs that do not share the expected row or column on one saved sheet. Refuses unresolved pin geometry or selectors. Read-only. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text). Report wires drawn through a symbol body, label text, visible power symbol Value text, visible Reference or Value text on ordinary symbols, or a drawn pin name or number. Name symbols checked using the origin fallback, and in `pin_text_unresolved` symbols whose pin text could not be measured. |
 | `check_schematic_page_fit` | Check a saved schematic against its inner drawing frame and title block. Report per-item overflow, intrusion and missing coverage without editing the schematic or changing paper size. |
-| `check_schematic_wire_runs` | Report long or indirect orthogonal wire runs, including collinear backtracking, on one saved sheet. Includes drawn length, detour length, bends and endpoint status. Read-only. |
-| `compare_schematic_layout` | Score a saved schematic sheet, including wires crossing visible Reference or Value text on ordinary symbols or drawn pin names and numbers. Compare with a saved baseline after checking pin connectivity, symbol identity, and saved PCB/BOM properties. Refuses potentially affected rule areas, component classes, or exported text expressions. Does not write or run KiCad. |
+| `check_schematic_wire_runs` | Report long or indirect orthogonal wire runs, including collinear backtracking, on one saved sheet. Includes drawn length, detour length, bends, endpoint status and primary net names. Read-only. |
+| `compare_schematic_layout` | Score a saved schematic sheet, including wires crossing visible Reference or Value text on ordinary symbols or drawn pin names and numbers. Compare with a saved baseline after checking pin connectivity, primary names, scoped aliases, symbol identity, and saved PCB/BOM properties. Refuses potentially affected rule areas, component classes, or exported text expressions. Does not write or run KiCad. |
 | `find_pin_contacts` | Report visible pins touching on distinct symbols and branch-free pin-to-pin runs shorter than `min_wire_mm` (default 2.54 mm). Read-only drawing check on one saved sheet. |
 | `plan_schematic_cleanup` | Preview net-preserving reroutes and permitted symbol moves on one saved schematic. Returns a revision, ordered steps and skip reasons without writing. |
 | `preview_block_placement` | Preview placement and wiring for explicitly selected supporting parts around a fixed IC on one saved sheet. Does not write or run KiCad. |
@@ -227,7 +227,7 @@ and Windows servers do not.
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. An entry under a numbered reference already held is refused, and the others are placed. |
-| `batch_connect_pins` | Connect multiple pin pairs by reference and pin number in a single file read/write cycle. Routes as `connect_pins` does. Reports verified pin-tip contacts, including hidden pins, in `already_connected`, new routes in `connected_count`, and refused pairs in `errors`. |
+| `batch_connect_pins` | Connect multiple pin pairs by reference and pin number in a single file read/write cycle. Routes and names net conflicts as `connect_pins` does. Reports verified pin-tip contacts, including hidden pins, in `already_connected`, new routes in `connected_count`, and refused pairs in `errors`. |
 
 ### `sch_export` · 11 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.
@@ -241,7 +241,7 @@ and Windows servers do not.
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
-| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
+| `export_netlist_summary` | Return a JSON netlist summary (components, nets, pin counts). Lists authored names under `nets` and the primary name at each pin. Does not require `kicad-cli`. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
 | `set_erc_severity` | Set ERC checks' severities (`error`, `warning`, `ignore`) under `erc.rule_severities` in the `.kicad_pro`, by the check keys KiCad 10.0.6 has or the file already names; only the named keys change, and the reply gives each one's previous and current severity. Refused while KiCad holds the project. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
@@ -567,11 +567,11 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; findings use primary net names. Does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Findings use primary net names. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Reports the primary name of each rail. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance and pools only global rails across sheets. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
-| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
+| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Net findings use the same primary names as the individual audits. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
 | `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 
 ---
