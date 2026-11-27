@@ -935,6 +935,125 @@ fn field_run(
     moved(upright, x + cx, y + cy, 0.0)
 }
 
+/// Inner and outer bounds for a placed symbol's visible field box. Unlike the
+/// plotted run, a field box includes the anchor for ordinary stroke text.
+/// Unbounded substitutions and font faces provide neither bound.
+pub(crate) fn rule_area_field_bounds<'a>(
+    field: &SexpNode,
+    symbol_angle: Option<f64>,
+    value_override: impl FnOnce(&str) -> Option<&'a str>,
+) -> Result<Option<(Option<SymbolBounds>, SymbolBounds)>, &'static str> {
+    let private = matches!(field.get(1), Some(SexpNode::Atom(name)) if name == "private");
+    let effects = field.find("effects");
+    let hides = |node: &SexpNode| {
+        node.children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|part| {
+                matches!(part, SexpNode::Atom(name) if name == "hide")
+                    || part.head() == Some("hide")
+            })
+            .count()
+    };
+    if field.find_all("effects").len() > 1 || hides(field) + effects.map_or(0, hides) > 1 {
+        return Err("ambiguous field visibility");
+    }
+    if symbol_angle.is_some() && (flag(field, "hide") || effects.is_some_and(|e| flag(e, "hide"))) {
+        return Ok(None);
+    }
+    if field.find_all("at").len() > 1 {
+        return Err("repeated field position");
+    }
+    let offset = usize::from(private);
+    let name = field
+        .get(1 + offset)
+        .and_then(SexpNode::as_str)
+        .ok_or("invalid field name")?;
+    let raw = field
+        .get(2 + offset)
+        .and_then(SexpNode::as_str)
+        .ok_or("invalid field value")?;
+    let value = value_override(name).unwrap_or(raw);
+    let (x, y, angle) = parse_at(field).ok_or("invalid field position")?;
+    if !x.is_finite() || !y.is_finite() || !matches!(angle, 0.0 | 90.0 | 180.0 | 270.0) {
+        return Err("invalid field position");
+    }
+    let font = effects.and_then(|e| e.find("font"));
+    if effects.is_some_and(repeated_style_setting) {
+        return Err("ambiguous field style");
+    }
+    let mut text = unescape(value);
+    if font.is_some_and(|f| f.find("face").is_some()) || text.contains("${") || text.contains("@{")
+    {
+        return Err("unresolved field text extent");
+    }
+    let style = TextStyle::of(field);
+    let localized_prefix = symbol_angle.is_none()
+        && matches!(name, "Sheetfile" | "Sheet file")
+        && !flag(field, "show_name");
+    if flag(field, "show_name") {
+        text = format!("{name}: {text}");
+    }
+    if !text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        return Err("unresolved field text extent");
+    }
+    let size = style.width.max(style.height);
+    if !size.is_finite() || size > 250.0 {
+        return Err("invalid field size");
+    }
+    let drawn = Drawn::of(&text);
+    let suffix = if name == "Reference" {
+        style.width * 2.0
+    } else {
+        0.0
+    };
+    // GetTextBox pads the stroke font by three pens and grows the vertical
+    // cell by 17%. Leave a further half-cell for shape/rounding differences.
+    let width = if localized_prefix {
+        // The localized "File: " prefix is a single line. Don't use a
+        // guessed translation length to prove separation along the text.
+        f64::from(i32::MAX) * 0.0002
+    } else {
+        style.box_width(&drawn) + suffix + style.width / 2.0
+    };
+    let height = 2.0 * style.height + 4.0 * style.pen;
+    let justified = |span, justify| match justify {
+        Justify::Center => span / 2.0,
+        _ => span,
+    };
+    let (dx, dy) = (
+        justified(width, style.horizontal),
+        justified(height, style.vertical),
+    );
+    let (dx, dy) = if field_drawn_orientation(angle, symbol_angle.unwrap_or(0.0)) == "vertical" {
+        (dy, dx)
+    } else {
+        (dx, dy)
+    };
+    let anchor = SymbolBounds::spanning((x, y), (x, y));
+    let outer = SymbolBounds::spanning((x - dx, y - dy), (x + dx, y + dy));
+    // The anchor lies on or in the native box for non-italic default text.
+    // A point can still enlarge a body rectangle and prove a collision.
+    let inner = (!localized_prefix
+        && !font.is_some_and(|f| flag(f, "italic"))
+        && !text.is_empty()
+        && !text.contains("~{"))
+    .then_some(anchor);
+    Ok(Some((inner, outer)))
+}
+
+// Font, effects and stroke trees contain settings, not repeated drawing
+// children. Do not certify geometry from an earlier occurrence of a setter.
+pub(crate) fn repeated_style_setting(node: &SexpNode) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    node.children()
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .filter(|child| child.children().is_some())
+        .any(|child| !seen.insert(child.head()) || repeated_style_setting(child))
+}
+
 pub fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
     label_placement(node, kind).map(|placement| placement.extent)
 }

@@ -56,6 +56,36 @@ pub fn parse_end(node: &SexpNode) -> Option<(f64, f64)> {
     Some((e.get_f64(1)?, e.get_f64(2)?))
 }
 
+/// The closed outline of a schematic rule area, in sheet coordinates.
+pub fn rule_area_outline(node: &SexpNode) -> Option<Vec<(f64, f64)>> {
+    let polyline = node.find_all("polyline").into_iter().last()?;
+    // KiCad appends repeated point lists. A single list cannot establish
+    // the outline when more lists follow it.
+    let lists = polyline.find_all("pts");
+    if lists.len() > 1 {
+        return None;
+    }
+    let points = lists.first()?.children()?;
+    let mut outline: Vec<_> = points
+        .iter()
+        .skip(1)
+        .map(|point| {
+            let x = point.get_f64(1)?;
+            let y = point.get_f64(2)?;
+            (point.head() == Some("xy") && x.is_finite() && y.is_finite()).then_some((x, y))
+        })
+        .collect::<Option<_>>()?;
+    if outline.first() == outline.last() {
+        outline.pop();
+    }
+    let area: f64 = outline
+        .iter()
+        .zip(outline.iter().cycle().skip(1))
+        .map(|(&(ax, ay), &(bx, by))| ax * by - ay * bx)
+        .sum();
+    (outline.len() >= 3 && area.abs() > f64::EPSILON).then_some(outline)
+}
+
 // ─── Wire ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

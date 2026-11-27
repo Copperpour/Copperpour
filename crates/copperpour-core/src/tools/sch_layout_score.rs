@@ -366,12 +366,18 @@ fn gate(
             Some(kept) => {
                 let instance_changed = if sources.is_some() {
                     properties::instance_identity(kept) != properties::instance_identity(symbol)
-                        || properties::reference(kept) != properties::reference(symbol)
                 } else {
                     kept.find("instances") != symbol.find("instances")
                 };
                 if kept.find("lib_id") != symbol.find("lib_id") || instance_changed {
                     reasons.push(format!("symbol {uuid} changed its lib_id or instances"));
+                }
+                if sources.is_some()
+                    && properties::reference(kept) != properties::reference(symbol)
+                    && !(properties::saved_root_reference(symbol, before).is_some()
+                        && properties::saved_root_reference(kept, after).is_some())
+                {
+                    reasons.push(format!("symbol {uuid} changed its placed Reference"));
                 }
                 let on_board = |node: &SexpNode| node.find_str("on_board") != Some("no");
                 if on_board(kept) != on_board(symbol) {
@@ -401,8 +407,6 @@ fn gate(
     if reasons.is_empty() {
         if let Some((old, new)) = &sources {
             properties::uncertain_changes((old, new), &mut reasons);
-        }
-        if reasons.is_empty() && matches!(comparison, NetComparison::Layout) {
             library::append_changes((before, &was), (after, &now), &mut reasons);
         }
     }
