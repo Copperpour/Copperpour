@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
+#[path = "sch_layout_properties.rs"]
+mod properties;
+
 #[cfg(test)]
 #[path = "sch_layout_score_tests.rs"]
 mod tests;
@@ -338,6 +341,8 @@ fn gate(
         .unwrap_or_default();
     let mut approved = BTreeSet::new();
     let mut reasons = Vec::new();
+    let sources = matches!(comparison, NetComparison::Layout)
+        .then(|| properties::Source::comparison(before, after));
     for uuid in requested
         .iter()
         .map(String::as_str)
@@ -357,14 +362,27 @@ fn gate(
     for (&uuid, &symbol) in &was {
         match now.get(uuid) {
             Some(kept) => {
-                if kept.find("lib_id") != symbol.find("lib_id")
-                    || kept.find("instances") != symbol.find("instances")
-                {
+                let instance_changed = if sources.is_some() {
+                    properties::instance_identity(kept) != properties::instance_identity(symbol)
+                        || properties::reference(kept) != properties::reference(symbol)
+                } else {
+                    kept.find("instances") != symbol.find("instances")
+                };
+                if kept.find("lib_id") != symbol.find("lib_id") || instance_changed {
                     reasons.push(format!("symbol {uuid} changed its lib_id or instances"));
                 }
                 let on_board = |node: &SexpNode| node.find_str("on_board") != Some("no");
                 if on_board(kept) != on_board(symbol) {
                     reasons.push(format!("symbol {uuid} changed its PCB membership"));
+                }
+                if let Some((old, new)) = &sources {
+                    let reference = properties::reference(symbol).unwrap_or("?");
+                    properties::changes(
+                        &format!("symbol {uuid} ({reference})"),
+                        (symbol, old),
+                        (kept, new),
+                        &mut reasons,
+                    );
                 }
             }
             None if !approved.contains(uuid) => reasons.push(format!("symbol {uuid} was removed")),
@@ -374,7 +392,15 @@ fn gate(
     for uuid in now.keys().filter(|uuid| !was.contains_key(*uuid)) {
         reasons.push(format!("symbol {uuid} was added"));
     }
+    if let Some((old, new)) = &sources {
+        properties::sheet_changes((before, old), (after, new), &mut reasons);
+    }
     reasons.extend(snapshot_net_changes(before, after, &approved, comparison));
+    if reasons.is_empty() {
+        if let Some((old, new)) = &sources {
+            properties::uncertain_changes((old, new), &mut reasons);
+        }
+    }
     reasons
 }
 

@@ -5,6 +5,9 @@ caller can see adds one file here, named after the change, for example
 `run-drc-drops-tests.md`. Separate files keep two open PRs from conflicting on
 the same lines of `../API_MIGRATIONS.md`.
 
+If a tool is unreleased and already has a pending note, update that note instead
+of adding a separate entry for a change to the unreleased tool.
+
 The file starts with a `###` heading that names the change and the release it
 needs, then says what changed and what callers should do:
 

@@ -16,10 +16,19 @@ not ranking terms. Unavailable terms are `null` and appear in `not_compared`.
 are `null`.
 
 `blocked` means the comparison could not establish that the two sheets preserve
-pin nets and symbol identity. See `reasons`. For an intentional power-symbol
+pin nets, symbol identity, or saved PCB and BOM properties. Use `verdict` for
+decisions and `reasons` for human-readable details. For an intentional power-symbol
 removal, pass its placed UUID in `removed_power_symbol_uuids`. Remaining pins
 must keep their nets, and each named net must retain its name and scoped aliases.
 The comparison does not check the ERC effect of removing a power symbol.
+
+The comparison checks saved fields and export flags, including per-project and
+per-path variant overrides and settings on child-sheet placements. It does not
+open child sheets or project files. Moving field text on a placement with a
+literal variant override is allowed when no unresolved inputs can affect exports.
+For now, a placement edit on a sheet with a rule area, an edit to a possible
+Component Class input, or a saved change that could affect an exported text
+expression is refused. The comparison does not evaluate those effects.
 
 Otherwise `improved` means the first tier with a different sum went down and
 no individual term in the first two tiers went up. The tiers, in order, are
