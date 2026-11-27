@@ -250,6 +250,12 @@ pub(super) fn schematic_pin_endpoint(pin: &LibPin, mut transform: PinTransform) 
     copperpour_sexp::geometry::transform_pin(x, y, transform)
 }
 
+/// KiCad truncates the saved instance angle before selecting its transform.
+pub(super) fn saved_pin_endpoint(pin: &LibPin, mut transform: PinTransform) -> (f64, f64) {
+    transform.rotation_deg = transform.rotation_deg.trunc();
+    schematic_pin_endpoint(pin, transform)
+}
+
 /// Electrical contact with the drawn wire rather than a geometric proximity hit.
 pub(super) fn schematic_point_on_wire(at: (f64, f64), wire: &Wire) -> bool {
     let p = schematic_point(at.0, at.1);
@@ -792,6 +798,17 @@ pub(super) fn cleanup_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
     snapshot_graph(tree, wires, true)
 }
 
+pub(super) fn saved_route_net_graph(
+    tree: &SexpNode,
+    wires: &[Wire],
+    labels: &[Label],
+    placed: &super::PlacedPinsByReference,
+) -> NetGraph {
+    let mut graph = exact_drawn_net_graph(tree, wires, labels);
+    graph.pin_endpoint = saved_pin_endpoint;
+    snapshot_symbol_nets(tree, graph, placed, true)
+}
+
 /// Cleanup's electrical graph uses saved schematic units for both keyed
 /// endpoints and drawn attachments, including those along diagonal wires.
 pub(super) fn exact_drawn_net_graph(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
@@ -808,15 +825,11 @@ fn snapshot_graph(tree: &SexpNode, wires: &[Wire], exact: bool) -> NetGraph {
     use copperpour_sexp::schematic::extract_labels;
 
     let labels = extract_labels(tree);
-    let mut graph = if exact {
+    let graph = if exact {
         exact_drawn_net_graph(tree, wires, &labels)
     } else {
         drawn_net_graph_for(tree, wires, &labels)
     };
-    let lib_symbols = tree
-        .find("lib_symbols")
-        .map(|node| node.find_all("symbol"))
-        .unwrap_or_default();
     let placed: super::PlacedPinsByReference = if exact {
         super::drawn_pins_for_power_drivers(tree)
             .into_iter()
@@ -825,9 +838,22 @@ fn snapshot_graph(tree: &SexpNode, wires: &[Wire], exact: bool) -> NetGraph {
     } else {
         super::placed_pins_for_power_drivers(tree)
     };
+    snapshot_symbol_nets(tree, graph, &placed, exact)
+}
+
+fn snapshot_symbol_nets(
+    tree: &SexpNode,
+    mut graph: NetGraph,
+    placed: &super::PlacedPinsByReference,
+    exact: bool,
+) -> NetGraph {
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
     let pin_endpoint = graph.pin_endpoint;
     for (inst, pins) in placed {
-        let Some(lib) = find_lib_symbol(&lib_symbols, &inst) else {
+        let Some(lib) = find_lib_symbol(&lib_symbols, inst) else {
             continue;
         };
         let power = match SymbolPower::from_library(lib) {
@@ -837,7 +863,7 @@ fn snapshot_graph(tree: &SexpNode, wires: &[Wire], exact: bool) -> NetGraph {
         };
         add_symbol_power_drivers(
             &mut graph,
-            &inst,
+            inst,
             power,
             pins.iter()
                 .map(|(pin, transform)| (pin, pin_endpoint(pin, *transform))),
