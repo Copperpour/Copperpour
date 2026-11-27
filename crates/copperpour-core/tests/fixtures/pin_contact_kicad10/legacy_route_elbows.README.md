@@ -15,5 +15,8 @@ as `270°`/`x` and leaves R32 at `90°`/`x`. The test changes only the instance
 orientations to `90.5°`/`x` and `90.5°`/`y`, respectively, on a disposable copy.
 Resaving that copy would erase the fractions the test needs.
 
+The `kicad-cli` resave ran without a neighboring `.kicad_pro`, so the instance
+blocks contain `(project "")`.
+
 KiCad 10.0.6 and 10.0.8 put R32.1 at the horizontal-first elbow and R33.1 at the
 vertical-first elbow of a route from R30.1 to R31.1. Both routes must be refused.
