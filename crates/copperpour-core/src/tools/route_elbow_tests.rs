@@ -391,7 +391,7 @@ async fn named_pin_routes_refuse_an_unloadable_unrelated_symbol_without_writing(
     let token = "(at 41.91 25.4 90)\n\t\t(mirror x)";
     assert_eq!(LEGACY_ELBOW_SEED.matches(token).count(), 1);
     let reason = "R32 has a saved symbol angle KiCad cannot load";
-    for angle in [" 45", " bad", "", " \"90\""] {
+    for angle in [" 45", " bad", "", " \"90\"", " -90"] {
         let unloadable =
             LEGACY_ELBOW_SEED.replace(token, &format!("(at 41.91 25.4{angle})\n\t\t(mirror x)"));
         let sheet = Sheet::with_source(LEGACY_ELBOW_NAME, unloadable.as_bytes()).await;
