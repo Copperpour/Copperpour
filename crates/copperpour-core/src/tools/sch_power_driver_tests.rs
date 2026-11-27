@@ -14,11 +14,17 @@ struct Witness {
 
 impl Witness {
     fn new(case: &str) -> Self {
-        let file = "ERC_same_name_local_global_power_port.kicad_sch";
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/power_driver_priority_kicad10")
+        let fixture = Path::new("power_driver_priority_kicad10")
             .join(case)
-            .join(file);
+            .join("ERC_same_name_local_global_power_port.kicad_sch");
+        Self::from_fixture(&fixture)
+    }
+
+    fn from_fixture(fixture: &Path) -> Self {
+        let file = fixture.file_name().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(file);
         fs::copy(&fixture, &path).unwrap();
@@ -589,6 +595,30 @@ async fn a_selected_passive_alternate_does_not_name_the_power_net() {
         assert_eq!(graph.scoped_name_of_root(root), Some(scoped("GND", 1)));
         assert_eq!(graph.aliases_of_root(root), BTreeSet::from(["GND".into()]));
     }
+    assert_eq!(sheet.files(), original);
+}
+
+#[tokio::test]
+async fn pin_derived_names_use_the_selected_alternate_type() {
+    let sheet = Witness::from_fixture(Path::new("pin_fallback_alternate.kicad_sch"));
+    let original = sheet.files();
+    let pins = sheet
+        .ok(
+            &handler().await,
+            "get_component_nets",
+            json!({"reference": "U2"}),
+        )
+        .await;
+    let mut pin_nets: Vec<_> = rows(&pins["pins"])
+        .iter()
+        .map(|pin| (pin["pin"].as_str().unwrap(), pin["net"].as_str()))
+        .collect();
+    pin_nets.sort_unstable();
+    // KiCad names this unlabeled wire after AUX, not the hidden base power pin.
+    assert_eq!(
+        pin_nets,
+        [("2", Some("Net-(U2-AUX)")), ("6", Some("Net-(U2-AUX)"))]
+    );
     assert_eq!(sheet.files(), original);
 }
 
