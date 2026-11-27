@@ -130,7 +130,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "lib_id": { "type": "string", "description": "Library:Symbol (e.g. 'Device:R')" },
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
-                    "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
+                    "rotation": { "type": "number", "description": "Symbol rotation in degrees, an exact multiple of 90.", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric. The stored orientation is normalized to the rotation and mirror pair eeschema writes (for example, 180° with 'x' is stored and reported as 0° with 'y')." },
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers. A numbered one already placed on any sheet of the hierarchy is refused as invalid_argument, unless this is another unit of that part with its value" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
@@ -264,14 +264,15 @@ pub fn tools() -> Vec<ToolDef> {
              re-judged where the pins turned, reported as junctions_pruned_count and \
              junctions_added_count. A no-connect flag travels with the pin it protects, \
              reported as no_connects_moved; the turn is refused before writing when that \
-             pin cannot be followed one-to-one. On a sheet placed more than once, the \
+             pin cannot be followed one-to-one or a selected unit has a saved angle that \
+             is not a multiple of 90°. On a sheet placed more than once, the \
              change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string" },
-                    "rotation": { "type": "number", "description": "Absolute rotation in degrees" }
+                    "rotation": { "type": "number", "description": "Absolute symbol rotation in degrees, an exact multiple of 90." }
                 },
                 "required": ["schematic", "reference", "rotation"]
             }),
@@ -296,7 +297,8 @@ pub fn tools() -> Vec<ToolDef> {
              re-judged where the pins moved, reported as junctions_pruned_count and \
              junctions_added_count. A no-connect flag travels with the pin it protects, \
              reported as no_connects_moved; the change is refused before writing when \
-             that pin cannot be followed one-to-one. On a sheet placed more than once, the \
+             that pin cannot be followed one-to-one or a selected unit has a saved angle \
+             that is not a multiple of 90°. On a sheet placed more than once, the \
              change reaches every instance of the sheet.",
             json!({
                 "type": "object",
@@ -451,7 +453,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_component_annotation",
-            "Add or update a custom property consistently across every placed unit of a component. Reference, Value, Footprint and Datasheet are set through edit_schematic_component's own arguments, and a key named DNP is refused: do-not-populate is KiCad's native attribute, set with edit_schematic_component's 'dnp'. On a sheet placed more than once, the change reaches every instance of the sheet.",
+            "Add or update a custom property supplied as `key` and `value` across every placed unit of a component. Reference, Value, Footprint and Datasheet are set through edit_schematic_component's own arguments, and a key named DNP is refused: do-not-populate is KiCad's native attribute, set with edit_schematic_component's 'dnp'. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {

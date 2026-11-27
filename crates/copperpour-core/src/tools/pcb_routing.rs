@@ -41,6 +41,20 @@ macro_rules! ipc {
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+macro_rules! zone_refill_remedy {
+    (steps) => {
+        "refill them (refill_zones, or run_drc with refill_zones and sync_live_board) before judging DRC"
+    };
+    (routing $($description:literal)?) => {
+        concat!(
+            $($description, " ",)?
+            "This tool does not refill zones. If the board has copper zones, ",
+            zone_refill_remedy!(steps),
+            "."
+        )
+    };
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -63,7 +77,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "route_trace",
-            "Route a trace segment between two points on a copper layer via KiCAD IPC.",
+            zone_refill_remedy!(routing
+                "Route a trace segment between two points on a copper layer via KiCad IPC."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -81,7 +97,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "route_pad_to_pad",
-            "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC.",
+            zone_refill_remedy!(routing
+                "Route a direct trace between two pads of named components (L-bend routing) via KiCad IPC."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -101,11 +119,13 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_via",
-            "Add a through-hole via at a given position and assign it to a net via KiCAD IPC. \
-             The via is read back and the response reports the net KiCad actually stored. A via \
-             that lands on copper of another net can be stored on that net instead; when that \
-             happens the via is removed again and the call fails with plan_blocked naming the \
-             net KiCad chose, rather than leaving an unrequested short on the board.",
+            zone_refill_remedy!(routing
+                "Add a through-hole via at a given position and assign it to a net via KiCad IPC. \
+                 The via is read back and the response reports the net KiCad actually stored. A via \
+                 that lands on copper of another net can be stored on that net instead; when that \
+                 happens the via is removed again and the call fails with plan_blocked naming the \
+                 net KiCad chose, rather than leaving an unrequested short on the board."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -165,7 +185,12 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_trace",
-            "Delete a trace segment identified by its UUID via KiCAD IPC. Refuses UUIDs that are not observed trace segments on the requested board, then verifies the segment is absent before reporting success. Returns the observed preimage and postcondition.",
+            zone_refill_remedy!(routing
+                "Delete a trace segment identified by its UUID via KiCad IPC. Refuses UUIDs \
+                 that are not observed trace segments on the requested board, then verifies \
+                 the segment is absent before reporting success. Returns the observed preimage \
+                 and postcondition."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -262,9 +287,11 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
-            "Change a trace segment in place, keeping its UUID, in one KiCad undo step. \
-             Refuses, leaving the board unchanged, when the UUID is not a trace segment \
-             or the board has no such net or copper layer.",
+            zone_refill_remedy!(routing
+                "Change a trace segment in place, keeping its UUID, in one KiCad undo step. \
+                 Refuses, leaving the board unchanged, when the UUID is not a trace segment \
+                 or the board has no such net or copper layer."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -395,7 +422,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "route_differential_pair",
-            "Route a differential pair (two parallel traces with a specified gap).",
+            zone_refill_remedy!(routing
+                "Route a differential pair (two parallel traces with a specified gap)."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -580,6 +609,11 @@ fn routing_dimension(
     Ok(value)
 }
 
+fn routing_zone_refill() -> serde_json::Value {
+    // Unlike Specctra import, an ordinary routing call has no zone inventory.
+    json!({ "remedy": zone_refill_remedy!(routing) })
+}
+
 async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -629,7 +663,8 @@ async fn handle_route_trace(
     }
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 },
+        "zone_refill": routing_zone_refill()
     })))
 }
 
@@ -706,7 +741,8 @@ async fn handle_route_pad_to_pad(
         "net": net_name, "layer": layer, "width": width,
         "from": { "ref": ref1, "pad": pad1, "x": x1, "y": y1 },
         "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 },
-        "source": "ipc"
+        "source": "ipc",
+        "zone_refill": routing_zone_refill()
     })))
 }
 
@@ -794,7 +830,8 @@ async fn handle_add_via(
             "y": via.position.y,
             "drill": via.drill_mm,
             "pad_size": via.pad_size_mm,
-            "source": "ipc_readback"
+            "source": "ipc_readback",
+            "zone_refill": routing_zone_refill()
         }))),
         copperpour_ipc::IpcViaPlacement::NetMismatch {
             requested_net,
@@ -1107,7 +1144,7 @@ fn zone_refill(zones: &[crate::specctra::ManifestZoneCount]) -> serde_json::Valu
         "required": required,
         "zones": zones,
         "remedy": required.then_some(
-            "the import does not refill zones: refill them (refill_zones, or run_drc with refill_zones and sync_live_board) before judging DRC"
+            concat!("the import does not refill zones: ", zone_refill_remedy!(steps))
         )
     })
 }
@@ -1529,9 +1566,15 @@ async fn handle_delete_trace(
             "from": { "x": trace.start.x, "y": trace.start.y },
             "to": { "x": trace.end.x, "y": trace.end.y }
         },
-        "postcondition": "absent_from_trace_readback"
+        "postcondition": "absent_from_trace_readback",
+        "zone_refill": routing_zone_refill()
     })))
 }
+
+#[cfg(test)]
+pub(super) const EXPECTED_ROUTING_REFILL_REMEDY: &str =
+    "This tool does not refill zones. If the board has copper zones, refill them \
+     (refill_zones, or run_drc with refill_zones and sync_live_board) before judging DRC.";
 
 #[cfg(test)]
 mod delete_trace_tests {
@@ -1595,10 +1638,12 @@ mod delete_trace_tests {
 
     async fn served_delete_trace(
         readback_status: kiapi::common::types::ItemRequestStatus,
+        uuid: &str,
     ) -> (serde_json::Value, bool) {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("target.kicad_pcb");
-        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let original = include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        std::fs::write(&board, original).unwrap();
         let deleted = Arc::new(Mutex::new(false));
         let deleted_in_mock = deleted.clone();
         let mut track =
@@ -1648,41 +1693,62 @@ mod delete_trace_tests {
         })
         .await
         .unwrap();
-        let result = handler.handle_message(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "delete_trace", "arguments": { "board": board, "uuid": "segment-1" } },
-        })).await.unwrap().result.unwrap();
-        assert!(
-            *deleted.lock().unwrap(),
-            "the mock must accept the delete before readback"
-        );
+        let result = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "delete_trace", "arguments": { "board": board, "uuid": uuid } },
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(*deleted.lock().unwrap(), uuid == "segment-1");
+        assert_eq!(std::fs::read(&board).unwrap(), original.as_slice());
         let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        (body, result["isError"] == true)
+        (body, result["isError"].as_bool().unwrap())
     }
 
     #[tokio::test]
     async fn success_reports_the_observed_trace_and_verified_postcondition() {
         let (body, is_error) =
-            served_delete_trace(kiapi::common::types::ItemRequestStatus::IrsOk).await;
+            served_delete_trace(kiapi::common::types::ItemRequestStatus::IrsOk, "segment-1").await;
         assert!(!is_error, "{body}");
-        assert_eq!(body["deleted_uuid"], json!("segment-1"));
-        assert_eq!(body["deleted_type"], json!("trace_segment"));
-        assert_eq!(body["preimage"]["net"], json!("GND"));
-        assert_eq!(body["preimage"]["layer"], json!("F.Cu"));
-        assert_eq!(body["preimage"]["width"], json!(0.4));
-        assert_eq!(body["preimage"]["from"], json!({ "x": 1.0, "y": 2.0 }));
-        assert_eq!(body["preimage"]["to"], json!({ "x": 3.0, "y": 4.0 }));
-        assert_eq!(body["postcondition"], json!("absent_from_trace_readback"));
+        assert_eq!(
+            body,
+            json!({
+                "deleted_uuid": "segment-1",
+                "deleted_type": "trace_segment",
+                "preimage": {
+                    "uuid": "segment-1", "net": "GND", "layer": "F.Cu", "width": 0.4,
+                    "from": { "x": 1.0, "y": 2.0 }, "to": { "x": 3.0, "y": 4.0 }
+                },
+                "postcondition": "absent_from_trace_readback",
+                "zone_refill": { "remedy": EXPECTED_ROUTING_REFILL_REMEDY }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_trace_refuses_without_refill_guidance() {
+        let (body, is_error) =
+            served_delete_trace(kiapi::common::types::ItemRequestStatus::IrsOk, "missing").await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "stale_target");
+        assert!(body.get("zone_refill").is_none(), "{body}");
     }
 
     #[tokio::test]
     async fn accepted_delete_with_failed_readback_is_uncertain() {
-        let (body, is_error) =
-            served_delete_trace(kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound).await;
+        let (body, is_error) = served_delete_trace(
+            kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound,
+            "segment-1",
+        )
+        .await;
         assert!(is_error, "{body}");
         assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        assert!(body.get("zone_refill").is_none(), "{body}");
         assert_eq!(body["recovery"]["mutation_outcome"], "unknown");
         assert_eq!(body["recovery"]["retry_safe"], false);
         let text = body["error"]["reason"].as_str().unwrap();
@@ -2256,7 +2322,8 @@ async fn handle_modify_trace(
         IpcTraceModify::Modified => CallToolResult::json(&json!({
             "modified_uuid": uuid,
             "net": net_name, "layer": layer, "width": width,
-            "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+            "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 },
+            "zone_refill": routing_zone_refill()
         })),
         IpcTraceModify::NotFound => CallToolResult::error_kind(
             ToolErrorKind::StaleTarget {
@@ -3295,7 +3362,8 @@ async fn handle_route_diff_pair(
 
     Ok(CallToolResult::json(&json!({
         "net_pos": net_pos, "net_neg": net_neg,
-        "layer": layer, "width": width, "gap": gap
+        "layer": layer, "width": width, "gap": gap,
+        "zone_refill": routing_zone_refill()
     })))
 }
 
@@ -6345,11 +6413,10 @@ mod apply_specctra_ses_candidate_drc_tests {
             ]),
             "{body}"
         );
-        assert!(
-            body["zone_refill"]["remedy"]
-                .as_str()
-                .unwrap()
-                .contains("refill_zones"),
+        assert_eq!(
+            body["zone_refill"]["remedy"],
+            "the import does not refill zones: refill them \
+             (refill_zones, or run_drc with refill_zones and sync_live_board) before judging DRC",
             "{body}"
         );
     }

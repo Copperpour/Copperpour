@@ -338,10 +338,13 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub Release
+      # A draft: the maintainer replaces GitHub's generated list with written
+      # notes (GOVERNANCE.md, "Releases") and publishes it by hand.
+      - name: Create draft GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: artifacts/*
+          draft: true
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

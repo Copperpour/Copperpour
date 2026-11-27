@@ -110,3 +110,47 @@ jobs:
             dist/
             e2e-artifacts/
           if-no-files-found: ignore
+
+  e2e-macos:
+    name: Live open_board on macos-latest
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run:e2e-kicad'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-kicad-macos
+
+      # Pinned to the same 10.0.8 release as the Windows E2E job above.
+      - name: Install KiCAD 10.0.8
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kicad-10.0.8.dmg \
+            "https://downloads.kicad.org/kicad/macos/explore/stable/download/kicad-unified-universal-10.0.8.dmg"
+          MOUNT_POINT=$(hdiutil attach /tmp/kicad-10.0.8.dmg -nobrowse -readonly \
+            | awk '/\/Volumes\//{print substr($0, index($0, "/Volumes/"))}' | head -n 1)
+          if [ -z "$MOUNT_POINT" ]; then
+            echo "Failed to mount kicad-10.0.8.dmg" >&2
+            exit 1
+          fi
+          sudo mkdir -p /Applications/KiCad
+          sudo cp -R "$MOUNT_POINT/KiCad/"* /Applications/KiCad/
+          hdiutil detach "$MOUNT_POINT" -quiet || true
+          rm -f /tmp/kicad-10.0.8.dmg
+          sudo xattr -dr com.apple.quarantine /Applications/KiCad || true
+          CLI="/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
+          echo "KICAD_CLI=$CLI" >> "$GITHUB_ENV"
+          "$CLI" --version
+          ls -la /Applications/KiCad/KiCad.app/Contents/Applications/pcbnew.app/Contents/MacOS/pcbnew
+
+      - name: macOS live open_board E2E (#23)
+        run: cargo test -p copperpour --test e2e_kicad e2e_macos_open_board_live_kicad -- --ignored --nocapture

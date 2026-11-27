@@ -7,15 +7,17 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::sch_connectivity::COINCIDENT_TOLERANCE as TOLERANCE;
+use crate::tools::sch_connectivity::{
+    kicad_schematic_mm, schematic_pin_endpoint, COINCIDENT_TOLERANCE as TOLERANCE,
+};
 use crate::tools::{
     get_path, opt_f64, opt_str, require_array, require_f64, require_str, NamedPin, PlacedPins,
-    ToolContext, ToolDef,
+    StubDirection, ToolContext, ToolDef,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::{
-    geometry::{round6, snap_point, transform_pin},
+    geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
@@ -150,7 +152,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_net_label",
-            "Delete a net label by net name and position.",
+            "Delete a net label by `net` name and `x`/`y` position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -224,7 +226,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_power_symbol",
-            "Add a power symbol (VCC, GND, etc.) to the schematic. Name the pin it ties to \
+            "Add a power symbol (VCC, GND, etc.) to the schematic. For a custom global rail name, \
+             use add_schematic_component with lib_id: power:VCC and value: +24V_ISO, for example. \
+             The placed symbol's Value names the net. Name the pin it ties to \
              with reference + pin_number, or give x + y. A named pin gets a straight outward \
              stub (2.54 mm by default); a blocked stub refuses with plan_blocked without writing. \
              The symbol keeps its library direction where clear, or faces away from the pin's body. \
@@ -245,14 +249,14 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "verbose": { "type": "boolean", "description": "Return the full saved readback per part (fields, field placements, instance paths, units) instead of the compact entry. Default false." },
                     "schematic": { "type": "string" },
-                    "power_net": { "type": "string", "description": "Net name (e.g. 'VCC', 'GND')" },
+                    "power_net": { "type": "string", "description": "Name of a symbol in KiCad's power library (e.g. 'VCC', 'GND')" },
                     "reference": { "type": "string",
                         "description": "Component reference, e.g. 'U1'. Use with pin_number instead of x/y." },
                     "pin_number": { "type": "string", "description": "Pin number, e.g. '3'" },
                     "x": { "type": "number", "description": "X in mm; alternative to reference + pin_number" },
                     "y": { "type": "number", "description": "Y in mm" },
                     "rotation": { "type": "number",
-                        "description": "Degrees. For a named pin, overrides automatic orientation; for x + y, defaults to 0." },
+                        "description": "Degrees, an exact multiple of 90. For a named pin, overrides automatic orientation; for x + y, defaults to 0." },
                     "stub_length": { "type": "number", "minimum": 0, "default": 2.54,
                         "description": "Named pins only: stub length in mm, a multiple of 1.27. Zero keeps placement on the pin tip, with the original facing-away rotation unless rotation is given." }
                 },
@@ -370,6 +374,8 @@ pub fn tools() -> Vec<ToolDef> {
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
              Name the pin with reference + pin_number, or give its coordinates directly. \
+             Returns the stub_length used, text_overlaps added by the wire and label, \
+             and bounds_unresolved for symbols whose bounds could not be checked. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
              A rail shared by every instance needs add_power_symbol or a global_label, \
              which are one net across all sheets and instances.",
@@ -388,15 +394,16 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Direction to route the wire stub. 'auto' (default) points it \
                                         away from the symbol body so the label text does not run back \
                                         across the pin names; it falls back to 'right' on a bare point. \
-                                        An 'auto' stub that would join another net turns across instead; \
-                                        when every direction, or the one named, would, the call refuses \
-                                        with plan_blocked.",
+                                        The tool tries permitted lengths outward before turning across. \
+                                        If none clear, it uses the first electrically safe stub, or \
+                                        refuses with plan_blocked if none is electrically safe.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54, "minimum": 0,
-                        "description": "Length of the wire stub in mm. 0 draws no wire and \
-                                        puts the label on the point itself." },
+                    "stub_length": { "type": "number", "minimum": 0,
+                        "description": "Length of the wire stub in mm. When omitted, the tool \
+                                        tries 2.54, 5.08, and 7.62 mm for clearance. An explicit \
+                                        length stays fixed; 0 puts the label on the point with no wire." },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
@@ -413,10 +420,15 @@ pub fn tools() -> Vec<ToolDef> {
              Looks up pin coordinates automatically and routes a wire between them, \
              preferring an elbow that crosses fewer symbol bodies, then fewer label and field \
              text runs. Refuses with plan_blocked if no candidate avoids joining another net \
-             or if a wire would miss a pin or have zero length in KiCad. \
-             Reports already_connected with x and y without writing if visible, \
-             connectable pins already touch on the saved schematic. \
-             Reports the drawn path, corner included.",
+             in KiCad, including pins with legacy saved angles, or if a wire would miss a pin \
+             or have zero length. Also refuses unverified contact or a saved symbol angle that \
+             prevents KiCad from loading the sheet. A straight route must be horizontal or \
+             vertical in saved coordinates. Refuses routes it cannot check on a sheet with \
+             an almost horizontal or vertical diagonal wire. \
+             Reports already_connected with x and y without writing for verified pin-tip \
+             contact on the saved schematic, including hidden pins. \
+             Reports the drawn path, corner included. Conflict diagnostics use the net's \
+             primary name.",
             json!({
                 "type": "object",
                 "properties": {
@@ -435,7 +447,10 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect two schematic points with a straight wire or a two-leg elbow. Routes as \
              connect_pins does and reports the drawn path. Refuses with plan_blocked if no \
              candidate avoids joining another net or if the route would contain a zero-length \
-             segment. Use connect_pins if you have references instead of coordinates.",
+             segment. A straight route must be horizontal or vertical in saved coordinates. \
+             Refuses routes it cannot check on a sheet with an almost horizontal or vertical \
+             diagonal wire. \
+             Use connect_pins if you have references instead of coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -637,14 +652,26 @@ pub(crate) fn insert_wire_with_junctions(
     x2: f64,
     y2: f64,
 ) -> String {
-    // Parse existing wires to detect new T-junctions
     let tree = copperpour_sexp::parse_sexp(&content).ok();
-    let mut existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
+    let exits = tree
+        .as_ref()
+        .map(crate::tools::junction_exit_points)
+        .unwrap_or_default();
+    insert_wire_with_exits(content, tree.as_ref(), &exits, (x1, y1), (x2, y2))
+}
+
+fn insert_wire_with_exits(
+    content: String,
+    tree: Option<&copperpour_sexp::SexpNode>,
+    exits: &[(f64, f64)],
+    (x1, y1): (f64, f64),
+    (x2, y2): (f64, f64),
+) -> String {
+    let mut existing_wires = tree.map(extract_wires).unwrap_or_default();
 
     // Existing junction positions, so a hit already marked isn't re-inserted
     // (L-bends, and any loop calling this repeatedly, would otherwise double it).
     let existing_junctions = tree
-        .as_ref()
         .map(copperpour_sexp::schematic::extract_junctions)
         .unwrap_or_default();
 
@@ -658,11 +685,7 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    let exits = tree
-        .as_ref()
-        .map(crate::tools::junction_exit_points)
-        .unwrap_or_default();
-    let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
+    let junctions = new_wire_junctions(&existing_wires, exits, (x1, y1), (x2, y2));
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
@@ -681,7 +704,7 @@ pub(crate) fn insert_wire_with_junctions(
 /// The proposed schematic and the points the wire runs through, corner included.
 pub(crate) struct Routed {
     pub(crate) content: String,
-    path: Vec<(f64, f64)>,
+    pub(super) path: Vec<(f64, f64)>,
 }
 
 pub(crate) enum ConnectionRefusal {
@@ -689,6 +712,7 @@ pub(crate) enum ConnectionRefusal {
     UnprovenContact,
     PinNotPlaced,
     MissedPin,
+    UnsupportedSavedOrientation(String),
     Unsafe(Vec<String>),
 }
 
@@ -697,8 +721,8 @@ impl ConnectionRefusal {
         match self {
             Self::ZeroLengthSegment => vec!["KiCad would read a zero-length wire segment".into()],
             Self::UnprovenContact => vec![
-                "the pin tips coincide, but contact cannot be confirmed for a hidden, \
-                 electrically unconnected or unresolved pin"
+                "the pin tips coincide, but contact cannot be confirmed for an electrically \
+                 unconnected or unresolved pin"
                     .into(),
             ],
             Self::PinNotPlaced => {
@@ -707,6 +731,9 @@ impl ConnectionRefusal {
             Self::MissedPin => {
                 vec!["KiCad would read a wire end away from its requested pin".into()]
             }
+            Self::UnsupportedSavedOrientation(reference) => vec![format!(
+                "{reference} has a saved symbol angle KiCad cannot load"
+            )],
             Self::Unsafe(reasons) => reasons,
         }
     }
@@ -727,40 +754,34 @@ impl ConnectionRefusal {
     }
 }
 
-fn kicad_schematic_mm(mm: f64) -> f64 {
-    // KiCad's schematic parser clamps to its displayable range, then rounds
-    // to integer 100 nm units (SCH_IO_KICAD_SEXPR_PARSER::parseInternalUnits).
-    const IU_PER_MM: f64 = 10_000.0;
-    const LIMIT: f64 = i32::MAX as f64 * 7071.0 / 10_000.0;
-    (mm * IU_PER_MM).clamp(-LIMIT, LIMIT).round() / IU_PER_MM
-}
-
-fn saved_pin_tip(pin: &NamedPin) -> (f64, f64) {
-    // KiCad reads the origin and library pin offset separately, and truncates
-    // the instance angle before choosing the orthogonal transform.
-    transform_pin(
-        kicad_schematic_mm(pin.pin.local_x),
-        kicad_schematic_mm(pin.pin.local_y),
-        copperpour_sexp::geometry::PinTransform {
-            comp_x: kicad_schematic_mm(pin.t.comp_x),
-            comp_y: kicad_schematic_mm(pin.t.comp_y),
-            rotation_deg: pin.t.rotation_deg.trunc(),
-            ..pin.t
-        },
-    )
-}
-
 fn saved_wire_point((x, y): (f64, f64)) -> (f64, f64) {
     (kicad_schematic_mm(round6(x)), kicad_schematic_mm(round6(y)))
+}
+
+fn kicad_reads_symbol_angle(symbol: &copperpour_sexp::SexpNode) -> bool {
+    use copperpour_sexp::SexpNode::Atom;
+    // KiCad requires a numeric token and switches on its truncated value.
+    // The general-purpose parse_at defaults missing or malformed angles to zero.
+    let read_angle = || {
+        let [_, _, _, Atom(value)] = symbol.find("at")?.children()? else {
+            return None;
+        };
+        let angle: f64 = value.parse().ok()?;
+        Some(angle.trunc())
+    };
+    matches!(read_angle(), Some(0.0 | 90.0 | 180.0 | 270.0))
+}
+
+struct PlacedPinDefinition<'a> {
+    placed: &'a copperpour_sexp::SexpNode,
+    instance: copperpour_sexp::schematic::SymbolInstance,
+    pins: Vec<&'a copperpour_sexp::SexpNode>,
 }
 
 fn placed_pin_definition<'a>(
     tree: &'a copperpour_sexp::SexpNode,
     named: &NamedPin,
-) -> Option<(
-    &'a copperpour_sexp::SexpNode,
-    Vec<&'a copperpour_sexp::SexpNode>,
-)> {
+) -> Option<PlacedPinDefinition<'a>> {
     use copperpour_sexp::schematic::{lib_pin_nodes_for_body_style, symbol_instance};
     let uuid = named.instance_uuid.as_deref()?;
     let mut instances = tree
@@ -783,44 +804,161 @@ fn placed_pin_definition<'a>(
         && pins.iter().all(|pin| {
             parse_at(pin).is_some_and(|(x, y, _)| (x, y) == (named.pin.local_x, named.pin.local_y))
         });
-    verified.then_some((placed, pins))
+    verified.then_some(PlacedPinDefinition {
+        placed,
+        instance: inst,
+        pins,
+    })
 }
 
-fn can_confirm_pin_contact(
-    placed: &copperpour_sexp::SexpNode,
-    pins: &[&copperpour_sexp::SexpNode],
-    number: &str,
-) -> bool {
-    use copperpour_sexp::schematic::lib_pin_is_hidden;
+fn can_confirm_pin_contact(definition: &PlacedPinDefinition<'_>, number: &str) -> bool {
+    let PlacedPinDefinition { placed, pins, .. } = definition;
+    // KiCad uses the last position if (at ...) is repeated, but pin lookup
+    // uses the first. Only confirm contact when the saved position is unique.
+    let positions = placed.find_all("at");
+    let [position] = positions.as_slice() else {
+        return false;
+    };
+    // Read the saved angle without parse_at's zero default.
+    let angle = position.get_f64(3);
+    if !matches!(angle.map(f64::trunc), Some(0.0 | 90.0 | 180.0 | 270.0)) {
+        return false;
+    }
+    // The same first-vs-last placement ambiguity applies inside library pins.
+    if pins.iter().any(|pin| pin.find_all("at").len() != 1) {
+        return false;
+    }
     let mut placed_pins = placed
         .find_all("pin")
         .into_iter()
         .filter(|pin| pin.get(1).and_then(|n| n.as_str()) == Some(number));
-    let alternate = placed_pins
-        .next()
-        .and_then(|pin| pin.find_str("alternate"))
-        .filter(|name| !name.is_empty());
+    let selected = placed_pins.next();
     if placed_pins.next().is_some() {
         return false;
     }
+    let selections = selected.map_or_else(Vec::new, |pin| pin.find_all("alternate"));
+    let alternate = match selections.as_slice() {
+        [] => None,
+        [selection] => match selection.get(1).and_then(|n| n.as_str()) {
+            Some(name) => (!name.is_empty()).then_some(name),
+            None => return false,
+        },
+        _ => return false,
+    };
+    // Visibility does not disqualify a pin from electrical contact.
     let eligible = |pin: &copperpour_sexp::SexpNode| {
-        if lib_pin_is_hidden(pin) {
-            return Some(false);
-        }
         let kind = match alternate {
             None => pin.get(1)?.as_str()?,
-            Some(name) => pin
-                .find_all("alternate")
-                .into_iter()
-                .find(|alt| alt.get(1).and_then(|n| n.as_str()) == Some(name))?
-                .get(2)?
-                .as_str()?,
+            Some(name) => {
+                let mut definitions = pin
+                    .find_all("alternate")
+                    .into_iter()
+                    .filter(|alt| alt.get(1).and_then(|n| n.as_str()) == Some(name));
+                let selected = definitions.next()?;
+                if definitions.next().is_some() {
+                    return Some(false);
+                }
+                selected.get(2)?.as_str()?
+            }
         };
         Some(!matches!(kind, "no_connect" | "unconnected"))
     };
-    // A repeated pin number in one body must not let one eligible copy hide
-    // an ineligible one. Resolve the visible/electrical status of each.
+    // A repeated pin number in one body must not let one eligible copy mask
+    // an ineligible one. Resolve the electrical type of each.
     pins.iter().all(|pin| eligible(pin) == Some(true))
+}
+
+fn saved_contact_references<'a>(
+    definition: &PlacedPinDefinition<'a>,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    let mut records = Vec::new();
+    for instances in definition.placed.find_all("instances") {
+        for project in instances.find_all("project") {
+            for path in project.find_all("path") {
+                let (references, units) = (path.find_all("reference"), path.find_all("unit"));
+                let ([reference], [unit]) = (references.as_slice(), units.as_slice()) else {
+                    return None;
+                };
+                let reference = reference
+                    .get(1)?
+                    .as_str()
+                    .filter(|value| !value.is_empty())?;
+                let path = path.get(1)?.as_str()?;
+                if unit.get_f64(1) != Some(f64::from(definition.instance.unit)) {
+                    return None;
+                }
+                records.push((path, reference));
+            }
+        }
+    }
+    Some(records)
+}
+
+pub(super) fn contact_instance_paths(
+    schematic: &std::path::Path,
+    tree: &copperpour_sexp::SexpNode,
+) -> Option<Vec<String>> {
+    match super::resolve_schematic_ownership(schematic).ok()? {
+        Some(owner) => Some(owner.instance_paths),
+        None => tree.find_str("uuid").map(|uuid| vec![format!("/{uuid}")]),
+    }
+}
+
+fn is_canonical_instance_path(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(|path| {
+        path.split('/').all(|segment| {
+            uuid::Uuid::try_parse(segment).is_ok_and(|id| {
+                id.hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    == segment
+            })
+        })
+    })
+}
+
+fn contact_references_agree<'a>(
+    from: &PlacedPinDefinition<'_>,
+    to: &PlacedPinDefinition<'_>,
+    instance_paths: impl FnOnce() -> Option<&'a [String]>,
+) -> bool {
+    let (Some(from_records), Some(to_records)) =
+        (saved_contact_references(from), saved_contact_references(to))
+    else {
+        return false;
+    };
+    let endpoints = [
+        (from.instance.reference.as_str(), from_records),
+        (to.instance.reference.as_str(), to_records),
+    ];
+    // If KiCad can pick a different annotation, prove both requested
+    // references occur together in the actual hierarchy, not a foreign path.
+    if endpoints
+        .iter()
+        .all(|(reference, records)| records.iter().all(|(_, saved)| saved == reference))
+    {
+        return true;
+    }
+    // KiCad treats alternate UUID spellings and extra slashes as the same
+    // path. Do not let a second spelling evade the conflict check.
+    if endpoints.iter().any(|(_, records)| {
+        records
+            .iter()
+            .any(|(path, _)| !is_canonical_instance_path(path))
+    }) {
+        return false;
+    }
+    instance_paths().is_some_and(|paths| {
+        paths.iter().any(|path| {
+            endpoints.iter().all(|(reference, records)| {
+                if records.is_empty() {
+                    return true;
+                }
+                let mut on_path = records.iter().filter(|(saved_path, _)| *saved_path == path);
+                on_path.next().is_some_and(|(_, saved)| saved == reference)
+                    && on_path.next().is_none()
+            })
+        })
+    })
 }
 
 pub(crate) enum PinRoute {
@@ -828,25 +966,45 @@ pub(crate) enum PinRoute {
     AlreadyConnected { x: f64, y: f64 },
 }
 
-pub(crate) fn route_between_pins(
+pub(crate) fn route_between_pins<'a>(
     content: &str,
     tree: &copperpour_sexp::SexpNode,
     from: &NamedPin,
     to: &NamedPin,
+    instance_paths: impl FnOnce() -> Option<&'a [String]>,
 ) -> anyhow::Result<Result<PinRoute, ConnectionRefusal>> {
-    let (Some((from_instance, from_pins)), Some((to_instance, to_pins))) = (
+    let (Some(from_definition), Some(to_definition)) = (
         placed_pin_definition(tree, from),
         placed_pin_definition(tree, to),
     ) else {
         return Ok(Err(ConnectionRefusal::PinNotPlaced));
     };
-    let (from_tip, to_tip) = (saved_pin_tip(from), saved_pin_tip(to));
-    if from_tip == to_tip {
-        if !can_confirm_pin_contact(from_instance, &from_pins, &from.pin.number)
-            || !can_confirm_pin_contact(to_instance, &to_pins, &to.pin.number)
-        {
-            return Ok(Err(ConnectionRefusal::UnprovenContact));
-        }
+    let (from_tip, to_tip) = (
+        schematic_pin_endpoint(&from.pin, from.t),
+        schematic_pin_endpoint(&to.pin, to.t),
+    );
+    let touching = from_tip == to_tip;
+    if touching
+        && (!can_confirm_pin_contact(&from_definition, &from.pin.number)
+            || !can_confirm_pin_contact(&to_definition, &to.pin.number)
+            || !contact_references_agree(&from_definition, &to_definition, instance_paths))
+    {
+        return Ok(Err(ConnectionRefusal::UnprovenContact));
+    }
+    // Preserve unverified-contact refusals, but check the whole sheet before
+    // reporting verified contact or drawing a route.
+    if let Some(symbol) = tree
+        .find_all("symbol")
+        .into_iter()
+        .find(|symbol| !kicad_reads_symbol_angle(symbol))
+    {
+        let reference = copperpour_sexp::schematic::symbol_instance(symbol)
+            .map_or_else(|| "A placed symbol".into(), |instance| instance.reference);
+        return Ok(Err(ConnectionRefusal::UnsupportedSavedOrientation(
+            reference,
+        )));
+    }
+    if touching {
         let (x, y) = from_tip;
         return Ok(Ok(PinRoute::AlreadyConnected { x, y }));
     }
@@ -856,8 +1014,7 @@ pub(crate) fn route_between_pins(
     if saved_wire_point(from_raw) != from_tip || saved_wire_point(to_raw) != to_tip {
         return Ok(Err(ConnectionRefusal::MissedPin));
     }
-    let ((x1, y1), (x2, y2)) = (from_raw, to_raw);
-    Ok(route_between(content, x1, y1, x2, y2)?.map(PinRoute::Drawn))
+    Ok(route_on_sheet(content, tree, from_raw, to_raw, true)?.map(PinRoute::Drawn))
 }
 
 /// Route a straight wire when aligned, otherwise try the two elbows in order
@@ -866,58 +1023,61 @@ pub(crate) fn route_between_pins(
 ///
 /// The inner `Err` holds one reason per bend in horizontal-first, vertical-first
 /// order, or why no candidate could be drawn or checked.
-fn route_between(
+pub(super) fn route_between(
     content: &str,
     x1: f64,
     y1: f64,
     x2: f64,
     y2: f64,
 ) -> anyhow::Result<Result<Routed, ConnectionRefusal>> {
-    let before = parse_sexp(content)?;
-    let (start, end) = (saved_wire_point((x1, y1)), saved_wire_point((x2, y2)));
+    route_on_sheet(content, &parse_sexp(content)?, (x1, y1), (x2, y2), false)
+}
+
+fn route_on_sheet(
+    content: &str,
+    before: &copperpour_sexp::SexpNode,
+    from: (f64, f64),
+    to: (f64, f64),
+    verify_saved_pins: bool,
+) -> anyhow::Result<Result<Routed, ConnectionRefusal>> {
+    let (start, end) = (saved_wire_point(from), saved_wire_point(to));
     let same_x = start.0 == end.0;
     let same_y = start.1 == end.1;
-    let aligned = (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01;
+    let aligned = route_uses_straight_wire(from, to);
     // Either elbow has a zero-length leg when just one axis collapses.
     if (same_x && same_y) || (!aligned && (same_x || same_y)) {
         return Ok(Err(ConnectionRefusal::ZeroLengthSegment));
     }
-    let Some(guard) = RouteGuard::new(&before, (x1, y1), &[(x2, y2)]) else {
+    // The saved-coordinate graph cannot verify joins along a diagonal span.
+    if aligned && !same_x && !same_y {
+        return Ok(Err(ConnectionRefusal::Unsafe(vec![
+            "cannot check what a diagonal straight route would join; align its endpoints in saved coordinates".into(),
+        ])));
+    }
+    let guard = if verify_saved_pins {
+        RouteGuard::for_saved_pins(before, from, to)
+    } else {
+        RouteGuard::new(before, from, &[to])
+    };
+    let Some(guard) = guard else {
         return Ok(Err(ConnectionRefusal::Unsafe(vec![format!(
             "cannot check what the route would join: {}",
             crate::tools::UNRESOLVED_PIN_GEOMETRY
         )])));
     };
-    let from = (x1, y1);
-    let to = (x2, y2);
-    let straight = [from, to];
-    let horizontal = [from, (x2, y1), to];
-    let vertical = [from, (x1, y2), to];
-    let prefer_vertical = !aligned && vertical_elbow_is_clearer(&before, horizontal, vertical);
-    let bends: &[(&str, &[(f64, f64)])] = if aligned {
-        &[("straight", &straight)]
-    } else if prefer_vertical {
-        &[
-            ("vertical-first", &vertical),
-            ("horizontal-first", &horizontal),
-        ]
-    } else {
-        &[
-            ("horizontal-first", &horizontal),
-            ("vertical-first", &vertical),
-        ]
-    };
+    let (bends, prefer_vertical) = ordered_route_paths(before, from, to);
     let mut refused = Vec::new();
-    for &(bend, points) in bends {
-        let routed = points.windows(2).fold(content.to_owned(), |c, leg| {
-            insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
-        });
-        match guard.refusal(&format!("{bend} route"), &routed)? {
+    for (bend, points) in bends {
+        let routed = draw_route(content, &points);
+        let after = parse_sexp(&routed)?;
+        let name = format!("{bend} route");
+        let refusal = guard.refusal_in(&name, &after);
+        match refusal {
             Some(reason) => refused.push(reason),
             None => {
                 return Ok(Ok(Routed {
                     content: routed,
-                    path: points.to_vec(),
+                    path: points,
                 }));
             }
         }
@@ -926,6 +1086,81 @@ fn route_between(
         refused.reverse();
     }
     Ok(Err(ConnectionRefusal::Unsafe(refused)))
+}
+
+type RoutePaths = Vec<(&'static str, Vec<(f64, f64)>)>;
+
+pub(super) fn ordered_route_paths(
+    tree: &copperpour_sexp::SexpNode,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> (RoutePaths, bool) {
+    let mut bends = route_paths(from, to);
+    let prefer_vertical = match bends.as_slice() {
+        [(_, horizontal), (_, vertical)] => vertical_elbow_is_clearer(
+            tree,
+            [horizontal[0], horizontal[1], horizontal[2]],
+            [vertical[0], vertical[1], vertical[2]],
+        ),
+        _ => false,
+    };
+    if prefer_vertical {
+        bends.reverse();
+    }
+    (bends, prefer_vertical)
+}
+
+fn route_uses_straight_wire(from: (f64, f64), to: (f64, f64)) -> bool {
+    (from.0 - to.0).abs() < TOLERANCE || (from.1 - to.1).abs() < TOLERANCE
+}
+
+fn is_near_axis_diagonal(wire: &Wire) -> bool {
+    let from = (wire.x1, wire.y1);
+    let to = (wire.x2, wire.y2);
+    let a = super::sch_connectivity::schematic_point(from.0, from.1);
+    let b = super::sch_connectivity::schematic_point(to.0, to.1);
+    route_uses_straight_wire(from, to) && a.0 != b.0 && a.1 != b.1
+}
+
+pub(super) fn route_paths(from: (f64, f64), to: (f64, f64)) -> RoutePaths {
+    if route_uses_straight_wire(from, to) {
+        vec![("straight", vec![from, to])]
+    } else {
+        vec![
+            ("horizontal-first", vec![from, (to.0, from.1), to]),
+            ("vertical-first", vec![from, (from.0, to.1), to]),
+        ]
+    }
+}
+
+pub(super) fn draw_route(content: &str, points: &[(f64, f64)]) -> String {
+    points.windows(2).fold(content.to_owned(), |c, leg| {
+        insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
+    })
+}
+
+pub(super) fn draw_route_with_drawn_pins(
+    content: &str,
+    points: &[(f64, f64)],
+) -> anyhow::Result<String> {
+    let tree = parse_sexp(content)?;
+    let pins = super::drawn_symbol_pins(&tree)
+        .ok_or_else(|| anyhow::anyhow!(super::UNRESOLVED_PIN_GEOMETRY))?;
+    let exits = super::junction_exits(
+        &pins,
+        copperpour_sexp::schematic::extract_sheet_pins(&tree),
+        super::sch_connectivity::bus_entry_wire_ends(
+            &tree,
+            &copperpour_sexp::schematic::extract_buses(&tree),
+            super::sch_connectivity::COINCIDENT_TOLERANCE,
+        ),
+    );
+    let mut content = content.to_owned();
+    for leg in points.windows(2) {
+        let tree = parse_sexp(&content)?;
+        content = insert_wire_with_exits(content, Some(&tree), &exits, leg[0], leg[1]);
+    }
+    Ok(content)
 }
 
 fn vertical_elbow_is_clearer(
@@ -992,13 +1227,15 @@ pub(crate) fn route_blocked(operation: &str, reasons: Vec<String>) -> CallToolRe
 /// What a sheet held before a wire from `from`, built once for every bend or
 /// direction tried. Wire ends are not terminals: a net is joined through what it
 /// carries, and a net of bare wires has nothing to short.
-struct RouteGuard {
+pub(super) struct RouteGuard {
     /// The nets at `from` and `also`, and those of any wire one lies on: a route
     /// ending mid-span is dotted there, so tapping a wire is the caller's ask.
     allowed: Vec<crate::tools::sch_connectivity::NetRoot>,
     a: (f64, f64),
     /// What sits at each point, in sheet order, so one join is reported once.
     terminals: Vec<Terminal>,
+    /// Named-pin routes use the selected pin functions to derive power drivers.
+    saved_pins: Option<crate::tools::PlacedPinsByReference>,
 }
 
 struct Terminal {
@@ -1012,13 +1249,33 @@ struct Terminal {
 impl RouteGuard {
     /// `None` when a placed symbol's pins cannot be resolved: the guard would
     /// not see them, and a route over them would join them unchecked.
-    fn new(
+    pub(super) fn new(
         before: &copperpour_sexp::SexpNode,
         from: (f64, f64),
         also: &[(f64, f64)],
     ) -> Option<Self> {
         let pins = crate::tools::resolved_placed_pins_by_reference(before)?;
-        Some(Self::with_pins(before, from, also, pins, None))
+        Some(Self::with_pins(before, from, also, pins, None, false))
+    }
+
+    pub(super) fn for_drawn_pins(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        also: &[(f64, f64)],
+    ) -> Option<Self> {
+        let pins = super::drawn_symbol_pins(before)?;
+        Some(Self::with_pins(before, from, also, pins, None, false))
+    }
+
+    fn for_saved_pins(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        to: (f64, f64),
+    ) -> Option<Self> {
+        let pins = super::drawn_pins_for_power_drivers(before)
+            .into_iter()
+            .collect::<Option<_>>()?;
+        Some(Self::with_pins(before, from, &[to], pins, None, true))
     }
 
     fn for_power(
@@ -1033,6 +1290,7 @@ impl RouteGuard {
             also,
             super::sch_pin_contacts::clearance_pin_inventory(before).0,
             Some(power_net),
+            false,
         )
     }
 
@@ -1042,17 +1300,24 @@ impl RouteGuard {
         also: &[(f64, f64)],
         pins: crate::tools::PlacedPinsByReference,
         power_net: Option<&str>,
+        saved: bool,
     ) -> Self {
-        use crate::tools::sch_connectivity::pt_key;
-        use copperpour_sexp::geometry::point_on_segment;
+        use crate::tools::sch_connectivity::{
+            net_graph_for, saved_route_net_graph, schematic_point, schematic_point_on_wire,
+        };
         use copperpour_sexp::schematic::{extract_sheet_pins, LabelKind};
-        let labels = copperpour_sexp::schematic::extract_all_net_labels(before);
+        let labels = Self::labels(before, saved);
         let wires = extract_wires(before);
-        let mut graph = crate::tools::sch_connectivity::net_graph_for(before, &wires, &labels);
+        let mut graph = if saved {
+            saved_route_net_graph(before, &wires, &labels, &pins)
+        } else {
+            net_graph_for(before, &wires, &labels)
+        };
 
         let mut terminals: Vec<Terminal> = Vec::new();
         let mut index: std::collections::HashMap<(i64, i64), usize> = Default::default();
-        let mut push = |at: (f64, f64), desc: String| match index.get(&pt_key(at.0, at.1)) {
+        let mut push = |at: (f64, f64), desc: String| match index.get(&schematic_point(at.0, at.1))
+        {
             Some(&i) => terminals[i].descs.push(desc),
             None => {
                 let root = graph.root_at(at.0, at.1);
@@ -1060,7 +1325,7 @@ impl RouteGuard {
                     .name_of_root(root)
                     .map(|n| format!(" on net {n}"))
                     .unwrap_or_default();
-                index.insert(pt_key(at.0, at.1), terminals.len());
+                index.insert(schematic_point(at.0, at.1), terminals.len());
                 terminals.push(Terminal {
                     at,
                     descs: vec![desc],
@@ -1069,15 +1334,22 @@ impl RouteGuard {
                 });
             }
         };
-        for (inst, pins) in pins {
+        for (inst, pins) in &pins {
             for (pin, t) in pins {
                 push(
-                    pin_endpoint(&pin, t),
+                    schematic_pin_endpoint(pin, *t),
                     format!("{} pin {}", inst.reference, pin.number),
                 );
             }
         }
-        for label in &labels {
+        // Named-pin routing gets its electrical drivers from the effective
+        // placed pins. Keep the saved power marks in diagnostics as well.
+        let power_marks = if saved {
+            super::sch_connectivity::saved_power_labels(before)
+        } else {
+            Vec::new()
+        };
+        for label in labels.iter().chain(&power_marks) {
             let kind = match label.kind {
                 LabelKind::NetLabel => "label",
                 LabelKind::GlobalLabel => "global label",
@@ -1090,13 +1362,16 @@ impl RouteGuard {
             push(at, "a sheet pin".into());
         }
 
-        let ends: Vec<_> = std::iter::once(from).chain(also.iter().copied()).collect();
+        let ends: Vec<_> = std::iter::once(from)
+            .chain(also.iter().copied())
+            .map(saved_wire_point)
+            .collect();
         let mut allowed: Vec<_> = ends.iter().map(|p| graph.root_at(p.0, p.1)).collect();
-        for w in &wires {
-            if ends.iter().any(|p| {
-                power_net.is_none() && point_on_segment(p.0, p.1, w.x1, w.y1, w.x2, w.y2, 0.01)
-            }) {
-                allowed.push(graph.root_at(w.x1, w.y1));
+        if power_net.is_none() {
+            for w in &wires {
+                if ends.iter().any(|&p| schematic_point_on_wire(p, w)) {
+                    allowed.push(graph.root_at(w.x1, w.y1));
+                }
             }
         }
         allowed.extend(
@@ -1107,25 +1382,71 @@ impl RouteGuard {
         );
         RouteGuard {
             allowed,
-            a: from,
+            a: ends[0],
             terminals,
+            saved_pins: saved.then_some(pins),
         }
     }
 
-    /// Why the `candidate` sheet in `after` is refused, or `None` when it joins
-    /// nothing [`Self::foreign_joins`] reports.
-    fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
-        let joined = self.foreign_joins(&parse_sexp(after)?);
-        Ok((!joined.is_empty())
-            .then(|| format!("the {candidate} would join {}", joined.join(", "))))
+    fn labels(
+        tree: &copperpour_sexp::SexpNode,
+        saved: bool,
+    ) -> Vec<copperpour_sexp::schematic::Label> {
+        if saved {
+            // The saved graph derives power drivers from their actual pin tips.
+            copperpour_sexp::schematic::extract_labels(tree)
+        } else {
+            super::sch_connectivity::saved_net_labels(tree)
+        }
+    }
+
+    /// Why the `candidate` sheet in `after` is refused, or `None` when its
+    /// geometry can be checked and it joins no foreign terminals.
+    pub(super) fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.refusal_in(candidate, &parse_sexp(after)?))
+    }
+
+    fn refusal_in(&self, candidate: &str, after: &copperpour_sexp::SexpNode) -> Option<String> {
+        match self.checked_foreign_joins(after) {
+            Ok(joined) => (!joined.is_empty())
+                .then(|| format!("the {candidate} would join {}", joined.join(", "))),
+            Err(reason) => Some(format!("the {candidate} {reason}")),
+        }
+    }
+
+    fn checked_foreign_joins(
+        &self,
+        after: &copperpour_sexp::SexpNode,
+    ) -> Result<Vec<String>, &'static str> {
+        let wires = extract_wires(after);
+        // The old graph could attach to an almost orthogonal wire. The new
+        // graph excludes its diagonal span, so it cannot clear a route here.
+        if wires.iter().any(is_near_axis_diagonal) {
+            return Err("cannot be checked on a sheet with a near-axis diagonal wire");
+        }
+        Ok(self.foreign_joins_with_wires(after, &wires))
+    }
+
+    /// Cleanup apply needs individual terminal diagnostics. An uncheckable
+    /// route must also return a reason so it cannot be cleared for writing.
+    pub(super) fn foreign_joins(&self, after: &copperpour_sexp::SexpNode) -> Vec<String> {
+        self.checked_foreign_joins(after)
+            .unwrap_or_else(|reason| vec![format!("the cleanup route {reason}")])
     }
 
     /// Each point whose items `after` puts on `a`'s net although they were on
     /// no allowed net before.
-    fn foreign_joins(&self, after: &copperpour_sexp::SexpNode) -> Vec<String> {
-        let labels = copperpour_sexp::schematic::extract_all_net_labels(after);
-        let mut graph =
-            crate::tools::sch_connectivity::net_graph_for(after, &extract_wires(after), &labels);
+    fn foreign_joins_with_wires(
+        &self,
+        after: &copperpour_sexp::SexpNode,
+        wires: &[Wire],
+    ) -> Vec<String> {
+        use crate::tools::sch_connectivity::{net_graph_for, saved_route_net_graph};
+        let labels = Self::labels(after, self.saved_pins.is_some());
+        let mut graph = match &self.saved_pins {
+            Some(pins) => saved_route_net_graph(after, wires, &labels, pins),
+            None => net_graph_for(after, wires, &labels),
+        };
         let routed = graph.root_at(self.a.0, self.a.1);
         self.terminals
             .iter()
@@ -1369,6 +1690,7 @@ struct IdentifiedPin {
 /// more coarsely — it cannot see one symbol of ten failing to resolve.
 fn identified_pins(
     tree: &copperpour_sexp::SexpNode,
+    resolve: PinResolver,
 ) -> Result<Vec<IdentifiedPin>, NoConnectCarryError> {
     let unresolved = || NoConnectCarryError::Unmappable {
         reason: format!(
@@ -1376,7 +1698,7 @@ fn identified_pins(
             crate::tools::UNRESOLVED_PIN_GEOMETRY
         ),
     };
-    let grouped = crate::tools::resolved_placed_pins_by_reference(tree).ok_or_else(unresolved)?;
+    let grouped = resolve(tree).ok_or_else(unresolved)?;
     let mut pins = Vec::new();
     for (instance, placed) in grouped {
         let symbol_uuid = instance.uuid.clone().ok_or_else(unresolved)?;
@@ -1505,7 +1827,21 @@ pub(crate) fn plan_no_connect_carry(
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, true)
+    plan_no_connect_carry_with(
+        before,
+        after,
+        true,
+        super::resolved_placed_pins_by_reference,
+    )
+}
+
+/// Cleanup plans against the drawn sheet, so only selected body-style pins can
+/// own a marker. The legacy placement and replacement tools keep their resolver.
+pub(super) fn plan_drawn_no_connect_carry(
+    before: &copperpour_sexp::SexpNode,
+    after: &copperpour_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    plan_no_connect_carry_with(before, after, true, super::drawn_symbol_pins)
 }
 
 /// Follow a no-connect through a symbol replacement by the identity that the
@@ -1519,13 +1855,21 @@ pub(crate) fn plan_no_connect_carry_for_replacement(
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, false)
+    plan_no_connect_carry_with(
+        before,
+        after,
+        false,
+        super::resolved_placed_pins_by_reference,
+    )
 }
+
+type PinResolver = fn(&copperpour_sexp::SexpNode) -> Option<super::PlacedPinsByReference>;
 
 fn plan_no_connect_carry_with(
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,
     require_same_local_geometry: bool,
+    resolve: PinResolver,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
     const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
     let coincident = |a: (f64, f64), b: (f64, f64)| {
@@ -1552,7 +1896,10 @@ fn plan_no_connect_carry_with(
         return Ok(Vec::new());
     }
 
-    let (before_pins, after_pins) = (identified_pins(before)?, identified_pins(after)?);
+    let (before_pins, after_pins) = (
+        identified_pins(before, resolve)?,
+        identified_pins(after, resolve)?,
+    );
 
     let mut carries: Vec<NoConnectCarry> = Vec::new();
     for (uuid, from) in &markers {
@@ -3362,7 +3709,7 @@ fn power_symbol_origin(
     point: (f64, f64),
     rotation: f64,
 ) -> (f64, f64) {
-    let (dx, dy) = pin_endpoint(
+    let (dx, dy) = super::sch_connectivity::schematic_pin_endpoint(
         power_pin,
         copperpour_sexp::geometry::PinTransform {
             comp_x: 0.0,
@@ -3406,14 +3753,14 @@ struct ExistingPower {
 
 impl ExistingPower {
     fn new(tree: &copperpour_sexp::SexpNode, power_net: &str) -> Self {
-        use copperpour_sexp::schematic::{extract_all_net_labels, extract_power_symbol_labels};
+        use super::sch_connectivity::{saved_net_labels, saved_power_labels};
         let mut graph = super::sch_connectivity::net_graph_for(
             tree,
             &extract_wires(tree),
-            &extract_all_net_labels(tree),
+            &saved_net_labels(tree),
         );
         let instances = extract_symbol_instances(tree);
-        let symbols = extract_power_symbol_labels(tree)
+        let symbols = saved_power_labels(tree)
             .into_iter()
             .filter(|l| l.net == power_net)
             .filter_map(|l| {
@@ -3894,12 +4241,10 @@ async fn handle_add_power_symbol(
         Ok(selector) => selector,
         Err(e) => return Ok(e),
     };
-    let requested_rotation = if matches!(selector, PowerSelector::Point { .. }) {
-        opt_f64(args, "rotation")
-    } else if args["rotation"].is_null() {
+    let requested_rotation = if args["rotation"].is_null() {
         None
     } else {
-        match require_f64(args, "rotation") {
+        match super::symbol_rotation_arg(&args["rotation"], "rotation") {
             Ok(rotation) => Some(rotation),
             Err(error) => return Ok(error),
         }
@@ -3947,7 +4292,7 @@ async fn handle_add_power_symbol(
             };
             let site = match resolve_power_pin(&placed, &reference, &pin_number) {
                 Ok(pin) => PowerSite::Pin {
-                    endpoint: pin.endpoint(),
+                    endpoint: schematic_pin_endpoint(&pin.pin, pin.t),
                     outward: pin.outward(),
                 },
                 Err(e) => return Ok(e),
@@ -4175,6 +4520,7 @@ struct PowerPoint {
     pins: Vec<(String, String)>,
     endpoint: (f64, f64),
     outward: f64,
+    rotation_requests: Vec<usize>,
     rotation: Option<f64>,
 }
 
@@ -4196,6 +4542,43 @@ impl PowerPoint {
             .map(|(r, n)| json!({"reference": r, "pin_number": n}))
             .collect::<Vec<_>>())
     }
+}
+
+/// Check agreement at an unjoined point. Only a stub that will be drawn uses
+/// the angle, so only that case requires quarter turns.
+fn power_rotation_agreement(
+    point: &PowerPoint,
+    requested: &[serde_json::Value],
+    will_draw: bool,
+) -> Result<Option<f64>, CallToolResult> {
+    let rotations = point
+        .rotation_requests
+        .iter()
+        .map(|&index| {
+            let value = &requested[index]["rotation"];
+            let rotation = if will_draw {
+                super::symbol_rotation_arg(value, &format!("pins[{index}].rotation"))?
+            } else {
+                // Already checked when the request was read. Keep the old
+                // stacked-pin conflict check even if the stub is blocked.
+                value
+                    .as_f64()
+                    .expect("validated rotation")
+                    .rem_euclid(360.0)
+            };
+            Ok((index, rotation))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(&(_, first)) = rotations.first() else {
+        return Ok(None);
+    };
+    if let Some(&(index, _)) = rotations.iter().find(|&&(_, rotation)| rotation != first) {
+        return Err(crate::tools::invalid_arg(
+            &format!("pins[{index}].rotation"),
+            "stacked pins sharing a power symbol must agree on rotation",
+        ));
+    }
+    Ok(Some(first))
 }
 
 /// Split points into rows that can share one bar: same outward direction, same
@@ -4266,7 +4649,14 @@ impl PowerObstacles {
         let (pins, unresolved_pins) = super::sch_pin_contacts::clearance_pin_inventory(tree);
         let mut points: Vec<_> = pins
             .iter()
-            .flat_map(|(_, pins)| pins.iter().map(|(pin, t)| (pin_endpoint(pin, *t), "pin")))
+            .flat_map(|(_, pins)| {
+                pins.iter().map(|(pin, t)| {
+                    (
+                        super::sch_connectivity::schematic_pin_endpoint(pin, *t),
+                        "pin",
+                    )
+                })
+            })
             .collect();
         points.extend(
             ks::extract_labels(tree)
@@ -4477,7 +4867,6 @@ pub(crate) async fn handle_batch_add_power_symbol(
     // Validate every selector before planning. Missing pin geometry is a
     // safety refusal, distinct from a stale or ambiguous selector.
     let mut points: Vec<PowerPoint> = Vec::new();
-    let mut conflicting_rotations = Vec::new();
     let (mut obstacles, placed_pins) = PowerObstacles::with_drawn_pins(&tree);
     let mut errors = Vec::new();
     let mut blocking_reasons = Vec::new();
@@ -4494,17 +4883,15 @@ pub(crate) async fn handle_batch_add_power_symbol(
             (Ok(r), Ok(n)) => (r, n),
             (Err(e), _) | (_, Err(e)) => return Ok(e),
         };
-        let rotation = match &pin["rotation"] {
+        let rotation_index = match &pin["rotation"] {
             serde_json::Value::Null => None,
-            value => match value.as_f64() {
-                Some(rotation) if rotation.is_finite() => Some(rotation),
-                _ => {
-                    return Ok(crate::tools::invalid_arg(
-                        &format!("pins[{index}].rotation"),
-                        "must be a finite number of degrees",
-                    ))
-                }
-            },
+            value if value.as_f64().is_some_and(f64::is_finite) => Some(index),
+            _ => {
+                return Ok(crate::tools::invalid_arg(
+                    &format!("pins[{index}].rotation"),
+                    "must be a finite number of degrees",
+                ))
+            }
         };
         if obstacles.pin_geometry_unresolved(&reference) {
             let reason = obstacles
@@ -4520,21 +4907,13 @@ pub(crate) async fn handle_batch_add_power_symbol(
             continue;
         }
         let (endpoint, outward) = match resolve_power_pin(&placed_pins, &reference, &pin_number) {
-            Ok(pin) => (pin.endpoint(), pin.outward()),
+            Ok(pin) => (schematic_pin_endpoint(&pin.pin, pin.t), pin.outward()),
             Err(e) => return Ok(e),
         };
         let pin = (reference, pin_number);
-        match points
-            .iter_mut()
-            .find(|p| points_coincident(p.endpoint.0, p.endpoint.1, endpoint.0, endpoint.1, 0.01))
-        {
+        match points.iter_mut().find(|p| p.endpoint == endpoint) {
             Some(point) => {
-                if let (Some(a), Some(b)) = (point.rotation, rotation) {
-                    if a.rem_euclid(360.0) != b.rem_euclid(360.0) {
-                        conflicting_rotations.push((point.endpoint, index));
-                    }
-                }
-                point.rotation = point.rotation.or(rotation);
+                point.rotation_requests.extend(rotation_index);
                 if !point.pins.contains(&pin) {
                     point.pins.push(pin);
                 }
@@ -4543,7 +4922,8 @@ pub(crate) async fn handle_batch_add_power_symbol(
                 pins: vec![pin],
                 endpoint,
                 outward,
-                rotation,
+                rotation_requests: rotation_index.into_iter().collect(),
+                rotation: None,
             }),
         }
     }
@@ -4599,20 +4979,8 @@ pub(crate) async fn handle_batch_add_power_symbol(
         }
         unjoined.push((index, group, not_joined_reason));
     }
-    if obstacles.unresolved_pins.is_empty() {
-        if let Some((_, index)) = conflicting_rotations.iter().find(|(at, _)| {
-            unjoined
-                .iter()
-                .any(|(_, group, _)| group.iter().any(|point| point.endpoint == *at))
-        }) {
-            return Ok(crate::tools::invalid_arg(
-                &format!("pins[{index}].rotation"),
-                "stacked pins sharing a power symbol must agree on rotation",
-            ));
-        }
-    }
     for (index, group, not_joined_reason) in unjoined {
-        for point in group {
+        for mut point in group {
             let checked =
                 match checked_power_stub(&obstacles, point.endpoint, point.outward, stub_length) {
                     Ok(stub) => match power_wires_refusal(
@@ -4630,6 +4998,11 @@ pub(crate) async fn handle_batch_add_power_symbol(
             let stub = match checked {
                 Ok(stub) => stub,
                 Err(reasons) => {
+                    if obstacles.unresolved_pins.is_empty() && point.rotation_requests.len() > 1 {
+                        if let Err(error) = power_rotation_agreement(&point, &requested, false) {
+                            return Ok(error);
+                        }
+                    }
                     errors.extend(point.pins.iter().map(|(reference, pin_number)| {
                         json!({
                             "reference": reference,
@@ -4645,6 +5018,10 @@ pub(crate) async fn handle_batch_add_power_symbol(
                     }
                     continue;
                 }
+            };
+            point.rotation = match power_rotation_agreement(&point, &requested, true) {
+                Ok(rotation) => rotation,
+                Err(error) => return Ok(error),
             };
             obstacles.wires.push(stub);
             obstacles.points.push((stub.1, "pin"));
@@ -5173,10 +5550,10 @@ async fn handle_connect_to_net(
         Err(e) => return Ok(e),
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
-    let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    let fixed_length = opt_f64(args, "stub_length");
     // A negative length would flip the stub's direction; 0 is a label on the
     // point with no wire, as in batch_connect_to_net.
-    if stub_length < 0.0 || !stub_length.is_finite() {
+    if fixed_length.is_some_and(|length| length < 0.0 || !length.is_finite()) {
         return Ok(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
                 field: "stub_length".to_string(),
@@ -5187,7 +5564,7 @@ async fn handle_connect_to_net(
     }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
-    let (_, tree) = read_schematic(&sch_path)?;
+    let (source, tree) = read_schematic(&sch_path)?;
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
@@ -5233,70 +5610,126 @@ async fn handle_connect_to_net(
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
     let outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    let pin = (pin_x, pin_y);
     let dirs = crate::tools::stub_directions(direction, outward);
-    let mut sch = cse::Schematic::load(&sch_path)?;
     let exits = crate::tools::junction_exit_points(&tree);
-    // A zero-length stub is a label on the pin, which joins only the net asked for.
-    let dir = if stub_length > 0.0 {
-        match clear_stub_direction(
-            &sch,
-            &exits,
-            (pin_x, pin_y),
-            &dirs,
-            stub_length,
-            label_type,
-            &net,
-            &[],
-        )? {
-            Ok(dir) => dir,
-            Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
-        }
+    const LENGTHS: [f64; 3] = [2.54, 5.08, 7.62];
+    let lengths = fixed_length
+        .as_ref()
+        .map_or(LENGTHS.as_slice(), std::slice::from_ref);
+    let scratch = || cse::Schematic::from_source(&sch_path, source.as_str());
+    // A label on the anchor introduces no extra joins through a wire.
+    let guard = if fixed_length == Some(0.0) {
+        None
     } else {
-        crate::tools::stub_direction(direction, outward)
+        let guard = match stub_route_guard(scratch()?, pin, label_type, &net, &[])? {
+            Ok(guard) => guard,
+            Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
+        };
+        Some(guard)
     };
-    let (label_x, label_y, label_rot) = add_net_stub(
-        &mut sch,
-        &exits,
-        (pin_x, pin_y),
-        &dir,
-        stub_length,
-        label_type,
-        &net,
-    );
 
-    sch.overwrite()?;
+    let mut selected = None;
+    let mut refused = Vec::new();
+    'directions: for dir in dirs {
+        for &length in lengths {
+            let mut candidate = scratch()?;
+            let (label_uuid, wire_uuid) =
+                add_net_stub(&mut candidate, &exits, pin, &dir, length, label_type, &net);
+            let content = candidate.to_source();
+            let after = parse_sexp(&content)?;
+            if let Some(reason) = guard
+                .as_ref()
+                .and_then(|guard| guard.refusal_in(&format!("{} stub", dir.name), &after))
+            {
+                // A pin at the end of a short stub can block longer tries too.
+                if !refused.contains(&reason) {
+                    refused.push(reason);
+                }
+                continue;
+            }
+            let mut changed_uuids = vec![label_uuid.as_str()];
+            changed_uuids.extend(wire_uuid.as_deref());
+            let clearance =
+                super::sch_analysis::added_clearance_findings(&tree, &after, &changed_uuids);
+            let clear = clearance.findings.is_empty();
+            if selected.is_none() || clear {
+                selected = Some((content, after, dir, label_uuid, wire_uuid, clearance));
+                if clear {
+                    break 'directions;
+                }
+            }
+        }
+    }
+    let Some((content, after, dir, label_uuid, wire_uuid, clearance)) = selected else {
+        return Ok(route_blocked("connect_to_net", refused));
+    };
+    let tag = if label_type == "global_label" {
+        "global_label"
+    } else {
+        "label"
+    };
+    let (label_x, label_y, label_rot) = after
+        .find_all(tag)
+        .into_iter()
+        .find(|node| node.find_str("uuid") == Some(label_uuid.as_str()))
+        .and_then(parse_at)
+        .ok_or_else(|| anyhow::anyhow!("prepared stub label has no saved position"))?;
+    let wire = wire_uuid
+        .map(|uuid| {
+            extract_wires(&after)
+                .into_iter()
+                .find(|wire| wire.uuid.as_deref() == Some(uuid.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("prepared stub wire has no saved endpoints"))
+        })
+        .transpose()?;
+    write_atomic_if_unchanged(&sch_path, &source, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
-        "wire": if stub_length > 0.0 {
-            json!({ "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y })
-        } else {
-            serde_json::Value::Null
-        },
-        "label": { "x": label_x, "y": label_y, "rotation": label_rot }
+        "wire": wire.as_ref().map(|w| json!({ "x1": pin_x, "y1": pin_y, "x2": w.x2, "y2": w.y2 })),
+        "label": { "x": label_x, "y": label_y, "rotation": label_rot },
+        "stub_length": wire.map_or(0.0, |w| round6((w.x2 - w.x1).hypot(w.y2 - w.y1))),
+        "text_overlaps": clearance.findings,
+        "bounds_unresolved": clearance.bounds_unresolved,
     })))
+}
+
+fn stub_route_guard(
+    mut asked: cse::Schematic,
+    pin: (f64, f64),
+    label_type: &str,
+    net: &str,
+    requested: &[(f64, f64)],
+) -> anyhow::Result<Result<RouteGuard, Vec<String>>> {
+    add_stub_label(&mut asked, label_type, net, pin, 0.0);
+    let before = parse_sexp(&asked.to_source())?;
+    Ok(RouteGuard::new(&before, pin, requested).ok_or_else(|| {
+        vec![format!(
+            "cannot check what the stub would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]
+    }))
 }
 
 /// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
 /// with the junctions it needs, and a net or global label at its end. Returns
-/// the label's position and rotation.
-pub(crate) fn add_net_stub(
+/// the UUIDs of the label and the optional wire.
+fn add_net_stub(
     sch: &mut cse::Schematic,
     exits: &[(f64, f64)],
     pin: (f64, f64),
-    dir: &crate::tools::StubDirection,
+    dir: &StubDirection,
     stub_length: f64,
     label_type: &str,
     net: &str,
-) -> (f64, f64, f64) {
+) -> (String, Option<String>) {
     let end = dir.end(pin, stub_length);
     // A zero-length stub is a label on the point: no degenerate wire.
-    if stub_length > 0.0 {
-        add_stub_wire(sch, exits, pin, end);
-    }
-    add_stub_label(sch, label_type, net, end, dir.label_rotation);
-    (end.0, end.1, dir.label_rotation)
+    let wire = (stub_length > 0.0).then(|| add_stub_wire(sch, exits, pin, end));
+    let label = add_stub_label(sch, label_type, net, end, dir.label_rotation);
+    (label, wire)
 }
 
 /// The first of `dirs` along which [`add_net_stub`] from `pin` joins nothing
@@ -5311,21 +5744,17 @@ pub(crate) fn clear_stub_direction(
     sch: &cse::Schematic,
     exits: &[(f64, f64)],
     pin: (f64, f64),
-    dirs: &[crate::tools::StubDirection],
+    dirs: &[StubDirection],
     stub_length: f64,
     label_type: &str,
     net: &str,
     requested: &[(f64, f64)],
-) -> anyhow::Result<Result<crate::tools::StubDirection, Vec<String>>> {
+) -> anyhow::Result<Result<StubDirection, Vec<String>>> {
     let source = sch.to_source();
     let scratch = || cse::Schematic::from_source(sch.filepath(), source.as_str());
-    let mut asked = scratch()?;
-    add_stub_label(&mut asked, label_type, net, pin, 0.0);
-    let Some(guard) = RouteGuard::new(&parse_sexp(&asked.to_source())?, pin, requested) else {
-        return Ok(Err(vec![format!(
-            "cannot check what the stub would join: {}",
-            crate::tools::UNRESOLVED_PIN_GEOMETRY
-        )]));
+    let guard = match stub_route_guard(scratch()?, pin, label_type, net, requested)? {
+        Ok(guard) => guard,
+        Err(reasons) => return Ok(Err(reasons)),
     };
     let mut refused = Vec::new();
     for dir in dirs {
@@ -5346,7 +5775,7 @@ pub(crate) fn add_stub_wire(
     exits: &[(f64, f64)],
     (x1, y1): (f64, f64),
     (x2, y2): (f64, f64),
-) {
+) -> String {
     // T-junction detection for the wire stub
     let mut existing_wires = cse_wires_to_sexp(sch);
     existing_wires.push(copperpour_sexp::schematic::Wire {
@@ -5358,8 +5787,9 @@ pub(crate) fn add_stub_wire(
     });
     let junctions = new_wire_junctions(&existing_wires, exits, (x1, y1), (x2, y2));
 
-    sch.add_wire(x1, y1, x2, y2);
+    let uuid = sch.add_wire(x1, y1, x2, y2).uuid.clone();
     add_missing_junctions(sch, &junctions);
+    uuid
 }
 
 /// The label half of [`add_net_stub`].
@@ -5369,19 +5799,21 @@ pub(crate) fn add_stub_label(
     net: &str,
     (x, y): (f64, f64),
     rotation: f64,
-) {
+) -> String {
     // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
     // unset, and KiCad then centres the text on the anchor (#43).
     match label_type {
         "global_label" => {
             sch.add_global_label(net, "input", x, y);
             let idx = sch.global_labels.len() - 1;
-            if let Some(gl) = sch.global_labels.get_mut(idx) {
-                gl.set_rotation(rotation);
-            }
+            let gl = sch.global_labels.get_mut(idx).expect("just pushed");
+            gl.set_rotation(rotation);
+            gl.uuid.clone()
         }
         _ => {
-            sch.add_label(net, x, y).set_rotation(rotation);
+            let label = sch.add_label(net, x, y);
+            label.set_rotation(rotation);
+            label.uuid.clone()
         }
     }
 }
@@ -5422,7 +5854,12 @@ async fn handle_connect_pins(
         Err(refusal) => return Ok(refusal.result("connect", RECOVERY)),
     };
     // Route wire(s) between the two pin endpoints
-    let routed = match route_between_pins(&content, &tree, &from, &to)? {
+    let instance_paths = std::cell::OnceCell::new();
+    let routed = match route_between_pins(&content, &tree, &from, &to, || {
+        instance_paths
+            .get_or_init(|| contact_instance_paths(&sch_path, &tree))
+            .as_deref()
+    })? {
         Ok(PinRoute::Drawn(routed)) => routed,
         Ok(PinRoute::AlreadyConnected { x, y }) => {
             return Ok(CallToolResult::json(&json!({
@@ -9290,6 +9727,36 @@ mod power_on_pin_tests {
 }
 
 #[cfg(test)]
+mod saved_route_power_tests {
+    use super::{parse_sexp, RouteGuard};
+    use crate::tools::sch_connectivity::schematic_point;
+
+    #[test]
+    fn saved_route_uses_effective_power_drivers_at_connected_pins() {
+        const FIXTURES: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/power_driver_priority_kicad10"
+        );
+        for (case, primary) in [
+            ("before", "VCC"),
+            ("midwire", "GND"),
+            ("midwire_junction", "VCC"),
+            ("passive_alternate", "GND"),
+        ] {
+            let path = format!("{FIXTURES}/{case}/ERC_same_name_local_global_power_port.kicad_sch");
+            let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let guard = RouteGuard::for_saved_pins(&tree, (134.62, 96.52), (160.02, 88.9)).unwrap();
+            let rail = guard
+                .terminals
+                .iter()
+                .find(|t| schematic_point(t.at.0, t.at.1) == schematic_point(134.62, 88.9))
+                .unwrap();
+            assert_eq!(rail.net, format!(" on net {primary}"), "{case}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod coincident_route_tests {
     use super::batch_power_tests::serve;
     use super::{extract_wires, json, parse_sexp};
@@ -9320,6 +9787,29 @@ mod coincident_route_tests {
         assert_eq!(result["error"]["reasons"], json!([reason]), "{result}");
     }
 
+    async fn batch_legacy_contact(handler: &McpHandler, path: &std::path::Path, touches: bool) {
+        let before = std::fs::read(path).unwrap();
+        let result = serve(
+            handler,
+            "batch_connect_pins",
+            path,
+            json!({"connections": [{"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"}]}),
+        )
+        .await;
+        let expected = if touches {
+            json!({"is_error": false, "connected_count": 0, "errors": [],
+                   "already_connected": [{"pair": "J1.1 -> R1.1", "x": 55.88, "y": 50.8}]})
+        } else {
+            json!({"is_error": true, "connected_count": 0, "already_connected": [],
+                   "errors": ["J1.1 -> R1.1: KiCad would read a wire end away from its requested pin"]})
+        };
+        assert_eq!(result, expected);
+        assert!(
+            std::fs::read(path).unwrap() == before,
+            "batch changed sheet"
+        );
+    }
+
     #[tokio::test]
     async fn connect_pins_reports_coincident_tips_without_writing() {
         // KiCad rounds the resistor origin and its local pin coordinate separately.
@@ -9344,6 +9834,7 @@ mod coincident_route_tests {
             result,
             json!({"is_error": false, "already_connected": true, "x": 55.88, "y": 50.8})
         );
+        batch_legacy_contact(&handler, &path, true).await;
     }
 
     #[tokio::test]
@@ -9365,6 +9856,32 @@ mod coincident_route_tests {
             result,
             json!({"is_error": false, "already_connected": true, "x": 55.88, "y": 50.8})
         );
+        batch_legacy_contact(&handler, &path, true).await;
+    }
+
+    #[tokio::test]
+    async fn named_pin_routes_check_sheet_angles_before_reporting_hidden_contact() {
+        let source = HIDDEN.replacen("(at 59.69 76.2 90)", "(at 59.69 76.2 45)", 1);
+        assert_ne!(source, HIDDEN);
+        let (handler, _dir, path) = setup(&source).await;
+        let pair = json!({"ref1": "#PWR01", "pin1": "1", "ref2": "R30", "pin2": "1"});
+        let reason = "R3 has a saved symbol angle KiCad cannot load";
+        let single = serve(&handler, "connect_pins", &path, pair.clone()).await;
+        assert_blocked(&single, "connect_pins", reason);
+        assert!(single.get("already_connected").is_none(), "{single}");
+        let batch = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({"is_error": true, "connected_count": 0, "already_connected": [],
+                   "errors": [format!("#PWR01.1 -> R30.1: {reason}")]})
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 
     #[tokio::test]
@@ -9390,6 +9907,7 @@ mod coincident_route_tests {
             "connect_pins",
             "KiCad would read a wire end away from its requested pin",
         );
+        batch_legacy_contact(&handler, &path, false).await;
     }
 
     #[tokio::test]
@@ -9405,13 +9923,8 @@ mod coincident_route_tests {
         );
         assert_ne!(source, SHEET);
         let (handler, _dir, path) = setup(&source).await;
-        let result = serve(
-            &handler,
-            "connect_pins",
-            &path,
-            json!({"ref1": "R20", "pin1": "99", "ref2": "R21", "pin2": "2"}),
-        )
-        .await;
+        let pair = json!({"ref1": "R20", "pin1": "99", "ref2": "R21", "pin2": "2"});
+        let result = serve(&handler, "connect_pins", &path, pair.clone()).await;
         assert!(
             std::fs::read(&path).unwrap() == source.as_bytes(),
             "sheet changed"
@@ -9421,59 +9934,447 @@ mod coincident_route_tests {
             "connect_pins",
             "the requested pin position is not verified in its placed body style",
         );
+        let batch = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({
+                "is_error": true,
+                "connected_count": 0,
+                "already_connected": [],
+                "errors": [
+                    "R20.99 -> R21.2: the requested pin position is not verified in its placed body style"
+                ]
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+    }
+
+    const HIDDEN: &str = include_str!("../../tests/fixtures/hidden_pin_contact_kicad10.kicad_sch");
+    const VISIBLE: &str =
+        include_str!("../../tests/fixtures/visible_pin_contact_kicad10.kicad_sch");
+    const ALTERNATE: &str =
+        include_str!("../../tests/fixtures/alternate_pin_contact_kicad10.kicad_sch");
+    const UNPROVEN_CONTACT: &str = "the pin tips coincide, but contact cannot be confirmed \
+                                    for an electrically unconnected or unresolved pin";
+
+    async fn assert_contact(source: &str, from: &str, to: &str, x: f64, y: f64) {
+        let (handler, _dir, path) = setup(source).await;
+        assert_contact_at(&handler, &path, source, from, to, (x, y)).await;
+    }
+
+    async fn assert_contact_at(
+        handler: &McpHandler,
+        path: &std::path::Path,
+        source: &str,
+        from: &str,
+        to: &str,
+        (x, y): (f64, f64),
+    ) {
+        let pair = json!({"ref1": from, "pin1": "1", "ref2": to, "pin2": "1"});
+        let single = serve(handler, "connect_pins", path, pair.clone()).await;
+        assert_eq!(
+            single,
+            json!({"is_error": false, "already_connected": true, "x": x, "y": y})
+        );
+        assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
+
+        let batch = serve(
+            handler,
+            "batch_connect_pins",
+            path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({
+                "is_error": false,
+                "connected_count": 0,
+                "already_connected": [{"pair": format!("{from}.1 -> {to}.1"), "x": x, "y": y}],
+                "errors": []
+            })
+        );
+        assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
     }
 
     #[tokio::test]
-    async fn contact_does_not_claim_hidden_or_electrically_unconnected_pins() {
-        let pin = "(pin passive line\n\t\t\t\t\t(at 0 3.81 270)";
-        let alternate = SHEET.replacen(
-            pin,
-            &format!("{pin}\n\t\t\t\t\t(alternate \"NC\" no_connect line)"),
-            1,
-        );
-        let (start, end) = crate::tools::find_all_symbol_instance_blocks(&alternate, "R1")[0];
-        let mut selected = alternate.clone();
-        let symbol =
-            alternate[start..end].replacen("(pin \"1\"", "(pin \"1\"\n\t\t\t(alternate \"NC\")", 1);
-        selected.replace_range(start..end, &symbol);
-        for source in [
-            SHEET.replacen(pin, &format!("{pin}\n\t\t\t\t\t(hide yes)"), 1),
-            SHEET.replacen(pin, "(pin unconnected line\n\t\t\t\t\t(at 0 3.81 270)", 1),
-            selected,
-        ] {
-            assert_ne!(source, SHEET);
-            let (handler, _dir, path) = setup(&source).await;
-            let pair = json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"});
-            let single = serve(&handler, "connect_pins", &path, pair.clone()).await;
-            assert!(
-                std::fs::read(&path).unwrap() == source.as_bytes(),
-                "sheet changed"
-            );
-            assert_blocked(
-                &single,
-                "connect_pins",
-                "the pin tips coincide, but contact cannot be confirmed for a hidden, \
-                 electrically unconnected or unresolved pin",
-            );
+    async fn reports_hidden_power_pin_contact_without_writing() {
+        assert_contact(HIDDEN, "#PWR01", "R30", 124.46, 137.16).await;
+    }
+
+    #[tokio::test]
+    async fn reports_visible_power_pin_contact_without_writing() {
+        assert_contact(VISIBLE, "#PWR01", "R30", 124.46, 137.16).await;
+    }
+
+    #[tokio::test]
+    async fn reports_hidden_passive_pin_contact_without_writing() {
+        assert_contact(HIDDEN, "R2", "R1", 55.88, 50.8).await;
+    }
+
+    async fn assert_contact_refusal(source: &str, a: (&str, &str), b: (&str, &str)) {
+        let (handler, _dir, path) = setup(source).await;
+        assert_contact_refusal_at(&handler, &path, source, a, b).await;
+    }
+
+    async fn assert_contact_refusal_at(
+        handler: &McpHandler,
+        path: &std::path::Path,
+        source: &str,
+        a: (&str, &str),
+        b: (&str, &str),
+    ) {
+        for ((from, pin1), (to, pin2)) in [(a, b), (b, a)] {
+            let pair = json!({"ref1": from, "pin1": pin1, "ref2": to, "pin2": pin2});
+            let single = serve(handler, "connect_pins", path, pair.clone()).await;
+            assert_blocked(&single, "connect_pins", UNPROVEN_CONTACT);
+            assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
+
             let batch = serve(
-                &handler,
+                handler,
                 "batch_connect_pins",
-                &path,
+                path,
                 json!({"connections": [pair]}),
             )
             .await;
-            assert!(
-                std::fs::read(&path).unwrap() == source.as_bytes(),
-                "sheet changed"
+            assert_eq!(
+                batch,
+                json!({
+                    "is_error": true,
+                    "connected_count": 0,
+                    "already_connected": [],
+                    "errors": [format!("{from}.{pin1} -> {to}.{pin2}: {UNPROVEN_CONTACT}")]
+                })
             );
-            assert_eq!(batch["is_error"], true, "{batch}");
-            assert_eq!(batch["connected_count"], 0, "{batch}");
-            assert_eq!(batch["already_connected"], json!([]), "{batch}");
-            assert!(batch["errors"][0]
-                .as_str()
-                .unwrap()
-                .contains("contact cannot be confirmed"));
+            assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_a_no_connect_pin() {
+        assert_contact_refusal(HIDDEN, ("R3", "1"), ("R4", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_an_unconnected_pin() {
+        // Keep the existing fail-closed check for this noncanonical type.
+        let source = HIDDEN.replacen("(pin no_connect line", "(pin unconnected line", 1);
+        assert_contact_refusal(&source, ("R3", "1"), ("R4", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_a_selected_no_connect_alternate() {
+        assert_contact_refusal(ALTERNATE, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_with_a_selected_legacy_unconnected_alternate() {
+        // KiCad normalizes the old spelling when resaving this definition.
+        let source = ALTERNATE.replacen(
+            "(alternate \"NC\" no_connect line)",
+            "(alternate \"NC\" unconnected line)",
+            1,
+        );
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_for_an_unresolved_pin_number() {
+        let (handler, _dir, path) = setup(HIDDEN).await;
+        let pair = json!({"ref1": "#PWR01", "pin1": "1", "ref2": "R30", "pin2": "99"});
+        let single = serve(&handler, "connect_pins", &path, pair.clone()).await;
+        assert_eq!(single["is_error"], true, "{single}");
+        assert_eq!(
+            single["error"],
+            json!({
+                "kind": "stale_target",
+                "target": "R30 pin 99",
+                "reason": "R30 has no pin 99 on placed unit 1",
+            }),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), HIDDEN.as_bytes());
+        let batch = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [pair]}),
+        )
+        .await;
+        assert_eq!(
+            batch,
+            json!({
+                "is_error": true,
+                "connected_count": 0,
+                "already_connected": [],
+                "errors": ["R30 pin 99: R30 has no pin 99 on placed unit 1"]
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), HIDDEN.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_the_placement_has_two_positions() {
+        let source = HIDDEN.replacen(
+            "(at 124.46 137.16 0)",
+            "(at 124.46 137.16 0)\n\t\t(at 127 137.16 0)",
+            1,
+        );
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_the_library_pin_has_two_positions() {
+        let source = HIDDEN.replacen("(at 0 0 270)", "(at 0 0 270)\n\t\t\t\t\t(at 2.54 0 270)", 1);
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_placed_symbol_has_an_invalid_orientation() {
+        // KiCad cannot save a symbol with this angle. Only change the target's
+        // angle in a copy of its saved fixture; GND still has a zero pin offset.
+        let source = HIDDEN.replacen("(at 124.46 137.16 0)", "(at 124.46 137.16 45)", 1);
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_saved_orientation_is_not_numeric() {
+        for replacement in ["(at 124.46 137.16)", "(at 124.46 137.16 bogus)"] {
+            let source = HIDDEN.replacen("(at 124.46 137.16 0)", replacement, 1);
+            assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+        }
+    }
+
+    async fn setup_reused_contact(
+        swap_resistor_references: bool,
+    ) -> (McpHandler, tempfile::TempDir, PathBuf, String) {
+        let root = "11111111-1111-4111-8111-111111111111";
+        let source = VISIBLE
+            .replace(
+                "(project \"visible_pin_contact_kicad10\"",
+                "(project \"reuse\"",
+            )
+            .replacen(
+                "(uuid \"4be0b2af-bd2b-4f96-9495-a33ac608abb9\")",
+                "(uuid \"44444444-4444-4444-8444-444444444444\")",
+                1,
+            );
+        let source = [("#PWR01", "#PWR02"), ("R30", "R31")].into_iter().fold(
+            source,
+            |source, (first, second)| {
+                let fields = |reference| {
+                    format!(
+                        "\n\t\t\t\t\t(reference \"{reference}\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)"
+                    )
+                };
+                let path = |sheet, reference| {
+                    format!("\t\t\t\t(path \"/{root}/{sheet}\"{}", fields(reference))
+                };
+                let (on_a, on_b) = if swap_resistor_references && first == "R30" {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                let changed = source.replacen(
+                    &format!(
+                        "\t\t\t\t(path \"/4be0b2af-bd2b-4f96-9495-a33ac608abb9\"{}",
+                        fields(first)
+                    ),
+                    &format!(
+                        "{}\n{}",
+                        path("22222222-2222-4222-8222-222222222222", on_a),
+                        path("33333333-3333-4333-8333-333333333333", on_b)
+                    ),
+                    1,
+                );
+                assert_ne!(changed, source);
+                changed
+            },
+        );
+        let (handler, dir, path) = setup(&source).await;
+        let sheets = [
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ]
+        .map(|uuid| {
+            format!(
+                "(sheet (at 50.8 50.8) (size 25.4 12.7) (uuid \"{uuid}\") \
+                     (property \"Sheetfile\" \"pin_contact.kicad_sch\" (at 50.8 50.8 0)))"
+            )
+        });
+        std::fs::write(dir.path().join("reuse.kicad_pro"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("reuse.kicad_sch"),
+            format!(
+                "(kicad_sch (version 20260306) (uuid \"{root}\") (lib_symbols) {} {})",
+                sheets[0], sheets[1]
+            ),
+        )
+        .unwrap();
+        (handler, dir, path, source)
+    }
+
+    #[tokio::test]
+    async fn reports_contact_on_a_reused_sheet_with_different_references() {
+        let (handler, _dir, path, source) = setup_reused_contact(false).await;
+        assert_contact_at(&handler, &path, &source, "#PWR01", "R30", (124.46, 137.16)).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_references_only_match_on_different_sheet_paths() {
+        let (handler, _dir, path, source) = setup_reused_contact(true).await;
+        assert_contact_refusal_at(&handler, &path, &source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    fn with_foreign_reference(value: &str, unit: u32) -> String {
+        let source = VISIBLE.replacen(
+            "(reference \"R30\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)",
+            &format!(
+                "(reference \"R30\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+                 \t\t\t(project \"another_project\"\n\
+                 \t\t\t\t(path \"/dab0b233-ece6-4f85-a589-8d8164617309\"\n\
+                 \t\t\t\t\t{value}\n\t\t\t\t\t(unit {unit})\n\t\t\t\t)\n\t\t\t)"
+            ),
+            1,
+        );
+        assert_ne!(source, VISIBLE);
+        source
+    }
+
+    #[tokio::test]
+    async fn reports_contact_with_a_different_reference_in_another_project() {
+        let source = with_foreign_reference("(reference \"R99\")", 1);
+        assert_contact(&source, "#PWR01", "R30", 124.46, 137.16).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_only_another_project_matches_the_reference() {
+        let source = with_foreign_reference("(reference \"R30\")", 1).replacen(
+            "(reference \"R30\")",
+            "(reference \"R99\")",
+            1,
+        );
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_path_has_conflicting_references() {
+        let source = with_foreign_reference("(reference \"R99\")", 1).replacen(
+            "/dab0b233-ece6-4f85-a589-8d8164617309",
+            "/4be0b2af-bd2b-4f96-9495-a33ac608abb9",
+            1,
+        );
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_path_alias_hides_a_conflicting_reference() {
+        for alias in [
+            "//4be0b2af-bd2b-4f96-9495-a33ac608abb9",
+            "/4BE0B2AF-BD2B-4F96-9495-A33AC608ABB9",
+        ] {
+            let source = with_foreign_reference("(reference \"R99\")", 1).replacen(
+                "/dab0b233-ece6-4f85-a589-8d8164617309",
+                alias,
+                1,
+            );
+            assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_saved_instance_unit_disagrees() {
+        let source = with_foreign_reference("(reference \"R99\")", 2);
+        assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_no_saved_instance_reference_matches() {
+        let source = HIDDEN.replacen("(reference \"R1\")", "(reference \"R99\")", 1);
+        assert_contact_refusal(&source, ("R1", "1"), ("R2", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_instance_repeats_identity_fields() {
+        for replacement in [
+            "(reference \"R1\") (reference \"R99\")\n\t\t\t\t\t(unit 1)",
+            "(reference \"R1\")\n\t\t\t\t\t(unit 1) (unit 2)",
+        ] {
+            let source = HIDDEN.replacen("(reference \"R1\")\n\t\t\t\t\t(unit 1)", replacement, 1);
+            assert_contact_refusal(&source, ("R1", "1"), ("R2", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_instance_omits_an_identity_field() {
+        for replacement in ["(reference \"R1\")", "(unit 1)"] {
+            let source = HIDDEN.replacen("(reference \"R1\")\n\t\t\t\t\t(unit 1)", replacement, 1);
+            assert_contact_refusal(&source, ("R1", "1"), ("R2", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_saved_instance_has_no_reference_value() {
+        for replacement in ["(reference)", "(reference \"\")"] {
+            let source = with_foreign_reference(replacement, 1);
+            assert_contact_refusal(&source, ("#PWR01", "1"), ("R30", "1")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_selected_alternate_has_two_definitions() {
+        let source = ALTERNATE.replacen(
+            "(alternate \"NC\" no_connect line)",
+            "(alternate \"NC\" input line)\n\t\t\t\t\t(alternate \"NC\" no_connect line)",
+            1,
+        );
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_placed_pin_repeats_its_alternate_selection() {
+        let source = ALTERNATE.replacen(
+            "(alternate \"NC\")",
+            "(alternate \"VPP\") (alternate \"NC\")",
+            1,
+        );
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn refuses_contact_when_a_placed_pin_has_no_alternate_name() {
+        let source = ALTERNATE.replacen("(alternate \"NC\")", "(alternate)", 1);
+        assert_contact_refusal(&source, ("U1", "16"), ("R1", "1")).await;
+    }
+
+    #[tokio::test]
+    async fn keeps_hidden_contact_when_another_touching_pair_is_refused() {
+        let (handler, _dir, path) = setup(HIDDEN).await;
+        let result = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [
+                {"ref1": "R1", "pin1": "1", "ref2": "R2", "pin2": "1"},
+                {"ref1": "R3", "pin1": "1", "ref2": "R4", "pin2": "1"}
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({
+                "is_error": false,
+                "connected_count": 0,
+                "already_connected": [{"pair": "R1.1 -> R2.1", "x": 55.88, "y": 50.8}],
+                "errors": [format!("R3.1 -> R4.1: {UNPROVEN_CONTACT}")]
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), HIDDEN.as_bytes());
     }
 
     #[tokio::test]
@@ -9628,6 +10529,10 @@ mod coincident_route_tests {
 #[cfg(test)]
 #[path = "power_orientation_tests.rs"]
 mod power_orientation_tests;
+
+#[cfg(test)]
+#[path = "wire_stroke_tests.rs"]
+mod wire_stroke_tests;
 
 #[cfg(test)]
 mod no_connect_carry_tests {

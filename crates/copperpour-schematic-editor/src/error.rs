@@ -15,6 +15,10 @@ pub enum Error {
     #[error("write conflict: '{0}' changed since it was loaded")]
     Conflict(PathBuf),
 
+    /// The initial target was not a regular file; no write was attempted.
+    #[error("write target is not a regular file: {0}")]
+    NonRegularWriteTarget(PathBuf),
+
     /// The file was replaced but did not read back as written.
     #[error("readback mismatch: '{0}' was replaced but did not read back as written")]
     ReadbackMismatch(PathBuf),

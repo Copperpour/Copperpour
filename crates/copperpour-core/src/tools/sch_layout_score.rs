@@ -1,7 +1,9 @@
 //! Compare two snapshots of one saved sheet, independent of the editor.
 
-use super::sch_analysis::{orphan_findings, overlap_findings, ORPHAN_TOLERANCE, OVERLAP_TOLERANCE};
-use super::sch_block_move::snapshot_net_changes;
+use super::sch_analysis::{
+    orphan_findings, overlap_findings, pin_text_findings, ORPHAN_TOLERANCE, OVERLAP_TOLERANCE,
+};
+use super::sch_block_move::{snapshot_net_changes, NetComparison};
 use super::sch_connectivity::{drawn_net_graph_for, ConnectivityIndex, COINCIDENT_TOLERANCE};
 use super::sch_pin_contacts::default_contact_counts;
 use super::{get_path, invalid_arg, opt_str_list, resolved_placed_pins_by_reference, ToolContext};
@@ -15,6 +17,11 @@ use copperpour_sexp::{parse_sexp, SexpNode};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
+
+#[path = "sch_layout_library.rs"]
+mod library;
+#[path = "sch_layout_properties.rs"]
+mod properties;
 
 #[cfg(test)]
 #[path = "sch_layout_score_tests.rs"]
@@ -33,6 +40,7 @@ const TIERS: [&[&str]; 4] = [
         "text_overlap_text",
         "text_overlap_body",
         "wire_field_overlap",
+        "wire_pin_text_overlap",
         "pin_contact",
         "short_pin_wire",
     ],
@@ -62,9 +70,10 @@ fn term_json(key: &str, number: Option<i64>) -> Value {
     }
 }
 
-struct Score {
+pub(super) struct Score {
     terms: Terms,
     bounds_unresolved: Vec<String>,
+    pin_text_unresolved: Vec<Value>,
     wire_segments: usize,
     power_symbols: Option<usize>,
 }
@@ -73,6 +82,7 @@ impl Score {
     fn json(&self) -> Value {
         let mut result = json!({
             "bounds_unresolved": self.bounds_unresolved,
+            "pin_text_unresolved": self.pin_text_unresolved,
             "wire_segments": self.wire_segments,
             "power_symbols": self.power_symbols,
         });
@@ -89,13 +99,19 @@ fn increment(score: &mut Terms, key: &str) {
     }
 }
 
-fn measure(tree: &SexpNode) -> Score {
+pub(super) fn measure(tree: &SexpNode) -> Score {
+    measure_with_stub_exclusions(tree, &BTreeSet::new())
+}
+
+fn measure_with_stub_exclusions(tree: &SexpNode, required_stubs: &BTreeSet<String>) -> Score {
     let wires = extract_wires(tree);
     let buses = extract_buses(tree);
     let labels = extract_all_net_labels(tree);
     let index = ConnectivityIndex::build(tree, &wires, &buses, &labels, ORPHAN_TOLERANCE);
     let pins = resolved_placed_pins_by_reference(tree);
-    let (overlaps, _, bounds_unresolved) = overlap_findings(tree, &wires, OVERLAP_TOLERANCE);
+    let (mut overlaps, _, bounds_unresolved) = overlap_findings(tree, &wires, OVERLAP_TOLERANCE);
+    let pin_text = pin_text_findings(tree, &wires);
+    overlaps.extend(pin_text.findings);
 
     let mut score: Terms = terms().map(|key| (key, Some(0))).collect();
     let contact_counts = default_contact_counts(tree, &wires);
@@ -111,6 +127,11 @@ fn measure(tree: &SexpNode) -> Score {
         for key in ["component_overlap", "wire_overlap", "text_overlap_body"] {
             score.insert(key, None);
         }
+    }
+    // Pin text that could not be measured leaves only its own term unknown:
+    // the body terms rest on the symbol drawings, which it does not change.
+    if !pin_text.unresolved.is_empty() {
+        score.insert("wire_pin_text_overlap", None);
     }
     if pins.is_none() {
         for key in [
@@ -137,6 +158,12 @@ fn measure(tree: &SexpNode) -> Score {
 
     let length: f64 = wires
         .iter()
+        .filter(|wire| {
+            !wire
+                .uuid
+                .as_ref()
+                .is_some_and(|uuid| required_stubs.contains(uuid))
+        })
         .map(|wire| (wire.x2 - wire.x1).hypot(wire.y2 - wire.y1))
         .sum();
     score.insert(LENGTH, Some((length * 1000.0).round() as i64));
@@ -180,6 +207,7 @@ fn measure(tree: &SexpNode) -> Score {
     Score {
         terms: score,
         bounds_unresolved,
+        pin_text_unresolved: pin_text.unresolved,
         wire_segments: wires.len(),
         power_symbols,
     }
@@ -292,7 +320,20 @@ fn identities(tree: &SexpNode) -> Option<BTreeMap<&str, &SexpNode>> {
     Some(result)
 }
 
-fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String> {
+pub(super) fn cleanup_gate(
+    before: &SexpNode,
+    after: &SexpNode,
+    requested: &[String],
+) -> Vec<String> {
+    gate(before, after, requested, NetComparison::Cleanup)
+}
+
+fn gate(
+    before: &SexpNode,
+    after: &SexpNode,
+    requested: &[String],
+    comparison: NetComparison,
+) -> Vec<String> {
     let (Some(was), Some(now)) = (identities(before), identities(after)) else {
         return vec!["a placed symbol has missing or duplicate identity".to_owned()];
     };
@@ -302,6 +343,8 @@ fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String
         .unwrap_or_default();
     let mut approved = BTreeSet::new();
     let mut reasons = Vec::new();
+    let sources = matches!(comparison, NetComparison::Layout)
+        .then(|| properties::Source::comparison(before, after));
     for uuid in requested
         .iter()
         .map(String::as_str)
@@ -321,14 +364,27 @@ fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String
     for (&uuid, &symbol) in &was {
         match now.get(uuid) {
             Some(kept) => {
-                if kept.find("lib_id") != symbol.find("lib_id")
-                    || kept.find("instances") != symbol.find("instances")
-                {
+                let instance_changed = if sources.is_some() {
+                    properties::instance_identity(kept) != properties::instance_identity(symbol)
+                        || properties::reference(kept) != properties::reference(symbol)
+                } else {
+                    kept.find("instances") != symbol.find("instances")
+                };
+                if kept.find("lib_id") != symbol.find("lib_id") || instance_changed {
                     reasons.push(format!("symbol {uuid} changed its lib_id or instances"));
                 }
                 let on_board = |node: &SexpNode| node.find_str("on_board") != Some("no");
                 if on_board(kept) != on_board(symbol) {
                     reasons.push(format!("symbol {uuid} changed its PCB membership"));
+                }
+                if let Some((old, new)) = &sources {
+                    let reference = properties::reference(symbol).unwrap_or("?");
+                    properties::changes(
+                        &format!("symbol {uuid} ({reference})"),
+                        (symbol, old),
+                        (kept, new),
+                        &mut reasons,
+                    );
                 }
             }
             None if !approved.contains(uuid) => reasons.push(format!("symbol {uuid} was removed")),
@@ -338,7 +394,18 @@ fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String
     for uuid in now.keys().filter(|uuid| !was.contains_key(*uuid)) {
         reasons.push(format!("symbol {uuid} was added"));
     }
-    reasons.extend(snapshot_net_changes(before, after, &approved));
+    if let Some((old, new)) = &sources {
+        properties::sheet_changes((before, old), (after, new), &mut reasons);
+    }
+    reasons.extend(snapshot_net_changes(before, after, &approved, comparison));
+    if reasons.is_empty() {
+        if let Some((old, new)) = &sources {
+            properties::uncertain_changes((old, new), &mut reasons);
+        }
+        if reasons.is_empty() && matches!(comparison, NetComparison::Layout) {
+            library::append_changes((before, &was), (after, &now), &mut reasons);
+        }
+    }
     reasons
 }
 
@@ -371,29 +438,122 @@ fn verdict(delta: &Terms, reasons: &[String]) -> &'static str {
     }
 }
 
-fn read_sheet(path: &Path) -> Result<SexpNode, CallToolResult> {
+pub(super) fn cleanup_rank(baseline: &Score, tree: &SexpNode) -> Option<[i64; TIERS.len()]> {
+    let delta = measure(tree).delta_from(baseline);
+    (verdict(&delta, &[]) == "improved")
+        .then(|| TIERS.map(|tier| tier.iter().filter_map(|key| delta[key]).sum()))
+}
+
+impl Score {
+    fn delta_from(&self, baseline: &Self) -> Terms {
+        terms()
+            .map(|key| {
+                let change = self.terms[key].zip(baseline.terms[key]);
+                (key, change.map(|(now, was)| now - was))
+            })
+            .collect()
+    }
+}
+
+pub(super) struct LayoutComparison {
+    score: Score,
+    baseline_score: Option<Score>,
+    delta: Terms,
+    pub(super) verdict: Option<&'static str>,
+    pub(super) reasons: Vec<String>,
+}
+
+impl LayoutComparison {
+    pub(super) fn json(&self) -> Value {
+        let not_compared = terms()
+            .filter(|key| self.delta[key].is_none())
+            .collect::<Vec<_>>();
+        let delta = self.baseline_score.as_ref().map(|_| {
+            self.delta
+                .iter()
+                .map(|(&key, &change)| (key.to_owned(), term_json(key, change)))
+                .collect::<Value>()
+        });
+        json!({
+            "score": self.score.json(),
+            "baseline_score": self.baseline_score.as_ref().map(Score::json),
+            "delta": delta,
+            "verdict": self.verdict,
+            "reasons": self.reasons,
+            "not_compared": not_compared,
+        })
+    }
+}
+
+/// Compare complete in-memory snapshots. Callers may exclude verified mandatory lead
+/// lengths from ranking, but those wires still participate in all other checks.
+pub(super) fn compare_layout(
+    sheet: &SexpNode,
+    baseline: Option<&SexpNode>,
+    removed: &[String],
+    required_stubs: [&BTreeSet<String>; 2],
+) -> LayoutComparison {
+    let [baseline_stubs, sheet_stubs] = required_stubs;
+    let score = measure_with_stub_exclusions(sheet, sheet_stubs);
+    let baseline_score = baseline.map(|tree| measure_with_stub_exclusions(tree, baseline_stubs));
+    // A single-sheet score reports which terms could be measured.
+    let delta = baseline_score
+        .as_ref()
+        .map_or_else(|| score.terms.clone(), |before| score.delta_from(before));
+    let reasons = baseline.map_or_else(Vec::new, |before| {
+        gate(before, sheet, removed, NetComparison::Layout)
+    });
+    let verdict = baseline.map(|_| verdict(&delta, &reasons));
+    LayoutComparison {
+        score,
+        baseline_score,
+        delta,
+        verdict,
+        reasons,
+    }
+}
+
+pub(super) fn read_saved_sheet(path: &Path) -> Result<(String, SexpNode), CallToolResult> {
+    let source = decode_saved_source(path, read_saved_bytes(path)?)?;
+    let tree = parse_saved_sheet(path, &source)?;
+    Ok((source, tree))
+}
+
+fn malformed_sheet(path: &Path, reason: String) -> CallToolResult {
+    let message = format!("Cannot read schematic {}: {reason}", path.display());
+    CallToolResult::error_kind(
+        ToolErrorKind::MalformedFile {
+            path: path.display().to_string(),
+            reason,
+        },
+        message,
+    )
+}
+
+pub(super) fn read_saved_bytes(path: &Path) -> Result<Vec<u8>, CallToolResult> {
     // The writers replace atomically; a single open reads one saved version
     // without creating the cooperative lockfile used by read_schematic.
-    let malformed = |reason: String| {
-        let message = format!("Cannot read schematic {}: {reason}", path.display());
-        CallToolResult::error_kind(
-            ToolErrorKind::MalformedFile {
-                path: path.display().to_string(),
-                reason,
-            },
-            message,
-        )
-    };
-    let bytes = std::fs::read(path).map_err(|err| {
-        CallToolResult::error_kind(
-            ToolErrorKind::file_not_found(path),
-            format!("Cannot read schematic {}: {err}", path.display()),
-        )
-    })?;
-    let source = std::str::from_utf8(&bytes).map_err(|err| malformed(err.to_string()))?;
-    let tree = parse_sexp(source).map_err(|err| malformed(err.to_string()))?;
+    std::fs::read(path).map_err(|err| unreadable_sheet(path, err))
+}
+
+pub(super) fn unreadable_sheet(path: &Path, error: std::io::Error) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::file_not_found(path),
+        format!("Cannot read schematic {}: {error}", path.display()),
+    )
+}
+
+pub(super) fn decode_saved_source(path: &Path, bytes: Vec<u8>) -> Result<String, CallToolResult> {
+    String::from_utf8(bytes).map_err(|err| malformed_sheet(path, err.utf8_error().to_string()))
+}
+
+pub(super) fn parse_saved_sheet(path: &Path, source: &str) -> Result<SexpNode, CallToolResult> {
+    let tree = parse_sexp(source).map_err(|err| malformed_sheet(path, err.to_string()))?;
     if tree.head() != Some("kicad_sch") || tree.find_str("version").is_none() {
-        return Err(malformed("expected a KiCad schematic sheet".to_owned()));
+        return Err(malformed_sheet(
+            path,
+            "expected a KiCad schematic sheet".to_owned(),
+        ));
     }
     Ok(tree)
 }
@@ -418,49 +578,20 @@ pub(super) async fn handle_compare_schematic_layout(
             "requires a baseline",
         ));
     }
-    let sheet = match read_sheet(&path) {
-        Ok(sheet) => sheet,
+    let sheet = match read_saved_sheet(&path) {
+        Ok((_, sheet)) => sheet,
         Err(error) => return Ok(error),
     };
-    let score = measure(&sheet);
-    let (baseline_score, delta, verdict, reasons, not_compared) = if let Some(path) = baseline {
-        let baseline = match read_sheet(&path) {
-            Ok(sheet) => sheet,
-            Err(error) => return Ok(error),
-        };
-        let baseline_score = measure(&baseline);
-        let delta: Terms = terms()
-            .map(|key| {
-                let change = score.terms[key].zip(baseline_score.terms[key]);
-                (key, change.map(|(now, was)| now - was))
-            })
-            .collect();
-        let not_compared = terms()
-            .filter(|key| delta[key].is_none())
-            .collect::<Vec<_>>();
-        let reasons = gate(&baseline, &sheet, &removed);
-        let verdict = verdict(&delta, &reasons);
-        let delta: Value = delta
-            .iter()
-            .map(|(&key, &change)| (key.to_owned(), term_json(key, change)))
-            .collect();
-        (
-            baseline_score.json(),
-            delta,
-            Some(verdict),
-            reasons,
-            not_compared,
-        )
-    } else {
-        let not_compared = terms().filter(|key| score.terms[key].is_none()).collect();
-        (Value::Null, Value::Null, None, Vec::new(), not_compared)
+    let baseline = match baseline.as_deref().map(read_saved_sheet).transpose() {
+        Ok(tree) => tree,
+        Err(error) => return Ok(error),
     };
-    Ok(CallToolResult::json(&json!({
-        "score": score.json(),
-        "baseline_score": baseline_score,
-        "delta": delta,
-        "verdict": verdict,
-        "reasons": reasons,
-        "not_compared": not_compared,
-    })))
+    let no_stubs = BTreeSet::new();
+    let comparison = compare_layout(
+        &sheet,
+        baseline.as_ref().map(|(_, tree)| tree),
+        &removed,
+        [&no_stubs; 2],
+    );
+    Ok(CallToolResult::json(&comparison.json()))
 }

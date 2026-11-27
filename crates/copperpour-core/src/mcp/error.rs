@@ -58,6 +58,8 @@ pub enum ToolErrorKind {
     /// A mutation conflicts with filesystem state, or schematic ownership
     /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
+    /// The write target was not a regular file at the initial check.
+    InvalidWriteTarget { path: String, reason: String },
     /// More than one observed object identifies a requested target. Clients
     /// must choose from the returned stable candidates rather than guessing.
     AmbiguousTarget {
@@ -131,10 +133,10 @@ pub enum ToolErrorKind {
     /// board is unknown, and neither a live edit nor a file edit is safe.
     AmbiguousOpenBoard { path: String },
     /// A configuration file exists but cannot be used: malformed JSON, a
-    /// non-object root, or an I/O failure other than absence. Defaults are
+    /// non-object root, a non-regular save target, or an I/O failure other than absence. Defaults are
     /// never substituted for it, because the next save would persist them
     /// over the user's own settings (#580). `reason` starts with
-    /// `malformed_json:` or `unreadable:`.
+    /// `malformed_json:`, `unreadable:`, or `non_regular_file:`.
     InvalidConfiguration { path: String, reason: String },
     /// A referenced KiCad file exists and was read, but its structure is
     /// malformed so the operation refused to mutate it.
@@ -168,6 +170,7 @@ impl ToolErrorKind {
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
+            Self::InvalidWriteTarget { .. } => "invalid_write_target",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::WrongDocument { .. } => "wrong_document",
             Self::WrongProject { .. } => "wrong_project",

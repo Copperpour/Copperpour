@@ -38,8 +38,8 @@ use super::sch_components::{
     ComponentDeleteTargetError, ComponentMutationIntent,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, clear_stub_direction, route_between_pins, route_blocked,
-    PinRoute,
+    add_stub_label, add_stub_wire, clear_stub_direction, contact_instance_paths,
+    route_between_pins, route_blocked, PinRoute,
 };
 use super::PlacedPins;
 
@@ -47,6 +47,7 @@ use super::PlacedPins;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::sch_cleanup::apply::definition(),
         tool!(
             "batch_connect_to_net",
             "Connect multiple component pins to a named net. By default it adds a net label \
@@ -176,7 +177,7 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "reference": { "type": "string" },
                                 "pin_number": { "type": "string" },
-                                "rotation": { "type": "number", "description": "Degrees, used only for a pin on its own stub." }
+                                "rotation": { "type": "number", "description": "Degrees, used only for a pin on its own stub. If used, must be an exact multiple of 90 or the call is refused before writing." }
                             },
                             "required": ["reference", "pin_number"]
                         }
@@ -216,7 +217,7 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "lib_id": { "type": "string" },
                                 "x": { "type": "number" }, "y": { "type": "number" },
-                                "rotation": { "type": "number", "default": 0 },
+                                "rotation": { "type": "number", "description": "Symbol rotation in degrees, an exact multiple of 90. An invalid angle refuses only this entry.", "default": 0 },
                                 "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric. The stored orientation is normalized to the rotation and mirror pair eeschema writes (for example, 180° with 'x' is stored and reported as 0° with 'y')." },
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
@@ -238,8 +239,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect multiple component pin pairs by reference and pin number, in a single \
              file read/write cycle. Routes as connect_pins does; a pair whose route would \
              join another net, miss a pin or draw a zero-length segment is skipped and listed \
-             in errors. Pins already connected by contact on the saved sheet are listed in \
-             already_connected, not counted as drawn routes.",
+              in errors. Verified contacts on the saved sheet, including hidden pins, are \
+              listed in already_connected, not counted as drawn routes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -789,7 +790,6 @@ async fn handle_batch_place_components(
             failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
             continue;
         };
-        let rotation = comp["rotation"].as_f64().unwrap_or(0.0);
         // One malformed entry refuses only itself, as every other per-entry
         // problem in this loop does; the batch is not abandoned because a
         // caller misspelled one axis.
@@ -833,7 +833,7 @@ async fn handle_batch_place_components(
             lib_id,
             x,
             y,
-            rotation,
+            comp.get("rotation"),
             mirror,
             reference,
             value,
@@ -851,7 +851,7 @@ async fn handle_batch_place_components(
                     lib_id,
                     expected_x,
                     expected_y,
-                    rotation,
+                    placed.requested_rotation,
                     mirror,
                     &placed.reference,
                     &placed.fields,
@@ -1055,11 +1055,18 @@ async fn handle_batch_connect_pins(
     // A route that would join another net is skipped and reported; the rest
     // still land, as an unresolved pin's do.
     let mut new_content = content;
+    let mut staged = tree;
     let mut connected = 0;
     let mut already_connected = Vec::new();
+    let instance_paths = std::cell::OnceCell::new();
     for (pair, from, to) in &resolved {
-        match route_between_pins(&new_content, &tree, from, to)? {
+        match route_between_pins(&new_content, &staged, from, to, || {
+            instance_paths
+                .get_or_init(|| contact_instance_paths(&sch_path, &staged))
+                .as_deref()
+        })? {
             Ok(PinRoute::Drawn(routed)) => {
+                staged = parse_sexp(&routed.content)?;
                 new_content = routed.content;
                 connected += 1;
             }

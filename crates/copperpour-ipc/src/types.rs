@@ -277,6 +277,7 @@ pub struct IpcPadDrill {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcFootprint {
+    pub kiid: String,
     pub reference: String,
     pub value: String,
     pub footprint: String,
@@ -490,14 +491,65 @@ pub enum IpcGraphicDefinition {
         /// Text angle in degrees, footprint-local.
         rotation: f64,
         layer: String,
-        /// Glyph size (width and height) in mm.
+        /// Glyph height in mm, and the width too unless `style.width` says
+        /// otherwise.
         size: f64,
         /// Font stroke width in mm.
         stroke_width_mm: f64,
         /// KiCad turns the text upright for reading; the library's
         /// `(unlocked yes)` clears it.
         keep_upright: bool,
+        /// The rest of the text's `(effects …)`.
+        style: IpcTextStyle,
     },
+}
+
+/// Horizontal text justification, from `(justify left|right)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcTextHorizontal {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// Vertical text justification, from `(justify top|bottom)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcTextVertical {
+    Top,
+    #[default]
+    Center,
+    Bottom,
+}
+
+/// A footprint text's `(effects …)` beyond its glyph height, stroke width and
+/// keep-upright. The default is what KiCad reads when a clause is absent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcTextStyle {
+    /// Glyph width in mm, when the font's `(size height width)` differs from
+    /// the height.
+    pub width: Option<f64>,
+    pub bold: bool,
+    pub italic: bool,
+    pub line_spacing: f64,
+    pub horizontal: IpcTextHorizontal,
+    pub vertical: IpcTextVertical,
+    /// `(justify mirror)`.
+    pub mirrored: bool,
+}
+
+impl Default for IpcTextStyle {
+    fn default() -> Self {
+        Self {
+            width: None,
+            bold: false,
+            italic: false,
+            line_spacing: 1.0,
+            horizontal: IpcTextHorizontal::Center,
+            vertical: IpcTextVertical::Center,
+            mirrored: false,
+        }
+    }
 }
 
 impl IpcGraphicDefinition {
@@ -993,6 +1045,16 @@ pub enum IpcFlipOutcome {
     Unsupported {
         kicad_version: Option<IpcKiCadVersion>,
     },
+    /// Refused before any write because the caller's KIID is absent or no
+    /// longer carries the named reference.
+    StaleTarget { target: String, reason: String },
+    /// Refused before any write: no `kiid` was given and several footprints
+    /// carry the reference. `candidates` are their KIIDs, sorted.
+    AmbiguousTarget {
+        target: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
     /// The mutation appeared to succeed, but a fresh post-flip readback
     /// disagreed with it or could not be resolved. The board may or may not
     /// have changed; the caller must reconcile before retrying rather than
@@ -1344,8 +1406,8 @@ pub struct IpcFootprintState {
 
 /// Outcome of reading a single placed footprint by reference and optional KIID.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IpcFootprintLookupOutcome {
-    Found(IpcFootprintState),
+pub enum IpcFootprintLookupOutcome<T = IpcFootprintState> {
+    Found(T),
     /// The caller pinned a KIID that is absent or no longer carries the named
     /// reference.
     StaleTarget {

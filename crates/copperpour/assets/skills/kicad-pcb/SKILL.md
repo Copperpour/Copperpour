@@ -19,6 +19,14 @@ ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
 Most PCB layout operations require KiCAD to be running with the board file open. The IPC
 connection communicates with the running KiCAD instance in real-time.
 
+Before starting live PCB work when the requested `.kicad_pcb` is not yet open (or when
+IPC reports no PCB editor or a different open board), load `verification` and call
+`open_board(board, display?, timeout_seconds?)` with the absolute `.kicad_pcb` path
+instead of asking the user to open KiCAD manually. `open_board` reuses an existing IPC
+endpoint already holding that exact board without launching a duplicate window, or starts
+KiCAD's PCB editor (`pcbnew`) and binds subsequent PCB calls to the endpoint reporting
+that board.
+
 Some board-construction and component tools have guarded closed-board paths. IPC-first
 tools fall back to the file only when the transport is unreachable and the target board
 has not been observed live during this server session. These paths use revision-aware
@@ -46,10 +54,9 @@ restart Copperpour automatically, or edit `.kicad_pcb` directly. If the user con
 clean close and an authoritative saved file, they may restart Copperpour to deliberately
 begin a new closed-board session.
 
-If connection fails:
-- Tell the user to open KiCAD and load the project
-- The board (.kicad_pcb) must be open in the PCB editor
-- KiCAD's IPC API must be enabled (default in KiCAD 8+)
+If connection fails or the requested board is not open:
+- Call `open_board` (from `verification`) with the target `.kicad_pcb` path first so Copperpour opens the PCB editor and binds its IPC endpoint.
+- If `open_board` returns `requested_open: false` or an error (for example, no display available, IPC API disabled, or a conflicting Project Manager socket), follow its returned note and `recovery.next_steps`, and ask the user to open the exact `.kicad_pcb` in KiCAD's PCB editor with KiCAD's IPC API enabled (Preferences → Plugins → Enable KiCad API).
 
 ---
 
@@ -71,7 +78,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
+load_toolset('verification')     # open_board, run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -531,8 +538,9 @@ geometry is the board outline or a cutout the footprint carries itself.
 4. **Refill zones after changes** — stale zone fills cause phantom DRC errors
 5. **Check DRC before finishing** — run `run_drc()` and resolve all errors
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
-7. **KiCAD normally must be running** — use guarded closed-board paths only when a
-   tool explicitly offers them. Treat `unsafe_file_fallback` as a human recovery
+7. **KiCAD normally must be running** — call `open_board` (in `verification`) before live
+   PCB work when the requested board is not yet open; use guarded closed-board paths only
+   when a tool explicitly offers them. Treat `unsafe_file_fallback` as a human recovery
    boundary; other PCB edits still require the live IPC connection.
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need

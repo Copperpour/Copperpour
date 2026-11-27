@@ -14,7 +14,7 @@ See [build requirements](../DEV.md#build-requirements) for Protobuf setup.
 | S-expression parsing and atomic writes | `crates/copperpour-sexp` tests |
 | Typed schematic model | `crates/copperpour-schematic-editor` tests |
 | IPC builders, transport, and client behavior | `crates/copperpour-ipc` tests |
-| Real KiCad behavior | ignored live tests and local CI's real-KiCad job (`e2e-kicad.yml`'s steps) |
+| Real KiCad behavior | ignored live tests and the real-KiCad job (`e2e-kicad.yml`) |
 | Viewer engine and browser service | `crates/copperpour-viewer` engine and HTTP/SSE tests, included in workspace checks |
 | Python plugin | `plugin/tests` and the plugin CI job |
 | PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
@@ -90,35 +90,27 @@ save and independently check the board with pcbnew.
 PR CI runs on GitHub Actions ([GOVERNANCE.md](../GOVERNANCE.md#where-ci-runs)):
 `ci.yml` runs on every PR: the Rust workspace on Linux, formatting, clippy,
 documentation tests, plugin, Nix, licenses, PCM validation and the offline
-build; `windows.yml` and `macos.yml` run Check & Test on those systems. The
-release build and the real-KiCad job run on a maintainer's machine (local CI).
-The real-KiCad job runs `e2e-kicad.yml`'s steps against KiCad 10.0.8 in a
-Windows VM. Ask a maintainer to run it on a pull request when KiCad-facing
-behavior needs that evidence.
+build; `windows.yml` and `macos.yml` run Check & Test on those systems.
+`e2e-kicad.yml` installs KiCad 10.0.8 on `windows-latest` and runs the
+real-KiCad job weekly and on demand. Ask a maintainer to apply the
+`run:e2e-kicad` label to a pull request when KiCad-facing behavior needs that
+evidence.
 
 Before creating a release tag, run `cargo xtask collect-api-migrations
 <version>` and `cargo xtask fix-doc-counts`, and commit the result. The first
 moves the notes in `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; the
 second rewrites the tool counts in the docs, which PRs leave alone. Then a
-maintainer runs local CI's release job against the exact candidate ref, with a
-synthetic `0.0.0` version. It runs the `doc-counts` check, which fails on a
-stale count, then builds the Linux x86_64 and Windows release binaries, PCM
-packages and Claude Desktop extensions (`.mcpb`), validates all four packages
-and runs the real-KiCad job. It publishes
-nothing.
+maintainer runs `release.yml` against the exact candidate ref
+(`gh workflow run release.yml --ref <candidate> -f version=<version>`). It runs
+the `doc-counts` check, which fails on a stale count, builds the Linux x86_64,
+Windows and both macOS release binaries, the three PCM packages and Claude
+Desktop extensions (`.mcpb`), validates them, merges the PCM zips and writes the
+addon repository metadata, and runs the real-KiCad job. It publishes nothing.
 
-For the tag, the same job builds the release artifacts from the tagged commit.
-The macOS ones come from GitHub: pushing the tag runs `macos.yml`, which runs
-Check & Test on macOS and builds the `x86_64-apple-darwin` and `aarch64-apple-darwin` archives and the universal
-macOS PCM package and `.mcpb`, and validates both. It publishes nothing. Download
-its artifacts with `gh run download <run-id>` next to local CI's, merge the
-three PCM zips with `packaging/merge-pcm.py`, run
-`packaging/pcm-submission-metadata.py` on the merged zip, and publish all of
-them, the three `.mcpb` files included, in one release. A failure in any build, on either side, or in the
-real-KiCad job means the release is not cut, so no partial set of assets is
-published. To check the macOS build before tagging, run `gh workflow run
-macos.yml --ref <candidate>` beside local CI's dry run. PRs and `main` run
-only its Check & Test job, as an optional check.
+Pushing the tag runs the same graph on the tagged commit. When every job
+passes, it creates a draft release with all the assets. A failure in any job
+means no draft, so no partial set of assets is published. A maintainer replaces
+the generated notes with written ones and publishes the draft.
 
 In the PR description, list every command run and explicitly name checks skipped
 because they require KiCad, another operating system, credentials, or release

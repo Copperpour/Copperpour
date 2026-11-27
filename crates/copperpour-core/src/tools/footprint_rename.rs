@@ -33,7 +33,7 @@ pub(crate) fn tool() -> ToolDef {
          becomes NEW_NAME.kicad_mod with the new name inside, and the Value changes too when \
          it equals the old name. Refuses a name already in the library, including one that \
          differs only in case, since both would be one file on a case-insensitive filesystem; \
-         a rename that changes only the case of the same footprint is allowed. Only this \
+         a rename that changes only the case of the same footprint requires a regular file. Only this \
          library changes: symbols whose Footprint field names the footprint, and footprints \
          placed on boards, keep the old library id, as in KiCad.",
         json!({
@@ -101,6 +101,9 @@ async fn handle_rename_footprint(
     {
         // A case-only rename interrupted after renaming the file: it still
         // holds the old name and the original text, so finish it from there.
+        if let Some(refusal) = case_only_target_refusal(&new_path)? {
+            return Ok(refusal);
+        }
         let source = copperpour_sexp::read_consistent(&new_path)?;
         if footprint_name(&source).as_deref() == Some(old_name) {
             let renamed = match renamed_source(&source, old_name, new_name) {
@@ -125,6 +128,11 @@ async fn handle_rename_footprint(
         ));
     }
 
+    if case_only {
+        if let Some(refusal) = case_only_target_refusal(&old_path)? {
+            return Ok(refusal);
+        }
+    }
     let source = copperpour_sexp::read_consistent(&old_path)?;
     let renamed = match renamed_source(&source, old_name, new_name) {
         Ok(renamed) => renamed,
@@ -258,10 +266,16 @@ fn rewrite_case_only(
     let new_name = &renamed.name;
     match copperpour_sexp::write_atomic_if_unchanged(new_path, source, &renamed.text) {
         Ok(()) => {}
-        Err(SexpError::Conflict { path }) => {
+        Err(error @ (SexpError::Conflict { .. } | SexpError::NonRegularWriteTarget { .. })) => {
             let Some(old_path) = rename_back else {
-                return Ok(super::revision_conflict_result(&path, OPERATION));
+                return if let SexpError::Conflict { path } = error {
+                    Ok(super::revision_conflict_result(&path, OPERATION))
+                } else {
+                    Err(error.into())
+                };
             };
+            // The original path was checked before moving it. A non-regular
+            // target here means the entry changed since that check.
             return Ok(match std::fs::rename(new_path, old_path) {
                 Ok(()) => super::revision_conflict_result(old_path, OPERATION),
                 Err(error) => super::mutation_outcome_uncertain(
@@ -295,6 +309,16 @@ fn rewrite_case_only(
         body["finished_earlier_rename"] = json!(true);
     }
     Ok(CallToolResult::json(&body))
+}
+
+fn case_only_target_refusal(path: &Path) -> std::io::Result<Option<CallToolResult>> {
+    if std::fs::symlink_metadata(path)?.is_file() {
+        return Ok(None);
+    }
+    Ok(super::non_regular_write_refusal(
+        &SexpError::NonRegularWriteTarget { path: path.into() },
+        OPERATION,
+    ))
 }
 
 /// The name in a footprint file's header, if it reads as one.

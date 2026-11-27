@@ -39,7 +39,7 @@ pub struct McpHandler {
     observer: CallObserver,
     /// Meta-tools bypass the domain router, so their advertised schemas are
     /// compiled here once and enforced at the same dispatch boundary.
-    meta_input_validators: Arc<HashMap<String, Arc<jsonschema::Validator>>>,
+    meta_tool_inputs: Arc<HashMap<String, MetaToolInput>>,
     /// The operator's `call_tool_allow_writes`: whether `call_tool` may run
     /// tools outside the reviewed read-only list. Set once at startup from
     /// the server configuration; no request can change it.
@@ -50,6 +50,11 @@ pub struct McpHandler {
     /// see it right before replying to the user, while `.guidance-checked-*`
     /// silences later sessions.
     session_guidance_notice: Arc<std::sync::OnceLock<Option<String>>>,
+}
+
+struct MetaToolInput {
+    schema: Value,
+    validator: Arc<jsonschema::Validator>,
 }
 
 /// MCP clients known to cache the first `tools/list` and ignore
@@ -223,12 +228,18 @@ impl McpHandler {
             tracing::warn!("no call log: {}", crate::app_dirs::NO_USER_DIR);
         }
         let observer = CallObserver::new(log_path);
-        let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
+        let meta_tool_inputs = meta_tools::meta_tool_descriptions_for(cfg!(unix))
             .into_iter()
             .map(|tool| {
                 let validator =
                     crate::tools::compile_input_validator(&tool.name, &tool.input_schema);
-                (tool.name, validator)
+                (
+                    tool.name,
+                    MetaToolInput {
+                        schema: tool.input_schema,
+                        validator,
+                    },
+                )
             })
             .collect();
         let ctx = Arc::new(
@@ -243,7 +254,7 @@ impl McpHandler {
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
             immediate_sinks: Arc::new(std::sync::RwLock::new(Vec::new())),
             observer,
-            meta_input_validators: Arc::new(meta_input_validators),
+            meta_tool_inputs: Arc::new(meta_tool_inputs),
             call_tool_allow_writes: Arc::new(AtomicBool::new(false)),
             session_guidance_notice: Arc::new(std::sync::OnceLock::new()),
         })
@@ -646,9 +657,9 @@ impl McpHandler {
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
         // Meta-tools always win.
-        if let Some(validator) = self.meta_input_validators.get(name) {
-            if let Err(error) = validator.validate(args) {
-                return schema_argument_error(&error);
+        if let Some(input) = self.meta_tool_inputs.get(name) {
+            if let Err(error) = input.validator.validate(args) {
+                return schema_argument_error(&input.schema, &error);
             }
         }
         if name == CALL_TOOL {
@@ -710,7 +721,7 @@ impl McpHandler {
         if refusal == Some(call_tool_policy::Refusal::Never) {
             return tool_not_permitted(target, call_tool_policy::Refusal::Never);
         }
-        let is_meta_tool = self.meta_input_validators.contains_key(target);
+        let is_meta_tool = self.meta_tool_inputs.contains_key(target);
         if !is_meta_tool && self.ctx.router.find_toolset_for_tool(target).is_none() {
             return self.tool_not_loaded(target);
         }
@@ -764,7 +775,7 @@ impl McpHandler {
                 );
             }
             if let Err(error) = tool_def.input_validator.validate(args) {
-                return schema_argument_error(&error);
+                return schema_argument_error(&tool_def.input_schema, &error);
             }
             return match (tool_def.handler)(args, self.ctx.clone()).await {
                 Ok(result) => {
@@ -862,6 +873,13 @@ impl McpHandler {
                     classify_transaction_conflict(path, journal, kind, name)
                 }
                 Err(e) => {
+                    if let Some(refusal) = e
+                        .chain()
+                        .find_map(|cause| crate::tools::non_regular_write_refusal(cause, name))
+                    {
+                        let kind = extract_error_kind(&refusal);
+                        return (refusal, CallStatus::Error, kind);
+                    }
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
                     let kind = ToolErrorKind::HandlerError {
                         reason: e.to_string(),
@@ -2611,7 +2629,10 @@ mod ipc_failure_dispatch_tests {
 /// and include an unexpected property's own name rather than only its parent.
 /// A branch whose `const` tag (such as `type`) the item fails is not the one
 /// the caller meant, so it is reported only when every branch fails its tag.
-fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, String) {
+fn schema_validation_error(
+    schema: &Value,
+    error: &jsonschema::ValidationError<'_>,
+) -> (String, String) {
     use jsonschema::error::ValidationErrorKind;
 
     /// The leaf to report, and a reason replacing its own when it stands for
@@ -2710,7 +2731,7 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
         field
     }
 
-    let (error, reason) = specific(error);
+    let (error, mut reason) = specific(error);
     let mut field = field_path(&error.instance_path().to_string());
     match error.kind() {
         ValidationErrorKind::AdditionalProperties { unexpected } => {
@@ -2719,6 +2740,9 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
                     field.push('.');
                 }
                 field.push_str(property);
+                if let Some(hint) = unexpected_property_hint(schema, error, property) {
+                    reason = Some(format!("{error}; {hint}"));
+                }
             }
         }
         ValidationErrorKind::Required { property } => {
@@ -2737,21 +2761,47 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
     (field, reason.unwrap_or_else(|| error.to_string()))
 }
 
+/// Look up the object that rejected the property, including the selected
+/// branch of a nested schema. Only guess when one name differs by a suffix
+/// such as `_name`; otherwise list the properties declared on that object.
+fn unexpected_property_hint(
+    schema: &Value,
+    error: &jsonschema::ValidationError<'_>,
+    property: &str,
+) -> Option<String> {
+    let object_path = error
+        .schema_path()
+        .as_str()
+        .strip_suffix("/additionalProperties")?;
+    let properties = schema
+        .pointer(object_path)?
+        .get("properties")?
+        .as_object()?;
+    if properties.is_empty() {
+        return None;
+    }
+
+    let stem = property.rsplit_once('_').map(|(stem, _)| stem);
+    let mut matches = properties.keys().filter(|name| {
+        stem == Some(name.as_str())
+            || name
+                .rsplit_once('_')
+                .is_some_and(|(stem, _)| stem == property)
+    });
+    if let (Some(name), None) = (matches.next(), matches.next()) {
+        return Some(format!("did you mean '{name}'?"));
+    }
+    let mut names: Vec<_> = properties.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    Some(format!("declared properties: {}", names.join(", ")))
+}
+
 fn schema_argument_error(
+    schema: &Value,
     error: &jsonschema::ValidationError<'_>,
 ) -> (CallToolResult, CallStatus, Option<String>) {
-    let (field, reason) = schema_validation_error(error);
-    (
-        CallToolResult::error_kind(
-            ToolErrorKind::InvalidArgument {
-                field: field.clone(),
-                reason: reason.clone(),
-            },
-            format!("Argument '{field}' is invalid: {reason}"),
-        ),
-        CallStatus::Error,
-        Some("invalid_argument".to_string()),
-    )
+    let (field, reason) = schema_validation_error(schema, error);
+    invalid_argument(&field, &reason)
 }
 
 fn call_status(result: &CallToolResult) -> CallStatus {
@@ -2871,6 +2921,74 @@ mod schema_validation_dispatch_tests {
         let body = error_json(&result);
         assert_eq!(body["error"]["kind"], "invalid_argument");
         assert_eq!(body["error"]["field"], "unit");
+    }
+
+    #[tokio::test]
+    async fn json_rpc_unexpected_argument_suggests_its_schema_name() {
+        let handler = handler().await;
+        handler.allow_call_tool_writes();
+        let args = json!({
+            "schematic": "does-not-exist.kicad_sch",
+            "net": "GND",
+            "net_name": "VCC",
+            "x": 10.0,
+            "y": 10.0
+        });
+        for (name, arguments) in [
+            ("delete_schematic_net_label", args.clone()),
+            (
+                "call_tool",
+                json!({"name": "delete_schematic_net_label", "arguments": args}),
+            ),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 18,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }))
+                .await
+                .unwrap();
+            let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+            assert!(result.is_error);
+            let body = error_json(&result);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "net_name", "{body}");
+            assert_eq!(
+                body["error"]["reason"],
+                "Additional properties are not allowed ('net_name' was unexpected); did you mean 'net'?",
+                "{name}: {body}"
+            );
+        }
+
+        let mut missing = args;
+        missing.as_object_mut().unwrap().remove("net");
+        let body =
+            assert_invalid_field(&handler, "delete_schematic_net_label", missing, "net").await;
+        assert_eq!(body["error"]["reason"], "missing", "{body}");
+    }
+
+    #[test]
+    fn only_an_unambiguous_qualified_property_is_suggested() {
+        for (properties, expected) in [
+            (json!({"net_name": {}}), "did you mean 'net_name'?"),
+            (
+                json!({"net_name": {}, "net_code": {}}),
+                "declared properties: net_code, net_name",
+            ),
+        ] {
+            let schema = json!({
+                "properties": properties,
+                "additionalProperties": false
+            });
+            let validator = jsonschema::draft202012::new(&schema).unwrap();
+            let args = json!({"net": "GND"});
+            let error = validator.validate(&args).unwrap_err();
+            let (field, reason) = schema_validation_error(&schema, &error);
+            assert_eq!(field, "net");
+            assert!(reason.ends_with(expected), "{reason}");
+        }
     }
 
     /// The schema bound is the guard a caller meets first. The DSN does not
@@ -3018,7 +3136,7 @@ mod schema_validation_dispatch_tests {
         let source = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
         std::fs::write(&footprint, source).unwrap();
 
-        assert_invalid_field(
+        let body = assert_invalid_field(
             &handler,
             "set_footprint_graphics",
             json!({
@@ -3036,6 +3154,14 @@ mod schema_validation_dispatch_tests {
             "graphics[0].colour",
         )
         .await;
+
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .ends_with("declared properties: end, start, stroke_width_mm, type"),
+            "{body}"
+        );
 
         assert_eq!(
             std::fs::read_to_string(&footprint).unwrap(),
@@ -3145,7 +3271,7 @@ mod schema_validation_dispatch_tests {
         let validator = jsonschema::draft202012::new(&schema).unwrap();
         let instance = json!({"type": "a", "inner": {"kind": "y"}});
         let error = validator.validate(&instance).unwrap_err();
-        let (field, _) = schema_validation_error(&error);
+        let (field, _) = schema_validation_error(&schema, &error);
         assert_eq!(field, "inner.kind");
     }
 
@@ -3429,7 +3555,20 @@ mod schema_validation_dispatch_tests {
     #[tokio::test]
     async fn meta_tool_typos_are_refused() {
         let handler = handler().await;
-        assert_invalid_field(&handler, "get_recent_calls", json!({"limti": 5}), "limti").await;
+        let body = assert_invalid_field(
+            &handler,
+            "get_recent_calls",
+            json!({"limit_count": 5}),
+            "limit_count",
+        )
+        .await;
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .ends_with("did you mean 'limit'?"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

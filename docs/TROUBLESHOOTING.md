@@ -222,9 +222,12 @@ Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
 
 **At startup** Copperpour resolves it in order: the `ipc_address` in your
 config, then `KICAD_API_SOCKET` (set only for plugins KiCad launches itself),
-then the platform default — `<temp dir>/kicad/api.sock` and, on Linux and
-macOS, any `api-<pid>.sock` beside it whose process is running. The startup log
-on stderr says which it picked, and warns when nothing was found.
+then the platform default — `<temp dir>/kicad/api.sock` and any
+`api-<pid>.sock` beside it (live-PID sockets on Linux and macOS; live named
+pipes in `\\.\pipe` on Windows, though KiCad 10.0.8 on Windows does not yet
+bind a fallback `api-<pid>.sock` pipe when another KiCad holds `api.sock`).
+The startup log on stderr says which it picked, and warns when nothing was
+found.
 
 When the address came from that probe, or nothing was found, Copperpour probes
 again on every IPC call. So the order in which the AI client and KiCad start no
@@ -502,13 +505,16 @@ therefore carries a warning describing that cold-start limitation.
 `error.kind: "invalid_configuration"` when a Copperpour preferences file exists
 but cannot be used. `error.path` names the file and `error.reason` starts with
 `malformed_json:` (invalid JSON, or a root that is not an object — often a
-truncated write or a hand edit) or `unreadable:` (permissions, a directory at
-that path, invalid UTF-8).
+truncated write or a hand edit), `unreadable:` (permissions, a directory at
+that path, invalid UTF-8), or `non_regular_file:` (a save target is a symbolic
+link or another non-regular entry).
 
 Older versions answered with their defaults here, and the next save then replaced
 the file with them. It now refuses and writes nothing, so your settings are
-still in the file. Open it, fix the JSON (or move it aside to start again from
-the defaults), and retry. The user file is `%APPDATA%\copperpour\config.json` on
+still in the file. For `non_regular_file:`, use a regular file at the config
+path; fixing the JSON does not fix a symbolic link. Otherwise fix the JSON or
+the read error (or move the file aside to start again from defaults), then
+retry. The user file is `%APPDATA%\copperpour\config.json` on
 Windows, `~/Library/Application Support/copperpour/config.json` on macOS and
 `~/.copperpour/config.json` elsewhere; a project's is
 `<project_dir>/.copperpour/project.json`.

@@ -3,16 +3,44 @@ use crate::tools::ServerConfig;
 use copperpour_sexp::schematic::{extract_wires, read_schematic};
 use copperpour_sexp::SexpNode;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 #[path = "sch_layout_score_guard_tests.rs"]
 mod guards;
+#[path = "sch_layout_library_tests.rs"]
+mod library;
 
 const CROWDED: &str = "region_cleanup_kicad10/crowded/crowded.kicad_sch";
 const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";
 const DIRECT_LANES: &str = "direct_lanes_kicad10/direct_lanes.kicad_sch";
 const TOOL: &str = "compare_schematic_layout";
+
+#[path = "sch_layout_properties_tests.rs"]
+mod properties;
+
+#[tokio::test]
+async fn only_preview_comparison_excludes_mandatory_lead_length() {
+    let handler = handler().await;
+    let sheet = Sheet::input("block_placement_kicad10/opamp_stage/opamp_stage.kicad_sch");
+    let tree = sheet.tree();
+    let stub = extract_wires(&tree)
+        .into_iter()
+        .find(|w| ((w.x1 - w.x2).hypot(w.y1 - w.y2) - 2.54).abs() < 1e-6)
+        .expect("fixture has a 2.54 mm wire");
+    let omitted = BTreeSet::from([stub.uuid.unwrap()]);
+    let all = BTreeSet::new();
+    let baseline = compare(&handler, &sheet, &sheet, &[]).await;
+    let shared = super::compare_layout(&tree, Some(&tree), &[], [&all; 2]).json();
+    assert_eq!(shared, baseline);
+    let preview = super::compare_layout(&tree, Some(&tree), &[], [&all, &omitted]).json();
+    let mut expected = baseline;
+    expected["score"]["wire_length_mm"] = json!(495.30);
+    expected["delta"]["wire_length_mm"] = json!(-2.54);
+    expected["verdict"] = json!("improved");
+    assert_eq!(preview, expected);
+}
 
 struct Sheet {
     dir: tempfile::TempDir,
@@ -143,14 +171,39 @@ async fn single_saved_score_and_gateway_report_the_same_read_only_result() {
     let expected = json!({
         "component_overlap": 0, "label_overlap": 0, "wire_overlap": 0,
         "dangling_wire_end": 0, "floating_label": 0, "unconnected_pin": 0,
-        "text_overlap_text": 2, "text_overlap_body": 1, "wire_field_overlap": 0, "pin_contact": 7,
+        "text_overlap_text": 2, "text_overlap_body": 1, "wire_field_overlap": 0,
+        "wire_pin_text_overlap": 0, "pin_contact": 7,
         "short_pin_wire": 0, "diagonal_wires": 0, "collinear_overlaps": 0,
         "wire_bends": 5, "split_runs": 0, "redundant_power_symbols": 0,
         "wire_length_mm": 130.81, "wire_segments": 9, "power_symbols": 10,
-        "bounds_unresolved": []
+        "bounds_unresolved": [], "pin_text_unresolved": []
     });
     assert_eq!(result["score"], expected);
     assert_eq!(result["not_compared"], json!([]));
+}
+
+#[tokio::test]
+async fn the_near_miss_changes_electrical_identity_but_not_pin_contact_proximity() {
+    let handler = handler().await;
+    let connected = Sheet::input(CROWDED);
+    let near_miss = connected.fork();
+    let source = fs::read_to_string(&near_miss.path).unwrap();
+    assert_eq!(source.matches("(xy 63.5 105.41)").count(), 1);
+    fs::write(
+        &near_miss.path,
+        source.replacen("(xy 63.5 105.41)", "(xy 63.5004 105.41)", 1),
+    )
+    .unwrap();
+
+    let report = compare(&handler, &near_miss, &connected, &[]).await;
+    assert_eq!(report["verdict"], "blocked", "{report}");
+    assert_eq!(report["delta"]["diagonal_wires"], -1, "{report}");
+
+    let before = near_miss.files();
+    let report = ok(&handler, &near_miss, "find_pin_contacts", json!({})).await;
+    assert_eq!(report["contact_count"], 7, "{report}");
+    assert_eq!(report["short_wires"], json!([]), "{report}");
+    assert_eq!(near_miss.files(), before);
 }
 
 async fn direct_lanes_with_clear_fields(handler: &McpHandler, crossed: &Sheet) -> Sheet {
@@ -446,9 +499,9 @@ async fn a_longer_label_stub_trades_wire_for_readability() {
     let short = input.fork();
     let long = input.fork();
     for (pin, net) in [("1", "SIG_IN"), ("2", "SIG_OUT")] {
-        let args = json!({"reference": "J1", "pin_number": pin, "net": net});
+        let mut args =
+            json!({"reference": "J1", "pin_number": pin, "net": net, "stub_length": 2.54});
         ok(&handler, &short, "connect_to_net", args.clone()).await;
-        let mut args = args;
         args["stub_length"] = json!(5.08);
         ok(&handler, &long, "connect_to_net", args).await;
     }

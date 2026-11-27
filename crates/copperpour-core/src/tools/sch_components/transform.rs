@@ -12,7 +12,8 @@ use crate::tools::sch_wiring::{
     carry_no_connects, observed_no_connect_moves, reconcile_junctions_for_placement,
 };
 use crate::tools::{
-    get_path, invalid_arg, opt_str, opt_u32, require_f64, require_str, ToolContext,
+    get_path, invalid_arg, is_symbol_quarter_turn, opt_str, opt_u32, require_f64, require_str,
+    symbol_rotation_arg, ToolContext,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
@@ -130,28 +131,26 @@ pub(super) async fn handle_rotate_schematic_component(
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
     };
-    let rotation = match require_f64(args, "rotation") {
+    let rotation = match symbol_rotation_arg(&args["rotation"], "rotation") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-
     let before_source = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
+    if let Err(error) =
+        check_saved_rotation("rotate_schematic_component", &reference, &target.units)
+    {
+        return Ok(error);
+    }
     let target_uuids = target.uuids();
     let selected = target_uuids.iter().cloned().collect::<BTreeSet<_>>();
-    let anchor_uuid = &target.units[0].uuid;
-    let anchor = sch
-        .symbols
-        .iter()
-        .find(|symbol| symbol.uuid == *anchor_uuid)
-        .expect("structural target UUID is present in the loaded schematic");
-    let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
+    let rotation_delta = rotation - target.units[0].rotation.rem_euclid(360.0);
     for unit in &mut target.units {
-        let next = (unit.rotation + rotation_delta).rem_euclid(360.0);
+        let next = unit.rotation.rem_euclid(360.0) + rotation_delta;
         let (canonical_rotation, canonical_mirror) =
             cse::kicad_orientation(next, unit.mirror.as_deref());
         unit.rotation = canonical_rotation;
@@ -167,7 +166,8 @@ pub(super) async fn handle_rotate_schematic_component(
         // eeschema's canonical `(rotation, mirror)` pair before writing, so
         // KiCad's next save leaves the pair alone and a later rotation computes
         // its delta from the stored angle (#568).
-        let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
+        let new_rotation = (symbol.at.rotation.unwrap_or(0.0).rem_euclid(360.0) + rotation_delta)
+            .rem_euclid(360.0);
         symbol.set_rotation(new_rotation);
         symbol.normalize_orientation();
     }
@@ -201,6 +201,32 @@ pub(super) async fn handle_rotate_schematic_component(
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
+}
+
+/// Transforming fields and no-connects needs the old pin geometry as well as
+/// the new angle. Do not use non-quarter-turn saved angles for that geometry.
+fn check_saved_rotation<'a>(
+    operation: &str,
+    reference: &str,
+    units: impl IntoIterator<Item = &'a super::readback::ComponentTargetUnit>,
+) -> Result<(), CallToolResult> {
+    for unit in units {
+        if !is_symbol_quarter_turn(unit.rotation) {
+            let reason = format!(
+                "{reference} unit {} has a saved rotation of {} degrees. \
+                 Open the sheet in KiCad, correct or resave its orientation, and retry.",
+                unit.unit, unit.rotation
+            );
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: operation.into(),
+                    reasons: vec![reason.clone()],
+                },
+                reason,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The UUIDs of the placements a `unit` argument selects, in unit order: the
@@ -278,6 +304,16 @@ pub(super) async fn handle_mirror_schematic_component(
         Ok(selected) => selected.into_iter().collect::<BTreeSet<_>>(),
         Err(error) => return Ok(error),
     };
+    if let Err(error) = check_saved_rotation(
+        "mirror_schematic_component",
+        &reference,
+        target
+            .units
+            .iter()
+            .filter(|unit| selected.contains(&unit.uuid)),
+    ) {
+        return Ok(error);
+    }
     // The intent is bound apart from the writer: the requested reflection on
     // each unit's own turn, in the pair eeschema writes for it. A unit whose
     // bound pair is unchanged is already as requested.

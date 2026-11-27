@@ -11,6 +11,7 @@ use crate::mcp::handler::McpHandler;
 use crate::mcp::protocol::CallToolResult;
 use crate::test_support::MockIpcServer;
 use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+use crate::tools::pcb_routing::EXPECTED_ROUTING_REFILL_REMEDY;
 use crate::tools::ServerConfig;
 use copperpour_ipc::builders::{distance, net, pack_any, vec2};
 use copperpour_ipc::gen::kiapi;
@@ -253,9 +254,14 @@ async fn modify_trace_updates_the_track_in_place_in_one_commit() {
     let result = scene.call(json!({})).await;
 
     assert!(!result.is_error, "{:?}", result.content);
-    let answer = body(&result);
-    assert_eq!(answer["modified_uuid"], TRACK);
-    assert_eq!(answer["layer"], "In4.Cu");
+    assert_eq!(
+        body(&result),
+        json!({
+            "modified_uuid": TRACK, "net": "GND", "layer": "In4.Cu", "width": 0.3,
+            "from": { "x": 5.0, "y": 5.0 }, "to": { "x": 12.0, "y": 5.0 },
+            "zone_refill": { "remedy": EXPECTED_ROUTING_REFILL_REMEDY }
+        })
+    );
     assert_eq!(
         scene.writes(),
         (
@@ -328,6 +334,7 @@ async fn modify_trace_refuses_before_changing_the_board() {
         let case = changes.to_string();
         assert!(result.is_error, "{case}: {:?}", result.content);
         let answer = body(&result);
+        assert!(answer.get("zone_refill").is_none(), "{case}: {answer}");
         let error = &answer["error"];
         assert_eq!(error["kind"], kind, "{case}: {error}");
         if let Some(field) = field {
@@ -379,7 +386,9 @@ async fn an_update_that_does_not_read_back_is_uncertain() {
     let result = scene.call(json!({})).await;
 
     assert!(result.is_error, "{:?}", result.content);
-    let error = &body(&result)["error"];
+    let answer = body(&result);
+    assert!(answer.get("zone_refill").is_none(), "{answer}");
+    let error = &answer["error"];
     assert_eq!(error["kind"], "ipc_outcome_unknown", "{error}");
     assert_eq!(error["retry_safe"], false);
     let reason = error["reason"].as_str().unwrap();

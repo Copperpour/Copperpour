@@ -12,8 +12,7 @@ use copperpour_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        pin_endpoint, read_schematic,
+        extract_labels, extract_symbol_instances, extract_wires, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, direct_children_with_tag, find_direct_child_blocks, write_atomic_if_unchanged,
@@ -25,7 +24,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_connectivity::net_graph_for;
+use super::sch_connectivity::{net_graph_for, saved_net_labels};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -199,8 +198,13 @@ pub fn tools() -> Vec<ToolDef> {
             "Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. \
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
              Preserves placement, routing, board-only footprints, and footprint artwork. \
+             A footprint linked to any unit of a multi-unit symbol is that symbol's, as \
+             KiCad's Update PCB matches it, and keeps its link. \
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
-             and the sync proceeds for every other component. A part the dry run finds \
+             and the sync proceeds for every other component. A pin KiCad left \
+             unconnected, alone on an `unconnected-…` net or with a no-connect pin type, \
+             needs no pad: a keyed header's footprint, with no pad at the key, takes \
+             every other net. A part the dry run finds \
              cannot be built is skipped and every other part is still synced, as KiCad's \
              Update PCB reports its errors and commits the rest: a library footprint that \
              cannot be placed, a connected pad its footprint does not have, an update of a \
@@ -614,7 +618,7 @@ async fn handle_export_netlist_summary(
 
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = saved_net_labels(&tree);
     let placed = placed_pins_by_reference(&tree);
 
     let mut g = net_graph_for(&tree, &wires, &labels);
@@ -646,7 +650,8 @@ async fn handle_export_netlist_summary(
                     pins.iter()
                         .map(|(pin, transform)| {
                             let (px, py) = pin_endpoint(pin, *transform);
-                            let net = g.net_at(px, py).unwrap_or_else(|| "~".to_string());
+                            let (x, y) = g.pin_position(pin, *transform);
+                            let net = g.net_at(x, y).unwrap_or_else(|| "~".to_string());
                             json!({
                                 "number": pin.number,
                                 "name": pin.name,

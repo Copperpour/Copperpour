@@ -1,6 +1,8 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
 #[cfg(test)]
+mod authoring_clearance_tests;
+#[cfg(test)]
 mod board_extents_tests;
 #[cfg(test)]
 mod board_layer_refusal_tests;
@@ -93,7 +95,9 @@ pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;
 mod sch_block_move;
+mod sch_block_placement;
 pub mod sch_bus;
+mod sch_cleanup;
 pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
@@ -101,9 +105,14 @@ pub mod sch_hierarchy;
 mod sch_instance_repair;
 mod sch_label_rename;
 mod sch_layout_score;
+mod sch_page_fit;
 mod sch_pin_contacts;
+mod sch_placement_check;
 pub mod sch_readability;
 mod sch_shapes;
+mod sch_split_plan;
+#[cfg(test)]
+mod sch_split_plan_tests;
 mod sch_texts;
 mod sch_transfer;
 pub(crate) mod sch_wire_runs;
@@ -1971,6 +1980,24 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+pub(super) fn is_symbol_quarter_turn(rotation: f64) -> bool {
+    rotation % 90.0 == 0.0
+}
+
+pub(super) fn normalize_symbol_rotation(rotation: f64, field: &str) -> Result<f64, CallToolResult> {
+    if !is_symbol_quarter_turn(rotation) {
+        return Err(invalid_arg(field, "must be a multiple of 90 degrees"));
+    }
+    Ok(rotation.rem_euclid(360.0))
+}
+
+pub(super) fn symbol_rotation_arg(value: &Value, field: &str) -> Result<f64, CallToolResult> {
+    let rotation = value
+        .as_f64()
+        .ok_or_else(|| invalid_arg(field, "missing or not a number"))?;
+    normalize_symbol_rotation(rotation, field)
+}
+
 /// A persistence step whose result cannot say what is on disk.
 pub(crate) fn file_outcome_uncertain(
     path: &std::path::Path,
@@ -2059,14 +2086,34 @@ pub(crate) fn revision_conflict_result(path: &std::path::Path, operation: &str) 
     changed_after_read(path, what, operation)
 }
 
+pub(crate) fn non_regular_write_refusal(
+    error: &(dyn std::error::Error + 'static),
+    operation: &str,
+) -> Option<CallToolResult> {
+    let path = match (error.downcast_ref(), error.downcast_ref()) {
+        (Some(copperpour_sexp::SexpError::NonRegularWriteTarget { path }), _)
+        | (_, Some(copperpour_schematic_editor::Error::NonRegularWriteTarget(path))) => path,
+        _ => return None,
+    };
+    let path = copperpour_sexp::paths::display_path(path);
+    let reason = "use the actual file path, not a symbolic link or another non-regular entry";
+    Some(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidWriteTarget {
+            path: path.clone(),
+            reason: reason.to_owned(),
+        },
+        format!("{operation} wrote nothing to '{path}': {reason}."),
+    ))
+}
+
 /// The `mutation_outcome_uncertain` result for a write `operation` that
 /// replaced `path` but could not read it back as written.
 pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) -> CallToolResult {
     mutation_outcome_uncertain(
         path,
         operation,
-        "the file was replaced, but did not read back as written; another program may have \
-         saved it in between",
+        "the file was replaced, but directory sync or readback could not verify it. \
+         Another program may have saved it in between",
     )
 }
 
@@ -2220,9 +2267,9 @@ pub(crate) fn install_schematic_editor_owners() {
     copperpour_sexp::writer::set_editor_owners(schematic_editor_owners);
 }
 
-/// The `conflict` refusal for a schematic write that `error` shows never
-/// happened: KiCad's editor lock blocked it, or the file changed after it was
-/// read. Single-file writers check both before the rename, so the file is as
+/// The refusal for a schematic write that `error` shows never happened:
+/// KiCad's editor lock blocked it, the path was not a regular file, or the
+/// file changed after it was read. The checks precede rename, so the file is as
 /// it was (#427); a transaction only before its journal. `None` for any other
 /// error, which may come after the rename.
 pub(crate) fn unwritten_schematic_refusal(
@@ -2231,6 +2278,9 @@ pub(crate) fn unwritten_schematic_refusal(
 ) -> Option<CallToolResult> {
     use copperpour_schematic_editor::Error as EditorError;
     use copperpour_sexp::SexpError;
+    if let Some(refusal) = non_regular_write_refusal(error, operation) {
+        return Some(refusal);
+    }
     if let Some(locked) = kicad_editor_lock(error) {
         // `paths` names the schematic, as dispatch's lock refusal does.
         let shown = copperpour_sexp::paths::display_path(locked.path);
@@ -2720,7 +2770,15 @@ pub(crate) type UnitPins = Vec<(
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
 pub(crate) fn placed_pins_by_reference(tree: &copperpour_sexp::SexpNode) -> PlacedPinsByReference {
-    placed_symbols_with_pins(tree)
+    placed_symbols_with_pins(tree, false)
+        .into_iter()
+        .filter_map(|(inst, pins)| Some((inst, pins?)))
+        .collect()
+}
+
+/// The legacy placement geometry, with the selected pin function for power drivers.
+fn placed_pins_for_power_drivers(tree: &copperpour_sexp::SexpNode) -> PlacedPinsByReference {
+    placed_symbols_with_pins(tree, true)
         .into_iter()
         .filter_map(|(inst, pins)| Some((inst, pins?)))
         .collect()
@@ -2730,38 +2788,37 @@ pub(crate) fn placed_pins_by_reference(tree: &copperpour_sexp::SexpNode) -> Plac
 /// definition is not embedded.
 fn placed_symbols_with_pins(
     tree: &copperpour_sexp::SexpNode,
+    resolve_alternates: bool,
 ) -> Vec<(copperpour_sexp::schematic::SymbolInstance, Option<UnitPins>)> {
     use copperpour_sexp::schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
+        extract_lib_pins_for_unit, extract_placed_pins, find_lib_symbol, symbol_instance,
     };
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    extract_symbol_instances(tree)
+    tree.find_all("symbol")
         .into_iter()
-        .map(|inst| {
+        .filter_map(|node| {
+            let inst = symbol_instance(node)?;
             // find_lib_symbol, not a lib_id match: an instance carrying a
             // (lib_name …) is a sheet-local derived symbol whose pins can sit
             // elsewhere than the base definition's (#143).
             let pins = find_lib_symbol(&lib_syms, &inst).map(|sym| {
                 let t = inst.pin_transform();
-                extract_lib_pins_for_unit(sym, inst.unit)
-                    .into_iter()
-                    .map(|p| (p, t))
-                    .collect()
+                let pins = if resolve_alternates {
+                    extract_placed_pins(node, sym, inst.unit)
+                } else {
+                    extract_lib_pins_for_unit(sym, inst.unit)
+                };
+                pins.into_iter().map(|p| (p, t)).collect()
             });
-            (inst, pins)
+            Some((inst, pins))
         })
         .collect()
 }
 
-pub(crate) fn symbol_body_style(node: &copperpour_sexp::SexpNode) -> u32 {
-    node.find_str("body_style")
-        .or_else(|| node.find_str("convert"))
-        .and_then(|style| style.parse().ok())
-        .unwrap_or(1)
-}
+pub(crate) use copperpour_sexp::schematic::symbol_body_style;
 
 /// Resolve the pins actually drawn by the selected unit and body style.
 fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByReference> {
@@ -2772,8 +2829,23 @@ fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByRef
 fn drawn_symbol_pin_inventory(
     tree: &copperpour_sexp::SexpNode,
 ) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
+    drawn_pin_inventory(tree, false)
+}
+
+/// Saved geometry with the selected pin function for power drivers.
+fn drawn_pins_for_power_drivers(
+    tree: &copperpour_sexp::SexpNode,
+) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
+    drawn_pin_inventory(tree, true)
+}
+
+fn drawn_pin_inventory(
+    tree: &copperpour_sexp::SexpNode,
+    resolve_alternates: bool,
+) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
     use copperpour_sexp::schematic::{
-        find_lib_symbol, resolve_lib_pins_for_unit_and_body_style, symbol_instance,
+        find_lib_symbol, resolve_lib_pins_for_unit_and_body_style,
+        resolve_placed_pins_for_unit_and_body_style, symbol_instance,
     };
     let lib_syms = tree
         .find("lib_symbols")
@@ -2791,8 +2863,12 @@ fn drawn_symbol_pin_inventory(
             }
             let lib = find_lib_symbol(&lib_syms, &inst)?;
             let transform = inst.pin_transform();
-            let pins =
-                resolve_lib_pins_for_unit_and_body_style(lib, inst.unit, symbol_body_style(node))?;
+            let style = symbol_body_style(node);
+            let pins = if resolve_alternates {
+                resolve_placed_pins_for_unit_and_body_style(node, lib, inst.unit, style)?
+            } else {
+                resolve_lib_pins_for_unit_and_body_style(lib, inst.unit, style)?
+            };
             Some((inst, pins.into_iter().map(|pin| (pin, transform)).collect()))
         })
         .collect()
@@ -2875,7 +2951,7 @@ pub(crate) struct PlacedPins {
 impl PlacedPins {
     pub(crate) fn new(tree: &copperpour_sexp::SexpNode) -> Self {
         Self {
-            symbols: placed_symbols_with_pins(tree),
+            symbols: placed_symbols_with_pins(tree, false),
         }
     }
 
@@ -4150,6 +4226,26 @@ pub(crate) fn key_top_level_sheets(
     listed: Vec<(std::path::PathBuf, Option<String>)>,
     known: Option<(&std::path::Path, &str)>,
 ) -> Option<Vec<TopLevelSheet>> {
+    key_top_level_sheets_with(listed, known, &|path| {
+        copperpour_schematic_editor::Schematic::load(path).ok()
+    })
+}
+
+type LoadHierarchySheet<'a> =
+    &'a dyn Fn(&std::path::Path) -> Option<copperpour_schematic_editor::Schematic>;
+
+fn same_placement_uuid(left: &str, right: &str) -> bool {
+    match (uuid::Uuid::parse_str(left), uuid::Uuid::parse_str(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn key_top_level_sheets_with(
+    listed: Vec<(std::path::PathBuf, Option<String>)>,
+    known: Option<(&std::path::Path, &str)>,
+    load: LoadHierarchySheet<'_>,
+) -> Option<Vec<TopLevelSheet>> {
     listed
         .into_iter()
         .map(|(schematic, uuid)| {
@@ -4158,11 +4254,7 @@ pub(crate) fn key_top_level_sheets(
                 (None, Some((file, uuid))) if same_schematic_document(file, &schematic) => {
                     uuid.to_owned()
                 }
-                (None, _) => {
-                    copperpour_schematic_editor::Schematic::load(&schematic)
-                        .ok()?
-                        .uuid?
-                }
+                (None, _) => load(&schematic)?.uuid?,
             };
             Some(TopLevelSheet { schematic, uuid })
         })
@@ -4175,15 +4267,34 @@ fn paths_under_each(
     sheets: &[TopLevelSheet],
     target: &std::path::Path,
     override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
+    load: LoadHierarchySheet<'_>,
+    preserve_placements: bool,
 ) -> Vec<Option<Vec<String>>> {
     sheets
         .iter()
         .map(|sheet| {
-            if same_schematic_document(&sheet.schematic, target) {
+            let mut paths = if same_schematic_document(&sheet.schematic, target) {
                 Some(vec![format!("/{}", sheet.uuid)])
             } else {
-                sheet_file_instance_paths(&sheet.schematic, &sheet.uuid, target, override_schematic)
+                sheet_file_instance_paths(
+                    &sheet.schematic,
+                    &sheet.uuid,
+                    target,
+                    override_schematic,
+                    load,
+                    preserve_placements,
+                )
+            }?;
+            if preserve_placements
+                && sheets.iter().any(|other| {
+                    same_placement_uuid(&other.uuid, &sheet.uuid)
+                        && other.schematic != sheet.schematic
+                })
+            {
+                // The target's root path also names a different top-level file.
+                paths.extend(paths.first().cloned());
             }
+            Some(paths)
         })
         .collect()
 }
@@ -4197,7 +4308,13 @@ pub(crate) fn top_level_instance_paths(
     override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
 ) -> Option<Vec<String>> {
     let mut paths = Vec::new();
-    for found in paths_under_each(sheets, target, override_schematic) {
+    for found in paths_under_each(
+        sheets,
+        target,
+        override_schematic,
+        &|path| copperpour_schematic_editor::Schematic::load(path).ok(),
+        false,
+    ) {
         paths.extend(found?);
     }
     paths.sort();
@@ -4469,6 +4586,20 @@ pub(crate) fn resolve_schematic_ownership_from(
     target: &std::path::Path,
     current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    resolve_schematic_ownership_with(
+        target,
+        current_dir,
+        &|path| copperpour_schematic_editor::Schematic::load(path).ok(),
+        false,
+    )
+}
+
+fn resolve_schematic_ownership_with(
+    target: &std::path::Path,
+    current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+    load: LoadHierarchySheet<'_>,
+    preserve_placements: bool,
+) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
     let project_files = candidate_project_files_from(target, current_dir)?;
 
     let mut roots = Vec::new();
@@ -4477,12 +4608,12 @@ pub(crate) fn resolve_schematic_ownership_from(
     for project_file in project_files {
         let listed = listed_top_level_sheets(&project_file);
         roots.extend(listed.iter().map(|(schematic, _)| schematic.clone()));
-        let Some(top_level_sheets) = key_top_level_sheets(listed, None) else {
+        let Some(top_level_sheets) = key_top_level_sheets_with(listed, None, load) else {
             complete = false;
             continue;
         };
 
-        let found = paths_under_each(&top_level_sheets, target, None);
+        let found = paths_under_each(&top_level_sheets, target, None, load, preserve_placements);
         complete &= found.iter().all(Option::is_some);
         let places = |index: &usize| {
             found[*index]
@@ -4499,7 +4630,9 @@ pub(crate) fn resolve_schematic_ownership_from(
         let root = top_level_sheets[index].clone();
         let mut instance_paths: Vec<String> = found.into_iter().flatten().flatten().collect();
         instance_paths.sort();
-        instance_paths.dedup();
+        if !preserve_placements {
+            instance_paths.dedup();
+        }
         owners.push(SchematicOwnership {
             project_file,
             root_schematic: root.schematic,
@@ -4584,6 +4717,8 @@ struct PathCollect<'a> {
         &'a std::path::Path,
         &'a copperpour_schematic_editor::Schematic,
     )>,
+    load: LoadHierarchySheet<'a>,
+    preserve_placements: bool,
     suffix: Vec<String>,
     stack: std::collections::HashSet<std::path::PathBuf>,
     found: Vec<String>,
@@ -4605,18 +4740,19 @@ fn collect_sheet_instance_paths(
     let mut complete = true;
     let loaded;
     let schematic = match collect.override_schematic {
-        Some((path, sch)) if same_schematic_document(current, path) => Ok(sch),
+        Some((path, sch)) if same_schematic_document(current, path) => Some(sch),
         _ => {
-            loaded = copperpour_schematic_editor::Schematic::load(current);
-            loaded.as_ref().map_err(|_| ())
+            loaded = (collect.load)(current);
+            loaded.as_ref()
         }
     };
-    if let Ok(schematic) = schematic {
+    if let Some(schematic) = schematic {
         let directory = current
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         for sheet in &schematic.sheets {
             let child = directory.join(sheet.file());
+            let first = collect.found.len();
             collect.suffix.push(sheet.uuid.clone());
             if same_schematic_document(&child, collect.target) {
                 let mut path = format!("/{}", collect.root_uuid);
@@ -4629,6 +4765,15 @@ fn collect_sheet_instance_paths(
                 complete &= collect_sheet_instance_paths(collect, &child, depth + 1);
             }
             collect.suffix.pop();
+            if collect.preserve_placements
+                && schematic.sheets.iter().any(|other| {
+                    same_placement_uuid(&other.uuid, &sheet.uuid) && other.file() != sheet.file()
+                })
+            {
+                // A different sibling file shares this path prefix. Preserve
+                // the ambiguity even if only one sibling contains the target.
+                collect.found.extend(collect.found.get(first).cloned());
+            }
         }
     } else {
         complete = false;
@@ -4646,18 +4791,24 @@ fn sheet_file_instance_paths(
     root_uuid: &str,
     target: &std::path::Path,
     override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
+    load: LoadHierarchySheet<'_>,
+    preserve_placements: bool,
 ) -> Option<Vec<String>> {
     let mut collect = PathCollect {
         target,
         root_uuid,
         override_schematic,
+        load,
+        preserve_placements,
         suffix: Vec::new(),
         stack: std::collections::HashSet::new(),
         found: Vec::new(),
     };
     let complete = collect_sheet_instance_paths(&mut collect, root_schematic, 0);
     collect.found.sort();
-    collect.found.dedup();
+    if !preserve_placements {
+        collect.found.dedup();
+    }
     complete.then_some(collect.found)
 }
 
@@ -4678,22 +4829,54 @@ pub(crate) fn sheet_instance_context(
     sch: &mut copperpour_schematic_editor::Schematic,
 ) -> Result<SheetInstanceContext, SchematicTargetError> {
     let own_root = ensure_root_uuid(sch);
+    let ownership = resolve_schematic_ownership(sch_path)?;
+    Ok(instance_context_from_ownership(
+        sch_path, &own_root, ownership,
+    ))
+}
+
+/// Same ownership rules as the edit path, without creating cooperative
+/// lockfiles. The requested document is the same snapshot the caller analyses.
+pub(super) fn saved_sheet_instance_context(
+    path: &std::path::Path,
+    source: &str,
+    own_root: &str,
+) -> Result<SheetInstanceContext, SchematicTargetError> {
+    let ownership = resolve_schematic_ownership_with(
+        path,
+        std::env::current_dir,
+        &|other| {
+            if same_schematic_document(path, other) {
+                return copperpour_schematic_editor::Schematic::from_source(other, source).ok();
+            }
+            let source = std::fs::read_to_string(other).ok()?;
+            copperpour_schematic_editor::Schematic::from_source(other, source).ok()
+        },
+        true,
+    )?;
+    Ok(instance_context_from_ownership(path, own_root, ownership))
+}
+
+fn instance_context_from_ownership(
+    sch_path: &std::path::Path,
+    own_root: &str,
+    ownership: Option<SchematicOwnership>,
+) -> SheetInstanceContext {
     let standalone = SheetInstanceContext {
         project_name: project_name_for(sch_path),
         instance_path: format!("/{own_root}"),
         instance_paths: vec![format!("/{own_root}")],
         is_child_sheet: false,
     };
-
-    let Some(ownership) = resolve_schematic_ownership(sch_path)? else {
-        return Ok(standalone);
+    let Some(ownership) = ownership else {
+        return standalone;
     };
     let instance_path = ownership
         .instance_paths
         .first()
         .cloned()
         .unwrap_or_else(|| standalone.instance_path.clone());
-    Ok(SheetInstanceContext {
+    SheetInstanceContext {
         project_name: ownership
             .project_file
             .file_stem()
@@ -4703,7 +4886,7 @@ pub(crate) fn sheet_instance_context(
         instance_path,
         instance_paths: ownership.instance_paths,
         is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
-    })
+    }
 }
 
 /// Symbols named per distinct diagnosis before the rest become a count.

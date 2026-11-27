@@ -127,7 +127,7 @@ pub(crate) fn for_unreachable(
                 ],
                 next_steps: vec![
                     user_step("Verify KiCad is open, check Preferences > Plugins > 'Enable KiCad API', and compare KiCad's 'Listening on' address against the configured endpoint."),
-                    agent_step("check_kicad_ui", "Call check_kicad_ui (or launch_kicad_ui if KiCad is not running) to verify editor and API readiness."),
+                    agent_step("check_kicad_ui", "Call check_kicad_ui to verify editor and API readiness, or open_board (in the verification toolset) to launch KiCad's PCB Editor on a .kicad_pcb (launch_kicad_ui opens the Project Manager)."),
                 ],
                 troubleshooting_url: Some(troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer")),
             }
@@ -319,8 +319,8 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 "Open the requested board in KiCad's PCB Editor.".to_string(),
             ],
             next_steps: vec![
-                user_step("Open the requested .kicad_pcb file in KiCad's PCB Editor."),
-                agent_step("open_project", "Call open_project to confirm the requested board appears in open_boards before retrying."),
+                agent_step("open_board", "Call open_board (in the verification toolset) with the requested .kicad_pcb path to open it in KiCad's PCB Editor and bind its IPC endpoint before retrying."),
+                user_step("Or open the requested .kicad_pcb file in KiCad's PCB Editor manually."),
             ],
             troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
@@ -340,8 +340,8 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 "Open the requested board in KiCad or confirm which open board should be targeted.".to_string(),
             ],
             next_steps: vec![
-                user_step("Open the requested board in KiCad's PCB Editor, or confirm which open document should be targeted instead."),
-                agent_step("open_project", "Do not switch targets automatically; call open_project to verify the target board is open before retrying."),
+                agent_step("open_board", "Do not switch targets automatically; call open_board (in the verification toolset) with the requested .kicad_pcb path to find or open it in KiCad's PCB Editor and bind its IPC endpoint before retrying."),
+                user_step("Or open the requested board in KiCad's PCB Editor manually, or confirm which open document should be targeted instead."),
             ],
             troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
@@ -402,8 +402,8 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 "Reopen or restore the exact requested board in KiCad's PCB Editor.".to_string(),
             ],
             next_steps: vec![
-                user_step("Reopen the requested board in KiCad's PCB Editor."),
-                agent_step("open_project", "Call open_project to confirm the requested board is uniquely open before retrying."),
+                agent_step("open_board", "Call open_board (in the verification toolset) with the requested .kicad_pcb path to locate or reopen it in KiCad's PCB Editor and bind its IPC endpoint before retrying."),
+                user_step("Or reopen the requested board in KiCad's PCB Editor manually."),
             ],
             troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
@@ -473,8 +473,8 @@ pub(crate) fn for_board_editor_absence(
                 "Open the requested board in KiCad's PCB Editor.".to_string(),
             ],
             next_steps: vec![
-                user_step("Open the requested .kicad_pcb board in KiCad's PCB Editor."),
-                agent_step("open_project", "Call open_project to confirm the board is open before retrying."),
+                agent_step("open_board", "Call open_board (in the verification toolset) with the requested .kicad_pcb path to find or launch KiCad's PCB Editor and bind its IPC endpoint before retrying."),
+                user_step("Or open the requested .kicad_pcb board in KiCad's PCB Editor manually."),
             ],
             troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
@@ -924,5 +924,113 @@ mod tests {
         ));
         assert_eq!(unimpl["recovery"]["cause"], "unknown");
         assert_eq!(unimpl["recovery"]["retry_safe"], false);
+    }
+
+    #[test]
+    fn missing_board_and_no_editor_recovery_suggest_open_board() {
+        let cases = [
+            (
+                "no_open_documents",
+                for_board_target_error(&BoardTargetError::NoOpenDocuments {
+                    requested: "/proj/board.kicad_pcb".to_string(),
+                }),
+            ),
+            (
+                "wrong_document",
+                for_board_target_error(&BoardTargetError::WrongDocument {
+                    requested: "/proj/a.kicad_pcb".to_string(),
+                    open_documents: vec!["/proj/b.kicad_pcb".to_string()],
+                }),
+            ),
+            (
+                "stale_document",
+                for_board_target_error(&BoardTargetError::StaleDocument {
+                    requested: "/proj/a.kicad_pcb".to_string(),
+                    previously_bound: "/proj/a.kicad_pcb".to_string(),
+                    open_documents: vec![],
+                }),
+            ),
+            (
+                "no_pcb_editor_at_endpoint",
+                for_board_editor_absence(BoardEditorAbsence::NoPcbEditor, "AS_UNHANDLED"),
+            ),
+        ];
+
+        for (expected_cause, guidance) in cases {
+            assert_eq!(guidance.cause, expected_cause);
+            assert_eq!(guidance.mutation_outcome, "none");
+            assert!(!guidance.retry_safe);
+            assert!(
+                guidance
+                    .next_steps
+                    .iter()
+                    .any(|s| s.actor == "agent" && s.tool.as_deref() == Some("open_board")),
+                "{expected_cause}: expected open_board agent step, got {:?}",
+                guidance.next_steps
+            );
+            assert!(
+                guidance.next_steps.iter().any(|s| s.actor == "user"),
+                "{expected_cause}: expected manual user fallback step"
+            );
+        }
+
+        let wrong = for_board_target_error(&BoardTargetError::WrongDocument {
+            requested: "/proj/a.kicad_pcb".to_string(),
+            open_documents: vec!["/proj/b.kicad_pcb".to_string()],
+        });
+        assert!(wrong
+            .next_steps
+            .iter()
+            .any(|s| s.action.contains("Do not switch targets automatically")));
+
+        let no_listener = for_unreachable(
+            UnreachableReason::NoListener,
+            Some("ipc:///tmp/kicad/api.sock"),
+            &[],
+            "connection refused",
+        );
+        assert!(no_listener
+            .next_steps
+            .iter()
+            .any(|s| s.actor == "agent" && s.action.contains("open_board")));
+
+        // Ambiguous, unresolved, unimplemented, permission, and uncertain-mutation
+        // errors must not suggest open_board as an automatic fix.
+        let non_open_board_cases = [
+            for_board_target_error(&BoardTargetError::AmbiguousDocument {
+                requested: "a.kicad_pcb".to_string(),
+                candidates: vec![
+                    "dir1/a.kicad_pcb".to_string(),
+                    "dir2/a.kicad_pcb".to_string(),
+                ],
+            }),
+            for_board_target_error(&BoardTargetError::UnresolvedDocumentIdentities {
+                requested: "a.kicad_pcb".to_string(),
+                reasons: vec!["unsaved".to_string()],
+            }),
+            for_board_editor_absence(
+                BoardEditorAbsence::OpenDocumentsUnimplemented,
+                "AS_UNIMPLEMENTED",
+            ),
+            for_unreachable(
+                UnreachableReason::AccessDenied,
+                Some("ipc:///tmp/kicad/api.sock"),
+                &[],
+                "permission denied",
+            ),
+            for_ipc_outcome_unknown("timeout"),
+            for_ipc_batch_recovered("late reply"),
+        ];
+        for guidance in non_open_board_cases {
+            assert!(
+                guidance
+                    .next_steps
+                    .iter()
+                    .all(|s| s.tool.as_deref() != Some("open_board")),
+                "{}: must not suggest open_board, got {:?}",
+                guidance.cause,
+                guidance.next_steps
+            );
+        }
     }
 }

@@ -103,6 +103,12 @@ pub(crate) fn carries_kicad_10_0_7_fields(version: &copperpour_ipc::IpcKiCadVers
     (version.major, version.minor, version.patch) >= (10, 0, 7)
 }
 
+/// Whether `version`'s API populates read-only `parent` KIIDs on footprints
+/// and their children (`board_types.proto`: `Since: 10.0.6`).
+pub(crate) fn carries_parent_fields(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (version.major, version.minor, version.patch) >= (10, 0, 6)
+}
+
 /// Whether `version`'s API keeps a footprint's net-tie pad groups. Every
 /// KiCad 10 release sends a group as its pad numbers, split at commas and
 /// whitespace (`FOOTPRINT::Serialize`), and joins them again when it takes a
@@ -1502,25 +1508,41 @@ fn check_user_text_effects(
     on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
 ) -> Result<()> {
     let mut font = None;
+    let mut justify = None;
     for clause in effects.children().unwrap_or_default().iter().skip(1) {
         let tag = clause
             .head()
             .context("fp_text user effects contain an unsupported atom")?;
-        if tag != "font" {
-            on_unsupported(
-                &format!("fp_text user effects clause '{tag}' is not carried by typed placement"),
-                &format!("fp_text user effects clause '{tag}' is not supported losslessly"),
-            )?;
-            continue;
-        }
-        if font.replace(clause).is_some() {
-            bail!("fp_text user contains duplicate font clauses");
+        match tag {
+            "font" => {
+                if font.replace(clause).is_some() {
+                    bail!("fp_text user contains duplicate font clauses");
+                }
+            }
+            // KiCad's API carries both alignments and the mirror flag.
+            "justify" => {
+                if justify.replace(clause).is_some() {
+                    bail!("fp_text user contains duplicate 'justify' clauses");
+                }
+                check_user_text_justify(clause)?;
+            }
+            _ => {
+                on_unsupported(
+                    &format!(
+                        "fp_text user effects clause '{tag}' is not carried by typed placement"
+                    ),
+                    &format!("fp_text user effects clause '{tag}' is not supported losslessly"),
+                )?;
+            }
         }
     }
     let font = font.context("fp_text user effects are missing the font clause")?;
 
     let mut size = None;
     let mut thickness = None;
+    let mut bold = false;
+    let mut italic = false;
+    let mut line_spacing = false;
     for clause in font.children().unwrap_or_default().iter().skip(1) {
         let tag = clause
             .head()
@@ -1531,24 +1553,49 @@ fn check_user_text_effects(
                     bail!("fp_text user contains duplicate font size clauses");
                 }
                 if clause.children().map_or(0, |children| children.len()) != 3 {
-                    bail!("fp_text user font size must contain width and height");
+                    bail!("fp_text user font size must contain height and width");
                 }
-                let width = clause
-                    .get_f64(1)
-                    .context("fp_text user font width is invalid")?;
+                // KiCad writes `(size height width)`; KiCad's API carries
+                // both, so a non-square size needs nothing more.
                 let height = clause
-                    .get_f64(2)
+                    .get_f64(1)
                     .context("fp_text user font height is invalid")?;
+                let width = clause
+                    .get_f64(2)
+                    .context("fp_text user font width is invalid")?;
                 if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
                     bail!("fp_text user font size must be finite and positive");
                 }
-                if width != height {
-                    on_unsupported(
-                        "fp_text user non-square font size is not carried by typed placement",
-                        "fp_text user non-square font size is not supported losslessly",
-                    )?;
+                size = Some(height);
+            }
+            "bold" | "italic" => {
+                let seen = if tag == "bold" {
+                    &mut bold
+                } else {
+                    &mut italic
+                };
+                if std::mem::replace(seen, true) {
+                    bail!("fp_text user contains duplicate font '{tag}' clauses");
                 }
-                size = Some(width);
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !matches!(clause.get(1).and_then(SexpNode::as_str), Some("yes" | "no"))
+                {
+                    bail!("fp_text user font '{tag}' must be 'yes' or 'no'");
+                }
+            }
+            "line_spacing" => {
+                if std::mem::replace(&mut line_spacing, true) {
+                    bail!("fp_text user contains duplicate font 'line_spacing' clauses");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .context("fp_text user font line spacing is invalid")?;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !value.is_finite()
+                    || value <= 0.0
+                {
+                    bail!("fp_text user font line spacing must be finite and positive");
+                }
             }
             "thickness" => {
                 if thickness.is_some() {
@@ -1579,6 +1626,31 @@ fn check_user_text_effects(
     }
     size.context("fp_text user font is missing its size")?;
     thickness.context("fp_text user font is missing its thickness")?;
+    Ok(())
+}
+
+/// `(justify …)` names at most one horizontal and one vertical side and
+/// `mirror` at most once, as KiCad writes it.
+fn check_user_text_justify(justify: &SexpNode) -> Result<()> {
+    let mut horizontal = false;
+    let mut vertical = false;
+    let mut mirror = false;
+    for value in justify.children().unwrap_or_default().iter().skip(1) {
+        let value = value
+            .as_str()
+            .context("fp_text user justify contains a non-atom")?;
+        let seen = match value {
+            "left" | "right" => &mut horizontal,
+            "top" | "bottom" => &mut vertical,
+            "mirror" => &mut mirror,
+            unsupported => {
+                bail!("fp_text user justification '{unsupported}' is not supported losslessly")
+            }
+        };
+        if std::mem::replace(seen, true) {
+            bail!("fp_text user justification repeats or conflicts at '{value}'");
+        }
+    }
     Ok(())
 }
 

@@ -1,0 +1,13 @@
+[global]
+enable = ["MD013"]
+exclude = ["docs/API_MIGRATIONS.md"]
+
+[MD013]
+line-length = 90
+headings = false
+code-blocks = false
+code-spans = false
+tables = false
+stern = true
+reflow = false
+reflow-length-exemptions = true

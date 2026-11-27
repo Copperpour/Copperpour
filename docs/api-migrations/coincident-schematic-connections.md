@@ -1,9 +1,9 @@
 ### Schematic connection tools no longer draw zero-length wires (minor release)
 
-When two visible, electrically connectable pins touch on the saved schematic,
+When two verified, electrically connectable pins touch on the saved schematic,
 `connect_pins` succeeds without writing. Check for `already_connected: true`
 with `x` and `y` in millimetres instead of `connected` and `path`. If either pin
-is hidden, electrically unconnected or cannot be verified, the tool refuses
+is electrically unconnected or cannot be verified, the tool refuses
 with `plan_blocked`. Save any changes in KiCad before relying on this result.
 
 `batch_connect_pins` reports those successes in `already_connected`, with

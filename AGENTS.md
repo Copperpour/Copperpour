@@ -37,9 +37,11 @@ Counts move at release.
 
 Compare `NetGraph` roots with `root_at` in `tools/sch_connectivity.rs`.
 One root can have several names. Use `name_of_root` and `net_at` for reporting.
-`seed_net_graph` joins points by geometry, then `merge_named_nets` joins points
-by name. `driver_priority` ranks global labels first, followed by power symbols, local
-labels, and hierarchical labels. Ties use ascending name order.
+`saved_drawn_graph` joins points by geometry, then `merge_named_nets` joins points
+by name. For scalar names on a saved sheet, `driver_priority` ranks global labels,
+global power symbols, local power symbols, local labels, and hierarchical labels in
+that order. Ties use ascending name order. The mixed-power and label cases were
+checked against KiCad 10.0.6 and 10.0.8 netlists.
 
 ## File writes
 

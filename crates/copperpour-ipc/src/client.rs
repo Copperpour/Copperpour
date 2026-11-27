@@ -2959,44 +2959,50 @@ impl KiCadIpcClient {
                 created_id.is_none() || fp.orientation.is_some(),
                 "footprint has no readable orientation"
             );
-            let pos = fp.position.as_ref();
-            let ref_text = fp
-                .reference_field
-                .as_ref()
-                .and_then(|f| f.text.as_ref())
-                .and_then(|bt| bt.text.as_ref())
-                .map(|t| t.text.clone())
-                .unwrap_or_default();
-            let val_text = fp
-                .value_field
-                .as_ref()
-                .and_then(|f| f.text.as_ref())
-                .and_then(|bt| bt.text.as_ref())
-                .map(|t| t.text.clone())
-                .unwrap_or_default();
-            let lib_id = fp
-                .definition
-                .as_ref()
-                .and_then(|d| d.id.as_ref())
-                .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
-                .unwrap_or_default();
-            footprints.push(IpcFootprint {
-                reference: ref_text,
-                value: val_text,
-                footprint: lib_id,
-                position: IpcVector2 {
-                    x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                    y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
-                },
-                rotation: fp
-                    .orientation
-                    .as_ref()
-                    .map(|a| a.value_degrees)
-                    .unwrap_or(0.0),
-                layer: layer_enum_to_name(fp.layer).to_string(),
-            });
+            footprints.push(Self::ipc_footprint(&fp));
         }
         Ok(footprints)
+    }
+
+    /// A placed footprint as `list_footprints` reports it.
+    fn ipc_footprint(fp: &kiapi::board::types::FootprintInstance) -> IpcFootprint {
+        let pos = fp.position.as_ref();
+        let ref_text = fp
+            .reference_field
+            .as_ref()
+            .and_then(|f| f.text.as_ref())
+            .and_then(|bt| bt.text.as_ref())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        let val_text = fp
+            .value_field
+            .as_ref()
+            .and_then(|f| f.text.as_ref())
+            .and_then(|bt| bt.text.as_ref())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        let lib_id = fp
+            .definition
+            .as_ref()
+            .and_then(|d| d.id.as_ref())
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+            .unwrap_or_default();
+        IpcFootprint {
+            kiid: text_edit::footprint_kiid(fp),
+            reference: ref_text,
+            value: val_text,
+            footprint: lib_id,
+            position: IpcVector2 {
+                x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+                y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+            },
+            rotation: fp
+                .orientation
+                .as_ref()
+                .map(|a| a.value_degrees)
+                .unwrap_or(0.0),
+            layer: layer_enum_to_name(fp.layer).to_string(),
+        }
     }
 
     /// Create items on the board.
@@ -4497,6 +4503,17 @@ impl KiCadIpcClient {
         .into())
     }
 
+    /// The footprints on the active board that decode, in KiCad's order.
+    fn active_footprints(&self) -> Result<Vec<kiapi::board::types::FootprintInstance>> {
+        Ok(self
+            .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?
+            .iter()
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .collect())
+    }
+
     /// The placed footprint carrying `reference`, and its index among items.
     fn find_footprint_instance(
         &self,
@@ -4803,9 +4820,11 @@ impl KiCadIpcClient {
     ///
     /// Implements the contract accepted for issue #604:
     ///
-    /// * The footprint is resolved by reference to its live KIID first —
-    ///   reference is discovery input, KIID is mutation identity, exactly
-    ///   like [`Self::move_footprint`].
+    /// * The footprint is resolved by reference, or by the caller's exact
+    ///   `kiid`, to its live KIID first — reference is discovery input, KIID
+    ///   is mutation identity, exactly like [`Self::move_footprint`]. A
+    ///   reference several footprints carry, given without `kiid`, is refused
+    ///   with their KIIDs, as `edit_footprint_in` refuses it.
     /// * Already on the requested layer → a readback-derived no-op; no
     ///   `FlipItems` call is made.
     /// * Otherwise `FlipItems` is sent with `BFD_TOP_BOTTOM` (the same
@@ -4825,12 +4844,31 @@ impl KiCadIpcClient {
     pub fn flip_footprint(
         &self,
         reference: &str,
+        kiid: Option<&str>,
         target_layer: &str,
     ) -> Result<crate::types::IpcFlipOutcome> {
         use crate::types::IpcFlipOutcome;
+        use footprint_edit::SelectedTarget;
 
         let target_board_layer = crate::builders::layer_from_name(target_layer);
-        let (fp, _) = self.find_footprint_instance(reference)?;
+        let inventory = self.active_footprints()?;
+        let fp = match footprint_edit::select_footprint_target(&inventory, reference, kiid)? {
+            SelectedTarget::Found(fp) => fp,
+            SelectedTarget::StaleTarget { target, reason } => {
+                return Ok(IpcFlipOutcome::StaleTarget { target, reason });
+            }
+            SelectedTarget::Ambiguous {
+                target,
+                candidates,
+                reason,
+            } => {
+                return Ok(IpcFlipOutcome::AmbiguousTarget {
+                    target,
+                    candidates,
+                    reason,
+                });
+            }
+        };
         let kiid = fp
             .id
             .as_ref()
@@ -4846,7 +4884,7 @@ impl KiCadIpcClient {
                 previous_layer: previous_layer.clone(),
                 layer: previous_layer,
                 already_on_layer: true,
-                models: Self::footprint_3d_models(&fp)?,
+                models: Self::footprint_3d_models(fp)?,
             });
         }
 
@@ -4920,8 +4958,21 @@ impl KiCadIpcClient {
 
         // Fresh readback — never the mutation response — is the only
         // evidence that counts for the final layer, identity and 3D-model
-        // state (accepted #604 contract).
-        let (readback_fp, _) = match self.find_footprint_instance(reference) {
+        // state (accepted #604 contract). It reads by the KIID the flip
+        // keeps, since another footprint may carry the same reference.
+        let readback = self.active_footprints().and_then(|footprints| {
+            let mut matches: Vec<_> = footprints
+                .into_iter()
+                .filter(|footprint| text_edit::footprint_kiid(footprint) == kiid)
+                .collect();
+            anyhow::ensure!(
+                matches.len() == 1,
+                "KiCad lists {} footprints with KIID '{kiid}'",
+                matches.len()
+            );
+            Ok(matches.remove(0))
+        });
+        let readback_fp = match readback {
             Ok(found) => found,
             Err(error) => {
                 return Ok(IpcFlipOutcome::Uncertain {
@@ -4934,21 +4985,6 @@ impl KiCadIpcClient {
                 });
             }
         };
-        let readback_kiid = readback_fp
-            .id
-            .as_ref()
-            .map(|id| id.value.as_str())
-            .unwrap_or("");
-        if readback_kiid != kiid {
-            return Ok(IpcFlipOutcome::Uncertain {
-                reference: reference.to_string(),
-                kiid,
-                requested_layer: target_layer.to_string(),
-                reason: format!(
-                    "post-flip readback KIID '{readback_kiid}' does not match requested KIID"
-                ),
-            });
-        }
         if readback_fp.layer != target_board_layer as i32 {
             return Ok(IpcFlipOutcome::Uncertain {
                 reference: reference.to_string(),
@@ -6826,24 +6862,42 @@ fn build_graphic_child(
             size,
             stroke_width_mm,
             keep_upright,
+            style,
         } => {
+            use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
             let (tx, ty) = xf(*position);
-            let mut text = builders::board_text_with_stroke_width(
+            let mut text = builders::board_text_with_style(
                 layer,
                 text,
                 tx,
                 ty,
                 *size,
-                *stroke_width_mm,
                 // KiCad keeps the angle as placed and turns keep-upright
                 // text for reading itself.
                 (text_rotation + rotation).rem_euclid(360.0),
-                false,
+                builders::BoardTextStyle {
+                    stroke_width_mm: *stroke_width_mm,
+                    mirror: style.mirrored,
+                    bold: style.bold,
+                    italic: style.italic,
+                },
             );
             if let Some(attributes) = text.text.as_mut().and_then(|text| text.attributes.as_mut()) {
                 // KiCad loads footprint text as multiline.
                 attributes.multiline = true;
                 attributes.keep_upright = *keep_upright;
+                attributes.line_spacing = style.line_spacing;
+                attributes.size = Some(builders::vec2(style.width.unwrap_or(*size), *size));
+                attributes.horizontal_alignment = match style.horizontal {
+                    crate::IpcTextHorizontal::Left => HorizontalAlignment::HaLeft,
+                    crate::IpcTextHorizontal::Center => HorizontalAlignment::HaCenter,
+                    crate::IpcTextHorizontal::Right => HorizontalAlignment::HaRight,
+                } as i32;
+                attributes.vertical_alignment = match style.vertical {
+                    crate::IpcTextVertical::Top => VerticalAlignment::VaTop,
+                    crate::IpcTextVertical::Center => VerticalAlignment::VaCenter,
+                    crate::IpcTextVertical::Bottom => VerticalAlignment::VaBottom,
+                } as i32;
             }
             builders::pack_any(&text, "kiapi.board.types.BoardText")
         }
@@ -8357,6 +8411,7 @@ mod footprint_graphics_tests {
                 size: 0.5,
                 stroke_width_mm: 0.075,
                 keep_upright: true,
+                style: Default::default(),
             },
         ];
         let fp = build(&graphics, 100.0, 50.0, 90.0);
@@ -8432,6 +8487,7 @@ mod footprint_graphics_tests {
             size: 0.5,
             stroke_width_mm: 0.075,
             keep_upright,
+            style: Default::default(),
         };
         let graphics = vec![
             line(crate::IpcLineStyle::Default),
@@ -8488,6 +8544,7 @@ mod footprint_graphics_tests {
             size: 0.5,
             stroke_width_mm: 0.075,
             keep_upright: true,
+            style: Default::default(),
         }];
         let fp = build(&graphics, 0.0, 0.0, 180.0);
         let texts = texts(&fp);
@@ -8668,6 +8725,7 @@ mod footprint_graphics_tests {
                 size: 1.0,
                 stroke_width_mm: 0.15,
                 keep_upright: true,
+                style: Default::default(),
             },
         ];
         let any = KiCadIpcClient::build_footprint_item(

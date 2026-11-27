@@ -387,6 +387,7 @@ async fn differential_pair_retains_item_evidence_independently_of_drop_outcome()
         let response = scene.call(json!({})).await;
         assert!(response.is_error);
         let response = body(&response);
+        assert!(response.get("zone_refill").is_none(), "{response}");
         let recovery = &response["recovery"];
         let evidence = &recovery["evidence"];
         assert_eq!(recovery["cause"], cause, "{response}");

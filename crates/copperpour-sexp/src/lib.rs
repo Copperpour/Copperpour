@@ -1,6 +1,7 @@
 pub mod board;
 pub mod bounds;
 pub mod command;
+pub mod drawing_sheet;
 pub mod error;
 pub mod geometry;
 mod hex;

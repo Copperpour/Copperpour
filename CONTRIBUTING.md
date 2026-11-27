@@ -30,6 +30,24 @@ cargo build --release -p copperpour
 See [DEV.md](DEV.md) for the architecture guide, tool conventions, and how to add a
 new tool.
 
+## Markdown prose
+
+Aim for 90 columns when adding or editing prose in Markdown files. The
+**Markdown prose wrap** CI check annotates added or edited lines as an advisory
+during the trial. It skips headings, tables, code blocks, standalone URLs,
+inline link destinations and code spans, and the released migration history in
+`docs/API_MIGRATIONS.md`. A long bare URL with prose can move to its own line.
+For a list item containing only a long URL, use Markdown autolink syntax
+(`<https://example.com/...>`).
+
+Use rumdl 0.3.6 to check a file with the same policy as CI. The fix command can
+reflow surrounding lines, so review the diff and keep wrapping edits within your change.
+
+```bash
+rumdl check path/to/file.md
+rumdl check --config 'MD013.reflow = true' --fix path/to/file.md
+```
+
 ## Pull request shape
 
 Use an imperative title such as `fix(schematic): preserve tab-indented wire blocks`.

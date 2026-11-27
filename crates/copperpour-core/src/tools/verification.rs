@@ -1461,9 +1461,11 @@ impl Looking {
         }
         let configured = ctx.config.ipc_address.trim().to_string();
         let defaults = copperpour_ipc::candidate_socket_paths();
-        let kicad_binds = configured
-            .strip_prefix("ipc://")
-            .is_some_and(|path| defaults.iter().any(|default| Path::new(path) == default));
+        let kicad_binds = configured.strip_prefix("ipc://").is_some_and(|path| {
+            defaults
+                .iter()
+                .any(|default| same_socket_path(Path::new(path), default))
+        });
         let unreachable_editor = if configured.is_empty() {
             Some("no KiCad endpoint is configured".to_string())
         } else {
@@ -1497,6 +1499,28 @@ impl Looking {
         let until = deadline.max(std::time::Instant::now() + KICAD_IPC_POLL);
         look_for_board_at(board, (self.endpoints)(), until).await
     }
+}
+
+fn same_socket_path(a: &Path, b: &Path) -> bool {
+    same_socket_path_for(a, b, cfg!(windows))
+}
+
+fn same_socket_path_for(a: &Path, b: &Path, case_insensitive: bool) -> bool {
+    if !case_insensitive {
+        return a == b;
+    }
+    let normalize = |path: &Path| {
+        let s = path.as_os_str().to_string_lossy().replace('/', "\\");
+        let mut parts: Vec<String> = Vec::new();
+        for part in s.split('\\') {
+            if part.is_empty() && !parts.is_empty() {
+                continue;
+            }
+            parts.push(part.to_ascii_lowercase());
+        }
+        parts
+    };
+    normalize(a) == normalize(b)
 }
 
 /// What `open_board` reports about itself, whatever the outcome.
@@ -1790,10 +1814,17 @@ async fn open_board(
         if std::time::Instant::now() >= deadline {
             let note = if seen.iter().any(|e| e.not_ready) {
                 crate::tools::NOT_READY_NOTE
+            } else if cfg!(windows) && seen.iter().any(|e| e.responsive && !e.holds_board) {
+                "No KiCad endpoint reported the board within timeout_seconds, and the PCB \
+                 editor started for it is still running. On Windows, KiCad 10 does not bind \
+                 a fallback api-<pid>.sock pipe when another KiCad (such as the Project \
+                 Manager) already holds api.sock. Open the board from the running KiCad \
+                 Project Manager, or close the other KiCad instance and call open_board again."
             } else {
                 "No KiCad endpoint reported the board within timeout_seconds, and the PCB \
-                 editor started for it is still running. Beside another KiCad it serves its \
-                 own socket, api-<pid>.sock, which is looked for only on Unix."
+                 editor started for it is still running. Check that KiCad's IPC API server \
+                 (api.enable_server in kicad_common.json) is enabled and no dialog is waiting; \
+                 beside another KiCad it serves its own api-<pid>.sock."
             };
             return Ok(call.timed_out(&seen, true, note));
         }
@@ -4252,7 +4283,13 @@ mod open_board_tests {
     #[test]
     fn a_configured_kicad_socket_is_known_however_it_is_spelled() {
         let default = copperpour_ipc::candidate_socket_paths()[0].clone();
-        let spelled = format!("ipc://{}", default.display()).replacen("/kicad/", "//kicad/", 1);
+        let spelled = if cfg!(windows) {
+            format!("ipc://{}", default.display())
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+        } else {
+            format!("ipc://{}", default.display()).replacen("/kicad/", "//kicad/", 1)
+        };
         let configured = |address: &str| {
             ToolContext::new(
                 ServerConfig {
@@ -4270,6 +4307,21 @@ mod open_board_tests {
                 .unreachable_editor
                 .is_some()
         );
+    }
+
+    #[test]
+    fn same_socket_path_is_case_insensitive_only_on_windows() {
+        let canonical = Path::new(r"C:\Users\Runner\AppData\Local\Temp\kicad\api.sock");
+        let mixed = Path::new(r"c:/users/runner/appdata/local/temp//kicad/API.SOCK");
+        let elsewhere = Path::new(r"C:\elsewhere\kicad\api.sock");
+
+        assert!(super::same_socket_path_for(canonical, mixed, true));
+        assert!(!super::same_socket_path_for(canonical, elsewhere, true));
+        assert!(!super::same_socket_path_for(
+            Path::new("/tmp/kicad/api.sock"),
+            Path::new("/tmp/KiCad/api.sock"),
+            false,
+        ));
     }
 
     /// Through the served dispatch, as a client calls it.

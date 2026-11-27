@@ -1574,8 +1574,32 @@ fn a_malformed_user_configuration_is_refused_and_never_overwritten_over_stdio() 
     }
 }
 
-/// The other half: with no preferences file the load says it answered with
-/// the defaults, leaves them on disk, and the next load reads that file.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_user_configuration_is_refused_without_writing_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = user_config_under(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let target = tmp.path().join("settings.json");
+    let original = br#"{"ui":{"theme":"light"}}"#;
+    std::fs::write(&target, original).unwrap();
+    std::os::unix::fs::symlink(&target, &config).unwrap();
+    let mut server = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+    let result = server.call_tool(
+        "save_user_config",
+        json!({"key_path": "ui.theme", "value": "dark"}),
+    );
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(result["isError"], true, "{body}");
+    assert_eq!(body["error"]["kind"], "invalid_configuration", "{body}");
+    assert_eq!(body["error"]["path"], json!(config), "{body}");
+    assert!(body["message"].as_str().unwrap().contains("wrote nothing"));
+    assert_eq!(std::fs::read_link(&config).unwrap(), target);
+    assert_eq!(std::fs::read(target).unwrap(), original);
+}
+
+/// With no preferences file the load says it answered with the defaults,
+/// leaves them on disk, and the next load reads that file.
 #[test]
 fn an_absent_user_configuration_reports_defaults_over_stdio() {
     let tmp = tempfile::tempdir().unwrap();

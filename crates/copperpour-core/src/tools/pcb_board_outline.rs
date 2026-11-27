@@ -1093,9 +1093,14 @@ fn replace_live(
         .map(|shape| shape.uuid.clone())
         .collect();
     if ids.iter().any(String::is_empty) {
-        return Ok(CallToolResult::error(
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "replace_board_outline".to_string(),
+                reasons: vec!["KiCad serialised an Edge.Cuts shape with no identifier".to_string()],
+            },
             "KiCad serialised an Edge.Cuts shape with no identifier, so it cannot be deleted; \
-             nothing was written.",
+             nothing was written."
+                .to_string(),
         ));
     }
     let items: Vec<prost_types::Any> = contours.iter().flatten().map(ipc_item).collect();
@@ -2195,6 +2200,40 @@ mod tests {
         assert!(
             !log.iter().any(|command| command == "DeleteItems"),
             "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_edge_shape_without_uuid_refuses_with_plan_blocked() {
+        let live = live(0);
+        let text = live.held.lock().unwrap().text.clone();
+        // Strip all uuids so KiCad's serialized Edge.Cuts shapes have no identifier.
+        let stripped = text.replace("(uuid \"", "(no_uuid \"");
+        live.held.lock().unwrap().text = stripped;
+        let contours = json!([half_disc(0.0, 100.0, 0.0)]);
+        let plan = body(
+            &call(
+                json!({"board": live.board, "contours": contours}),
+                &live.ctx,
+            )
+            .await,
+        );
+        let result = call(
+            json!({
+                "board": live.board,
+                "contours": contours,
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"]
+            }),
+            &live.ctx,
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("plan_blocked"),
+            "{}",
+            body(&result)
         );
     }
 }

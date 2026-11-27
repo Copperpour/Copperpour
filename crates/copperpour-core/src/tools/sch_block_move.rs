@@ -7,15 +7,15 @@
 //! whole sheet must come out of the move exactly as they went in.
 
 use crate::tools::sch_connectivity::{
-    net_graph_for, snapshot_net_graph, NetGraph, NetRoot, PinNetNames, UnitNotation,
-    COINCIDENT_TOLERANCE,
+    net_graph_for, saved_net_labels, snapshot_net_graph, NetGraph, NetRoot, PinNetNames,
+    UnitNotation, COINCIDENT_TOLERANCE,
 };
 use crate::tools::sch_wiring::NoConnectCarry;
 use copperpour_schematic_editor as cse;
 use copperpour_schematic_editor::sexp::{atom, SexpNode as RawNode};
 use copperpour_schematic_editor::types::{fmt_f64, translate_field_ats};
 use copperpour_sexp::geometry::points_coincident;
-use copperpour_sexp::schematic::{extract_all_net_labels, extract_wires, parse_at, pin_endpoint};
+use copperpour_sexp::schematic::{extract_wires, parse_at, pin_endpoint};
 use copperpour_sexp::SexpNode;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -38,7 +38,7 @@ impl Region {
         }
     }
 
-    fn contains(&self, (x, y): (f64, f64)) -> bool {
+    pub(super) fn contains(&self, (x, y): (f64, f64)) -> bool {
         x >= self.xmin && x <= self.xmax && y >= self.ymin && y <= self.ymax
     }
 
@@ -315,22 +315,28 @@ type PinKey = (String, u32, usize, String);
 /// Each pin's net root, net name, and how a refusal names the pin.
 type PinNets = BTreeMap<PinKey, (NetRoot, Option<(String, u8)>, String)>;
 
-/// Every symbol and sheet pin's net root and net name, with how a refusal
-/// names it. `None` when a symbol's library pins do not resolve, since an
-/// unseen pin cannot be shown to keep its net.
+#[derive(Clone, Copy)]
+pub(super) enum NetComparison {
+    Move,
+    Layout,
+    Cleanup,
+}
+
+/// Every symbol and sheet pin's net, or `None` if pin geometry is unresolved.
 fn pin_nets(tree: &SexpNode) -> Option<PinNets> {
     let wires = extract_wires(tree);
-    let labels = extract_all_net_labels(tree);
+    let labels = saved_net_labels(tree);
     let mut graph = net_graph_for(tree, &wires, &labels);
-    collect_pin_nets(tree, &mut graph, &BTreeSet::new(), false)
+    collect_pin_nets(tree, &mut graph, &BTreeSet::new(), NetComparison::Move)
 }
 
 fn collect_pin_nets(
     tree: &SexpNode,
     graph: &mut NetGraph,
     excluded_symbols: &BTreeSet<&str>,
-    snapshot: bool,
+    comparison: NetComparison,
 ) -> Option<PinNets> {
+    let snapshot = !matches!(comparison, NetComparison::Move);
     let names = snapshot.then(|| PinNetNames::build(tree, graph, UnitNotation::default()));
     let net_name = |graph: &NetGraph, root| {
         if snapshot {
@@ -340,7 +346,12 @@ fn collect_pin_nets(
         }
     };
     let mut nets = BTreeMap::new();
-    for (inst, pins) in crate::tools::resolved_placed_pins_by_reference(tree)? {
+    let placed = if matches!(comparison, NetComparison::Cleanup) {
+        crate::tools::drawn_symbol_pins(tree)
+    } else {
+        crate::tools::resolved_placed_pins_by_reference(tree)
+    }?;
+    for (inst, pins) in placed {
         if inst
             .uuid
             .as_deref()
@@ -351,7 +362,7 @@ fn collect_pin_nets(
         let symbol = inst.uuid.clone().unwrap_or_else(|| inst.reference.clone());
         for (ordinal, (pin, transform)) in pins.into_iter().enumerate() {
             let label = format!("{} pin {}", inst.reference, pin.number);
-            let (x, y) = pin_endpoint(&pin, transform);
+            let (x, y) = graph.pin_position(&pin, transform);
             let root = graph.root_at(x, y);
             let name = net_name(graph, root).or_else(|| {
                 names
@@ -383,11 +394,23 @@ fn collect_pin_nets(
             );
         }
     }
+    if matches!(comparison, NetComparison::Cleanup) {
+        // A label with no pin of its own can still silently join another net.
+        for (ordinal, label) in copperpour_sexp::schematic::extract_labels(tree)
+            .iter()
+            .enumerate()
+        {
+            let root = graph.root_at(label.x, label.y);
+            nets.insert(
+                (String::new(), 0, ordinal, label.net.clone()),
+                (root, net_name(graph, root), format!("label {}", label.net)),
+            );
+        }
+    }
     Some(nets)
 }
 
-/// How the move would change the sheet's pin nets, one line per net; empty
-/// when it changes none.
+/// How the move would change the sheet's pin nets.
 ///
 /// Pins are compared by the net they share with other pins and by the net's
 /// name, never by position, since every pin in the box moves.
@@ -401,12 +424,20 @@ pub(super) fn snapshot_net_changes(
     before: &SexpNode,
     after: &SexpNode,
     removed: &BTreeSet<&str>,
+    comparison: NetComparison,
 ) -> Vec<String> {
-    let graph = |tree| snapshot_net_graph(tree, &extract_wires(tree));
+    let graph = |tree| {
+        let wires = extract_wires(tree);
+        if matches!(comparison, NetComparison::Cleanup) {
+            super::sch_connectivity::cleanup_net_graph(tree, &wires)
+        } else {
+            snapshot_net_graph(tree, &wires)
+        }
+    };
     let (mut was, mut now) = (graph(before), graph(after));
     let mut reasons = compare_pin_nets(
-        collect_pin_nets(before, &mut was, removed, true),
-        collect_pin_nets(after, &mut now, &BTreeSet::new(), true),
+        collect_pin_nets(before, &mut was, removed, comparison),
+        collect_pin_nets(after, &mut now, &BTreeSet::new(), comparison),
     );
     // A named net can have no surviving pins that witness a name or scope change.
     let (was, now) = (was.named_net_aliases(), now.named_net_aliases());
@@ -493,6 +524,13 @@ pub(crate) fn misplaced_item(content: &str, anchors: &[(String, (f64, f64))]) ->
     let Ok(tree) = copperpour_sexp::parse_sexp(content) else {
         return Some("the written schematic cannot be parsed".to_owned());
     };
+    misplaced_item_in(&tree, anchors)
+}
+
+pub(super) fn misplaced_item_in(
+    tree: &SexpNode,
+    anchors: &[(String, (f64, f64))],
+) -> Option<String> {
     let mut written = HashMap::new();
     for node in tree.children().unwrap_or(&[]) {
         let Some(uuid) = node.find_str("uuid") else {

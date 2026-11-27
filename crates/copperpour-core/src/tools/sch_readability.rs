@@ -4,7 +4,7 @@ mod connector_pin_signals;
 
 use super::{
     sch_analysis::handle_check_overlaps, sch_layout_score::handle_compare_schematic_layout,
-    sch_pin_contacts, sch_wire_runs, ToolDef,
+    sch_page_fit, sch_pin_contacts, sch_placement_check, sch_wire_runs, ToolDef,
 };
 use crate::tool;
 use serde_json::json;
@@ -13,9 +13,14 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         connector_pin_signals::tool(),
         overlap_tool_def(),
+        sch_page_fit::tool_def(),
         sch_wire_runs::tool_def(),
         compare_tool_def(),
         sch_pin_contacts::definition(),
+        super::sch_cleanup::definition(),
+        super::sch_block_placement::definition(),
+        sch_placement_check::definition(),
+        super::sch_split_plan::tool_def(),
     ]
 }
 
@@ -29,10 +34,12 @@ fn overlap_tool_def() -> ToolDef {
              conflicting labels at the same location, colliding label and field text \
              (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), \
              wires crossing label text or visible power symbol Value text (`wire_label_overlap`), \
-             and wires crossing visible Reference or Value text on ordinary symbols \
-             (`wire_field_overlap`). \
+             wires crossing visible Reference or Value text on ordinary symbols \
+             (`wire_field_overlap`), and wires crossing a drawn pin name or number \
+             (`wire_pin_text_overlap`). \
              Reports any symbol whose embedded \
-             geometry could not be resolved and used the origin fallback instead.",
+             geometry could not be resolved and used the origin fallback instead, and in \
+             `pin_text_unresolved` any symbol whose pin text could not be measured.",
         json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -51,8 +58,16 @@ pub(super) fn compare_tool_def() -> ToolDef {
     tool!(
         "compare_schematic_layout",
         "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
-         Counts wires crossing visible Reference or Value text on ordinary symbols. \
-         Check pin connectivity and symbol identity before ranking layout changes. \
+         Counts wires crossing visible Reference or Value text on ordinary symbols \
+         and wires crossing drawn pin names or numbers. \
+         Before ranking layout changes, check pin connectivity, primary net names, \
+         scoped aliases, symbol identity, saved PCB/BOM fields and flags (including \
+         variants and child-sheet instances), and embedded library identity, jumpers, \
+         fields, units, and pins. Embedded Description, ki_keywords, and ki_fp_filters \
+         are not compared (https://github.com/Copperpour/Copperpour/issues/938). \
+         Refuse different schematic format versions when symbols are retained. \
+         Refuse changes that could affect unresolved rule areas or exported text expressions. \
+         Use verdict for decisions; reasons are human-readable diagnostics. \
          No writes, editor access, or ERC.",
         json!({ "type": "object",
             "properties": {
@@ -72,6 +87,10 @@ pub(super) fn compare_tool_def() -> ToolDef {
 #[cfg(test)]
 #[path = "sch_overlap_tests.rs"]
 mod overlap_tests;
+
+#[cfg(test)]
+#[path = "wire_pin_text_tests.rs"]
+mod wire_pin_text_tests;
 
 #[cfg(test)]
 async fn request(
@@ -153,5 +172,36 @@ mod tests {
     #[tokio::test]
     async fn wire_runs_belong_to_readability() {
         assert_readability_route("check_schematic_wire_runs").await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_belongs_to_readability() {
+        assert!(crate::tools::sch_analysis::tools()
+            .iter()
+            .all(|tool| tool.name != "plan_schematic_cleanup"));
+        assert_readability_route("plan_schematic_cleanup").await;
+    }
+
+    #[tokio::test]
+    async fn page_fit_belongs_to_readability() {
+        assert_readability_route("check_schematic_page_fit").await;
+    }
+
+    #[tokio::test]
+    async fn block_placement_belongs_only_to_readability() {
+        assert!(crate::tools::sch_analysis::tools()
+            .iter()
+            .all(|tool| tool.name != "preview_block_placement"));
+        assert_readability_route("preview_block_placement").await;
+    }
+
+    #[tokio::test]
+    async fn split_plan_belongs_to_readability() {
+        assert_readability_route("plan_schematic_split").await;
+    }
+
+    #[tokio::test]
+    async fn placement_check_belongs_to_readability() {
+        assert_readability_route("check_placement").await;
     }
 }

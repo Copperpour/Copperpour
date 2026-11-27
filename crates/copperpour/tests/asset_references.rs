@@ -421,6 +421,43 @@ fn troubleshooting_guidance_covers_recovery_workflow_and_boundaries() {
     }
 }
 
+/// PCB and troubleshooting guidance must direct agents to call `open_board`
+/// before live PCB work when the requested board is not yet open, rather than
+/// telling the user to open KiCad manually first (#23).
+#[test]
+fn pcb_and_troubleshooting_guidance_prescribe_open_board() {
+    let root = assets_root();
+    let pcb = std::fs::read_to_string(root.join("skills/kicad-pcb/SKILL.md")).unwrap();
+    let core = std::fs::read_to_string(root.join("skills/copperpour/SKILL.md")).unwrap();
+    let troubleshooting =
+        std::fs::read_to_string(root.join("skills/copperpour/references/troubleshooting.md"))
+            .unwrap();
+
+    for marker in [
+        "open_board(board, display?, timeout_seconds?)",
+        "instead of asking the user to open KiCAD manually",
+        "load_toolset('verification')     # open_board,",
+    ] {
+        assert!(
+            pcb.contains(marker),
+            "skills/kicad-pcb/SKILL.md is missing `{marker}`"
+        );
+    }
+    assert!(
+        !pcb.contains("Tell the user to open KiCAD and load the project"),
+        "skills/kicad-pcb/SKILL.md still tells agents to ask the user to open KiCAD manually first"
+    );
+
+    assert!(
+        core.contains("open_board"),
+        "skills/copperpour/SKILL.md does not mention `open_board`"
+    );
+    assert!(
+        troubleshooting.contains("call `open_board` with the exact `.kicad_pcb` path"),
+        "skills/copperpour/references/troubleshooting.md does not direct agents to call `open_board`"
+    );
+}
+
 /// Manufacturing guidance must describe evidence the released tools actually
 /// return, and it must remain safe while artifact verification is implemented
 /// independently in #270. v0.10.0 claimed four validations the handler did not
@@ -907,6 +944,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Structured recovery and diagnostic response fields, not callable tools (#526).
         "retry_safe",
         "board_state",
+        "requested_open",
         // Board-source provenance response fields and domain values (#58), not callable tools.
         "source_evidence",
         "excludes_unsaved_editor_state",

@@ -355,7 +355,7 @@ pub struct SymbolBounds {
 }
 
 impl SymbolBounds {
-    pub(crate) fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
+    pub fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
         let mut bounds = Self::point(x1, y1);
         bounds.include(x2, y2);
         bounds
@@ -370,7 +370,7 @@ impl SymbolBounds {
         }
     }
 
-    pub(crate) fn include(&mut self, x: f64, y: f64) {
+    pub fn include(&mut self, x: f64, y: f64) {
         if !x.is_finite() || !y.is_finite() {
             return;
         }
@@ -504,8 +504,17 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     let (Some(start), Some(mid), Some(end)) = (point("start"), point("mid"), point("end")) else {
         return;
     };
+    if let Some(arc) = arc_bounds(start, mid, end) {
+        include_point(bounds, arc.min_x, arc.min_y);
+        include_point(bounds, arc.max_x, arc.max_y);
+    }
+}
+
+/// Bounds of a circular arc through the three saved points.
+pub fn arc_bounds(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> Option<SymbolBounds> {
+    let mut bounds = None;
     for (x, y) in [start, mid, end] {
-        include_point(bounds, x, y);
+        include_point(&mut bounds, x, y);
     }
 
     let (x1, y1) = start;
@@ -513,7 +522,7 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     let (x3, y3) = end;
     let divisor = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
     if divisor.abs() < 1e-12 {
-        return;
+        return bounds;
     }
     let square = |x: f64, y: f64| x * x + y * y;
     let center_x =
@@ -524,7 +533,7 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
             / divisor;
     let radius = (x1 - center_x).hypot(y1 - center_y);
     if !center_x.is_finite() || !center_y.is_finite() || !radius.is_finite() {
-        return;
+        return bounds;
     }
 
     let angle = |(x, y): (f64, f64)| (y - center_y).atan2(x - center_x);
@@ -545,12 +554,13 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
         };
         if on_arc {
             include_point(
-                bounds,
+                &mut bounds,
                 center_x + radius * candidate.cos(),
                 center_y + radius * candidate.sin(),
             );
         }
     }
+    bounds
 }
 
 fn collect_direct_symbol_geometry(node: &SexpNode, geometry: &mut SymbolGeometry) {
@@ -637,6 +647,23 @@ fn local_geometry_for_unit(sym_node: &SexpNode, unit: u32) -> SymbolGeometry {
     geometry
 }
 
+/// Library parts in the requested unit and body style, plus common parts.
+pub fn symbol_parts_for_body_style(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Vec<&SexpNode> {
+    let mut parts = vec![sym_node];
+    for sub in unit_body_children(sym_node, unit, body_style) {
+        let mut stack = vec![sub];
+        while let Some(part) = stack.pop() {
+            parts.push(part);
+            stack.extend(part.find_all("symbol").into_iter().rev());
+        }
+    }
+    parts
+}
+
 /// Bounds of the selected unit's drawings and pins in library-local, Y-up
 /// coordinates.
 pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
@@ -658,6 +685,13 @@ fn place_bounds(local: SymbolBounds, transform: PinTransform) -> SymbolBounds {
         placed.include(x, y);
     }
     placed
+}
+
+impl SymbolBounds {
+    /// Carry a library-local bounding box into the placed symbol's sheet.
+    pub fn placed(self, transform: PinTransform) -> Self {
+        place_bounds(self, transform)
+    }
 }
 
 /// Transform a selected library unit's bounds into schematic coordinates for
@@ -1194,13 +1228,24 @@ pub fn extract_all_net_labels(tree: &SexpNode) -> Vec<Label> {
 /// it flags. Symbols whose definition is not embedded in `lib_symbols` are
 /// skipped: without it there is no pin to place the label on.
 pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    extract_power_symbol_labels_with(tree, pin_endpoint)
+}
+
+/// Power drivers at the pin positions used by the caller's geometry model.
+pub fn extract_power_symbol_labels_with(
+    tree: &SexpNode,
+    position: impl Fn(&LibPin, PinTransform) -> (f64, f64),
+) -> Vec<Label> {
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
     let mut labels = Vec::new();
-    for inst in extract_symbol_instances(tree) {
+    for placed in tree.find_all("symbol") {
+        let Some(inst) = symbol_instance(placed) else {
+            continue;
+        };
         if inst.value.is_empty() {
             continue;
         }
@@ -1213,11 +1258,11 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
             continue;
         }
         let t = inst.pin_transform();
-        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+        for pin in extract_placed_pins(placed, sym, inst.unit) {
             if pin.electrical_type != "power_in" {
                 continue;
             }
-            let (x, y) = pin_endpoint(&pin, t);
+            let (x, y) = position(&pin, t);
             labels.push(Label {
                 kind: LabelKind::PowerSymbol,
                 net: inst.value.clone(),
@@ -1291,6 +1336,22 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
     out
 }
 
+/// Pins of the placed unit and body style, with the types of its selected alternates.
+pub fn extract_placed_pins(placed: &SexpNode, sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
+    lib_pin_nodes_for_body_style(sym_node, unit, symbol_body_style(placed))
+        .into_iter()
+        .filter_map(|node| parse_placed_pin(node, placed))
+        .collect()
+}
+
+/// The body style selected by a placed symbol, defaulting to the standard style.
+pub fn symbol_body_style(node: &SexpNode) -> u32 {
+    node.find_str("body_style")
+        .or_else(|| node.find_str("convert"))
+        .and_then(|style| style.parse().ok())
+        .unwrap_or(1)
+}
+
 /// [`extract_lib_pins_for_unit`] of one body style too: eeschema places only
 /// the pins of sub-symbols whose `M` is `0` or the placed symbol's body style
 /// (`SCH_SYMBOL::UpdatePins`), so a De Morgan symbol's other style puts no
@@ -1313,10 +1374,31 @@ pub fn resolve_lib_pins_for_unit_and_body_style(
     unit: u32,
     body_style: u32,
 ) -> Option<Vec<LibPin>> {
+    resolve_pin_nodes(sym_node, unit, body_style, parse_lib_pin)
+}
+
+/// Resolve the drawn pins and their effective electrical types on this instance.
+pub fn resolve_placed_pins_for_unit_and_body_style(
+    placed: &SexpNode,
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Option<Vec<LibPin>> {
+    resolve_pin_nodes(sym_node, unit, body_style, |node| {
+        parse_placed_pin(node, placed)
+    })
+}
+
+fn resolve_pin_nodes(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+    parse: impl Fn(&SexpNode) -> Option<LibPin>,
+) -> Option<Vec<LibPin>> {
     lib_pin_nodes_for_body_style(sym_node, unit, body_style)
         .into_iter()
         .map(|node| {
-            let pin = parse_lib_pin(node)?;
+            let pin = parse(node)?;
             (pin.local_x.is_finite() && pin.local_y.is_finite()).then_some(pin)
         })
         .collect()
@@ -1328,18 +1410,59 @@ pub fn lib_pin_nodes_for_body_style(
     unit: u32,
     body_style: u32,
 ) -> Vec<&SexpNode> {
-    fn collect_nodes<'a>(node: &'a SexpNode, out: &mut Vec<&'a SexpNode>) {
-        out.extend(node.find_all("pin"));
-        for sub in node.find_all("symbol") {
-            collect_nodes(sub, out);
-        }
-    }
-
     let mut out = sym_node.find_all("pin");
     for sub in unit_body_children(sym_node, unit, body_style) {
-        collect_nodes(sub, &mut out);
+        collect_pin_nodes(sub, &mut out);
     }
     out
+}
+
+fn collect_pin_nodes<'a>(node: &'a SexpNode, out: &mut Vec<&'a SexpNode>) {
+    out.extend(node.find_all("pin"));
+    for sub in node.find_all("symbol") {
+        collect_pin_nodes(sub, out);
+    }
+}
+
+fn parse_placed_pin(node: &SexpNode, placed: &SexpNode) -> Option<LibPin> {
+    let mut pin = parse_lib_pin(node)?;
+    let kind = placed_pin_electrical_type(placed, node, &pin);
+    if kind != pin.electrical_type {
+        pin.electrical_type = kind.to_owned();
+    }
+    Some(pin)
+}
+
+/// Electrical type of the selected placed pin function, or the base pin type.
+pub fn placed_pin_electrical_type<'a>(
+    placed: &SexpNode,
+    lib_pin: &'a SexpNode,
+    pin: &'a LibPin,
+) -> &'a str {
+    // SCH_PIN::GetType() uses the placed pin's selected library alternate.
+    let alternate = selected_pin_alternate(placed, lib_pin, &pin.number)
+        .and_then(|alternate| alternate.get(2)?.as_str());
+    alternate.unwrap_or(&pin.electrical_type)
+}
+
+fn selected_pin_alternate<'a>(
+    placed: &SexpNode,
+    lib_pin: &'a SexpNode,
+    number: &str,
+) -> Option<&'a SexpNode> {
+    let alternates = lib_pin.find_all("alternate");
+    if alternates.is_empty() {
+        return None;
+    }
+    let name = placed
+        .find_all("pin")
+        .into_iter()
+        .find(|pin| pin.get(1).and_then(SexpNode::as_str) == Some(number))?
+        .find_str("alternate")
+        .filter(|name| !name.is_empty())?;
+    alternates
+        .into_iter()
+        .find(|alt| alt.get(1).and_then(SexpNode::as_str) == Some(name))
 }
 
 fn unit_body_children(

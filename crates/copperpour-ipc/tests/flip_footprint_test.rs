@@ -203,6 +203,9 @@ enum FlipBehavior {
     /// The layer changes, but fresh readback omits a required model vector.
     /// Missing evidence must not be converted to a zero-valued transform.
     SucceedButModelReadbackMissingScale,
+    /// The layer changes, but fresh readback lists the flipped KIID twice,
+    /// so no one footprint is the one flipped.
+    SucceedButReadbackListsKiidTwice,
 }
 
 struct MockState {
@@ -215,8 +218,17 @@ fn spawn_flip_mock(
     footprint: kiapi::board::types::FootprintInstance,
     behavior: FlipBehavior,
 ) -> (MockKicad, Arc<Mutex<MockState>>) {
+    spawn_flip_mock_holding(vec![footprint], behavior)
+}
+
+/// As [`spawn_flip_mock`], holding several footprints; `Success` flips the
+/// one whose KIID the request names.
+fn spawn_flip_mock_holding(
+    footprints: Vec<kiapi::board::types::FootprintInstance>,
+    behavior: FlipBehavior,
+) -> (MockKicad, Arc<Mutex<MockState>>) {
     let state = Arc::new(Mutex::new(MockState {
-        footprints: vec![footprint],
+        footprints,
         commit_actions: Vec::new(),
         flip_calls: Vec::new(),
     }));
@@ -334,11 +346,17 @@ fn spawn_flip_mock(
                 ))),
                 FlipBehavior::Success
                 | FlipBehavior::SucceedButModelReadbackMalformed
-                | FlipBehavior::SucceedButModelReadbackMissingScale => {
+                | FlipBehavior::SucceedButModelReadbackMissingScale
+                | FlipBehavior::SucceedButReadbackListsKiidTwice => {
                     let mut held = state_in_mock.lock().unwrap();
+                    let flipped = held
+                        .footprints
+                        .iter()
+                        .position(|fp| fp.id.as_ref() == flip.items.first())
+                        .unwrap_or(0);
                     let target_layer = match flip.direction() {
                         kiapi::board::commands::BoardFlipDirection::BfdTopBottom => {
-                            if held.footprints[0].layer
+                            if held.footprints[flipped].layer
                                 == kiapi::board::types::BoardLayer::BlFCu as i32
                             {
                                 kiapi::board::types::BoardLayer::BlBCu as i32
@@ -346,12 +364,12 @@ fn spawn_flip_mock(
                                 kiapi::board::types::BoardLayer::BlFCu as i32
                             }
                         }
-                        _ => held.footprints[0].layer,
+                        _ => held.footprints[flipped].layer,
                     };
-                    held.footprints[0].layer = target_layer;
-                    flip_model_in_place(&mut held.footprints[0]);
+                    held.footprints[flipped].layer = target_layer;
+                    flip_model_in_place(&mut held.footprints[flipped]);
                     if behavior == FlipBehavior::SucceedButModelReadbackMalformed {
-                        let model = held.footprints[0]
+                        let model = held.footprints[flipped]
                             .definition
                             .as_mut()
                             .unwrap()
@@ -364,7 +382,7 @@ fn spawn_flip_mock(
                             .unwrap();
                         model.value = vec![0xff, 0xff];
                     } else if behavior == FlipBehavior::SucceedButModelReadbackMissingScale {
-                        let model = held.footprints[0]
+                        let model = held.footprints[flipped]
                             .definition
                             .as_mut()
                             .unwrap()
@@ -380,9 +398,12 @@ fn spawn_flip_mock(
                                 .unwrap();
                         decoded.scale = None;
                         *model = builders::pack_any(&decoded, "kiapi.board.types.Footprint3DModel");
+                    } else if behavior == FlipBehavior::SucceedButReadbackListsKiidTwice {
+                        let twice = held.footprints[flipped].clone();
+                        held.footprints.push(twice);
                     }
                     let item = builders::pack_any(
-                        &held.footprints[0],
+                        &held.footprints[flipped],
                         "kiapi.board.types.FootprintInstance",
                     );
                     Some(reply_with(builders::pack_any(
@@ -452,7 +473,7 @@ fn flip_sends_top_bottom_direction_and_the_exact_kiid() {
     let (mock, state) = spawn_flip_mock(fp, FlipBehavior::Success);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     match outcome {
         IpcFlipOutcome::Flipped { .. } => {}
         other => panic!("expected Flipped, got {other:?}"),
@@ -475,7 +496,7 @@ fn flip_success_reports_layer_and_flipped_3d_model_and_leaves_the_pad_alone() {
     let (mock, state) = spawn_flip_mock(fp, FlipBehavior::Success);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     let IpcFlipOutcome::Flipped {
         reference,
         kiid,
@@ -539,7 +560,7 @@ fn already_on_target_layer_is_a_readback_derived_noop() {
     let (mock, state) = spawn_flip_mock(fp, FlipBehavior::Success);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     match outcome {
         IpcFlipOutcome::Flipped {
             already_on_layer, ..
@@ -562,7 +583,7 @@ fn irs_ok_with_empty_flipped_items_is_not_treated_as_success() {
     let (mock, state) = spawn_flip_mock(fp, FlipBehavior::OkButEmpty);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let error = client.flip_footprint("U1", "B.Cu").unwrap_err();
+    let error = client.flip_footprint("U1", None, "B.Cu").unwrap_err();
     assert!(format!("{error:#}").contains("0 flip results"), "{error:#}");
 
     // The commit must have been rolled back, not pushed.
@@ -579,7 +600,7 @@ fn wrong_kiid_in_the_flip_result_is_a_hard_failure_and_rolls_back() {
     let (mock, state) = spawn_flip_mock(fp, FlipBehavior::WrongKiid);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let error = client.flip_footprint("U1", "B.Cu").unwrap_err();
+    let error = client.flip_footprint("U1", None, "B.Cu").unwrap_err();
     assert!(
         format!("{error:#}").contains("does not match requested KIID"),
         "{error:#}"
@@ -597,7 +618,7 @@ fn a_non_ok_per_item_status_is_a_hard_failure_and_rolls_back() {
     let (mock, state) = spawn_flip_mock(fp, FlipBehavior::ItemFailed);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let error = client.flip_footprint("U1", "B.Cu").unwrap_err();
+    let error = client.flip_footprint("U1", None, "B.Cu").unwrap_err();
     assert!(format!("{error:#}").contains("item is locked"), "{error:#}");
     let actions = state.lock().unwrap().commit_actions.clone();
     assert_eq!(
@@ -612,7 +633,7 @@ fn as_unhandled_is_reported_as_unsupported_with_the_observed_version() {
     let (mock, _state) = spawn_flip_mock(fp, FlipBehavior::Unhandled);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     match outcome {
         IpcFlipOutcome::Unsupported { kicad_version } => {
             let version = kicad_version.expect("mock serves GetVersion");
@@ -628,7 +649,7 @@ fn a_mutation_that_looks_ok_but_fails_readback_is_uncertain_not_success() {
     let (mock, _state) = spawn_flip_mock(fp, FlipBehavior::SucceedButReadbackDisagrees);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     match outcome {
         IpcFlipOutcome::Uncertain {
             reference,
@@ -648,7 +669,7 @@ fn malformed_post_flip_model_evidence_is_uncertain_not_an_empty_success() {
     let (mock, _state) = spawn_flip_mock(fp, FlipBehavior::SucceedButModelReadbackMalformed);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     match outcome {
         IpcFlipOutcome::Uncertain { reason, .. } => {
             assert!(reason.contains("3D-model state"), "{reason}");
@@ -664,7 +685,7 @@ fn missing_post_flip_model_vector_is_uncertain_not_zero_evidence() {
     let (mock, _state) = spawn_flip_mock(fp, FlipBehavior::SucceedButModelReadbackMissingScale);
     let client = KiCadIpcClient::new(&mock.url);
 
-    let outcome = client.flip_footprint("U1", "B.Cu").unwrap();
+    let outcome = client.flip_footprint("U1", None, "B.Cu").unwrap();
     match outcome {
         IpcFlipOutcome::Uncertain { reason, .. } => {
             assert!(reason.contains("3D-model state"), "{reason}");
@@ -682,7 +703,7 @@ fn round_trip_f_cu_b_cu_f_cu_restores_layer_model_and_unrelated_content() {
     let client = KiCadIpcClient::new(&mock.url);
 
     // F.Cu -> B.Cu
-    let to_back = client.flip_footprint("U1", "B.Cu").unwrap();
+    let to_back = client.flip_footprint("U1", None, "B.Cu").unwrap();
     let IpcFlipOutcome::Flipped {
         layer: back_layer,
         models: back_models,
@@ -699,7 +720,7 @@ fn round_trip_f_cu_b_cu_f_cu_restores_layer_model_and_unrelated_content() {
 
     // B.Cu -> F.Cu: the semantic round trip the accepted #604 contract
     // requires.
-    let to_front = client.flip_footprint("U1", "F.Cu").unwrap();
+    let to_front = client.flip_footprint("U1", None, "F.Cu").unwrap();
     let IpcFlipOutcome::Flipped {
         layer: front_layer,
         models: front_models,
@@ -756,4 +777,142 @@ fn starting_models_as_ipc(
             opacity: model.opacity,
         })
         .collect()
+}
+
+/// The KIID KiCad gave the mounting hole in `board_only_shared_reference.ipc.bin`,
+/// and the KIID of the other `REF**` mounting hole on the board it came from,
+/// `fixtures/board_only_shared_reference.kicad_pcb`.
+const CAPTURED_KIID: &str = "5445eb98-9048-4c1b-8705-b478ce789fc4";
+const SECOND_KIID: &str = "df6ca34f-ba1b-40d0-939c-98e09a9466bc";
+
+/// One of that board's two `REF**` footprints, as KiCad's IPC API sent it,
+/// with only its KIID varied, as `pcb_sync`'s tests vary it (see the
+/// capture's README).
+fn ref_star(kiid: &str) -> kiapi::board::types::FootprintInstance {
+    let mut footprint = kiapi::board::types::FootprintInstance::decode(
+        include_bytes!("../../copperpour-core/tests/fixtures/board_only_shared_reference.ipc.bin")
+            .as_slice(),
+    )
+    .expect("the checked-in KiCad IPC capture must decode");
+    footprint.id = Some(kiapi::common::types::Kiid {
+        value: kiid.to_string(),
+    });
+    footprint
+}
+
+/// A reference two footprints share is refused before any commit, naming
+/// both KIIDs, sorted, as `edit_component` refuses it (#880).
+#[test]
+fn a_shared_reference_without_kiid_is_ambiguous_and_flips_nothing() {
+    let (mock, state) = spawn_flip_mock_holding(
+        vec![ref_star(SECOND_KIID), ref_star(CAPTURED_KIID)],
+        FlipBehavior::Success,
+    );
+    let client = KiCadIpcClient::new(&mock.url);
+
+    match client.flip_footprint("REF**", None, "B.Cu").unwrap() {
+        IpcFlipOutcome::AmbiguousTarget {
+            target,
+            candidates,
+            reason,
+        } => {
+            assert_eq!(target, "REF**");
+            assert_eq!(candidates, [CAPTURED_KIID, SECOND_KIID]);
+            assert!(reason.contains("pass kiid"), "{reason}");
+        }
+        other => panic!("expected AmbiguousTarget, got {other:?}"),
+    }
+    let held = state.lock().unwrap();
+    assert!(held.flip_calls.is_empty());
+    assert!(held.commit_actions.is_empty());
+}
+
+/// `kiid` flips that one footprint, and the readback finds it by KIID: the
+/// other `REF**`, listed first, stays on F.Cu and is not read in its place.
+#[test]
+fn kiid_flips_only_that_footprint_of_a_shared_reference() {
+    let (mock, state) = spawn_flip_mock_holding(
+        vec![ref_star(CAPTURED_KIID), ref_star(SECOND_KIID)],
+        FlipBehavior::Success,
+    );
+    let client = KiCadIpcClient::new(&mock.url);
+
+    match client
+        .flip_footprint("REF**", Some(SECOND_KIID), "B.Cu")
+        .unwrap()
+    {
+        IpcFlipOutcome::Flipped {
+            kiid,
+            previous_layer,
+            layer,
+            ..
+        } => {
+            assert_eq!(kiid, SECOND_KIID);
+            assert_eq!(previous_layer, "F.Cu");
+            assert_eq!(layer, "B.Cu");
+        }
+        other => panic!("expected Flipped, got {other:?}"),
+    }
+    let held = state.lock().unwrap();
+    assert_eq!(held.flip_calls.len(), 1);
+    assert_eq!(
+        held.flip_calls[0].items,
+        [kiapi::common::types::Kiid {
+            value: SECOND_KIID.to_string()
+        }]
+    );
+    assert_eq!(
+        held.footprints[0].layer,
+        kiapi::board::types::BoardLayer::BlFCu as i32
+    );
+    assert_eq!(
+        held.footprints[1].layer,
+        kiapi::board::types::BoardLayer::BlBCu as i32
+    );
+}
+
+/// A `kiid` no footprint carries, or one a footprint of another reference
+/// carries, is refused before any commit.
+#[test]
+fn a_stale_kiid_is_refused_before_any_flip() {
+    let (mock, state) = spawn_flip_mock_holding(
+        vec![
+            ref_star(CAPTURED_KIID),
+            mk_footprint("U1-kiid", kiapi::board::types::BoardLayer::BlFCu),
+        ],
+        FlipBehavior::Success,
+    );
+    let client = KiCadIpcClient::new(&mock.url);
+
+    for kiid in ["U1-kiid", "not-on-the-board"] {
+        match client.flip_footprint("REF**", Some(kiid), "B.Cu").unwrap() {
+            IpcFlipOutcome::StaleTarget { target, .. } => assert_eq!(target, kiid),
+            other => panic!("expected StaleTarget for {kiid}, got {other:?}"),
+        }
+    }
+    let held = state.lock().unwrap();
+    assert!(held.flip_calls.is_empty());
+    assert!(held.commit_actions.is_empty());
+}
+
+/// A readback that lists the flipped KIID twice names no one footprint, so
+/// the flip is uncertain rather than confirmed.
+#[test]
+fn a_readback_listing_the_flipped_kiid_twice_is_uncertain() {
+    let (mock, _state) = spawn_flip_mock_holding(
+        vec![ref_star(CAPTURED_KIID), ref_star(SECOND_KIID)],
+        FlipBehavior::SucceedButReadbackListsKiidTwice,
+    );
+    let client = KiCadIpcClient::new(&mock.url);
+
+    match client
+        .flip_footprint("REF**", Some(SECOND_KIID), "B.Cu")
+        .unwrap()
+    {
+        IpcFlipOutcome::Uncertain { kiid, reason, .. } => {
+            assert_eq!(kiid, SECOND_KIID);
+            assert!(reason.contains("2 footprints"), "{reason}");
+        }
+        other => panic!("expected Uncertain, got {other:?}"),
+    }
 }

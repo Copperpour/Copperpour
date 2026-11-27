@@ -1,6 +1,7 @@
 //! KiCad footprint and symbol library table resolution, listing, and registration.
 
 use super::footprint_ops::{escape_library_string, invalid_library_argument};
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tools::{get_path, require_str, ToolContext};
 use copperpour_sexp::parser::parse_sexp;
@@ -352,6 +353,11 @@ pub(super) fn read_lib_table_checked(path: &Path) -> Result<Vec<serde_json::Valu
     }
 }
 
+fn read_lib_table_or_error(table: &Path) -> Result<Vec<serde_json::Value>, CallToolResult> {
+    read_lib_table_checked(table)
+        .map_err(|msg| CallToolResult::error_kind(ToolErrorKind::file_not_found(table), msg))
+}
+
 /// As [`read_lib_table_checked`], for callers with nowhere to put an error.
 ///
 /// The failure is logged rather than dropped in silence. Handlers that can
@@ -602,9 +608,9 @@ pub(super) async fn handle_list_footprint_libraries(
             Ok(table) => table,
             Err(refusal) => return Ok(refusal),
         };
-        let mut libs = match read_lib_table_checked(&table) {
+        let mut libs = match read_lib_table_or_error(&table) {
             Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
+            Err(err) => return Ok(err),
         };
         for lib in &mut libs {
             lib["scope"] = json!("global");
@@ -615,9 +621,9 @@ pub(super) async fn handle_list_footprint_libraries(
     if (scope == "project" || scope == "all") && args["project"].is_string() {
         let proj = PathBuf::from(args["project"].as_str().unwrap());
         let table = proj.parent().unwrap_or(Path::new(".")).join("fp-lib-table");
-        let mut libs = match read_lib_table_checked(&table) {
+        let mut libs = match read_lib_table_or_error(&table) {
             Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
+            Err(err) => return Ok(err),
         };
         for lib in &mut libs {
             lib["scope"] = json!("project");
@@ -773,9 +779,16 @@ fn project_table_dir(project: &str) -> Result<PathBuf, CallToolResult> {
             .unwrap_or(Path::new("."))
             .to_path_buf());
     }
-    Err(CallToolResult::error(format!(
+    let message = format!(
         "'project' must be a .kicad_pro file or an existing project directory, got '{project}'"
-    )))
+    );
+    Err(CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "project".to_string(),
+            reason: message.clone(),
+        },
+        message,
+    ))
 }
 
 pub(super) fn lib_table_target(
@@ -792,8 +805,13 @@ pub(super) fn lib_table_target(
         ));
     }
     let Some(proj) = project else {
-        return Err(CallToolResult::error(
-            "For project scope, provide 'project' path to .kicad_pro file",
+        let message = "For project scope, provide 'project' path to .kicad_pro file";
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "project".to_string(),
+                reason: message.to_string(),
+            },
+            message,
         ));
     };
     let table_dir = project_table_dir(proj)?;
@@ -884,9 +902,9 @@ pub(super) async fn handle_list_symbol_libraries(
             Ok(table) => table,
             Err(refusal) => return Ok(refusal),
         };
-        let mut libs = match read_lib_table_checked(&table) {
+        let mut libs = match read_lib_table_or_error(&table) {
             Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
+            Err(err) => return Ok(err),
         };
         for lib in &mut libs {
             lib["scope"] = json!("global");
@@ -900,9 +918,9 @@ pub(super) async fn handle_list_symbol_libraries(
             .parent()
             .unwrap_or(Path::new("."))
             .join("sym-lib-table");
-        let mut libs = match read_lib_table_checked(&table) {
+        let mut libs = match read_lib_table_or_error(&table) {
             Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
+            Err(err) => return Ok(err),
         };
         for lib in &mut libs {
             lib["scope"] = json!("project");

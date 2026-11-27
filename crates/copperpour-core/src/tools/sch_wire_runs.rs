@@ -1,10 +1,10 @@
 //! Advisory checks for the drawn route, not the electrically merged net.
 
 use super::{
-    drawn_symbol_pin_inventory, get_path, opt_positive_f64,
+    drawn_pins_for_power_drivers, get_path, opt_positive_f64,
     sch_connectivity::{
-        bus_entry_wire_ends, wire_run_net_graph, PinNetNames, UnitNotation, WireIndex,
-        COINCIDENT_TOLERANCE,
+        bus_entry_wire_ends, net_graph_for, schematic_pin_endpoint, PinNetNames, UnitNotation,
+        WireIndex, COINCIDENT_TOLERANCE,
     },
     ToolDef,
 };
@@ -32,7 +32,8 @@ pub(super) fn tool_def() -> ToolDef {
     tool!(
         "check_schematic_wire_runs",
         "Report long or indirect branch-free orthogonal wire runs on a saved sheet. Includes \
-         lengths in mm, bends, endpoint status, and net names where known. Makes no edits.",
+         lengths in mm, bends, endpoint status, and electrical net names where known. \
+         Run geometry uses drawn contacts. Makes no edits.",
         json!({
             "type": "object",
             "properties": {
@@ -198,7 +199,7 @@ fn handle_check_schematic_wire_runs(args: &Value) -> anyhow::Result<CallToolResu
             continue;
         }
         let (net_graph, pin_names) = names.get_or_insert_with(|| {
-            let mut graph = wire_run_net_graph(&tree, &wires, &labels, point);
+            let mut graph = net_graph_for(&tree, &wires, &labels);
             let pin_names = pin_geometry_resolved
                 .then(|| PinNetNames::build(&tree, &mut graph, UnitNotation::for_schematic(&path)));
             (graph, pin_names)
@@ -302,7 +303,7 @@ pub(crate) fn measure_wire_runs(tree: &SexpNode) -> Result<WireRuns, &'static st
         .into_iter()
         .map(|(x, y)| point(x, y))
         .collect();
-    let pin_inventory = drawn_symbol_pin_inventory(tree);
+    let pin_inventory = drawn_pins_for_power_drivers(tree);
     let mut pins_resolved = pin_inventory.iter().all(Option::is_some);
     let lib_symbols = tree
         .find("lib_symbols")
@@ -320,6 +321,7 @@ pub(crate) fn measure_wire_runs(tree: &SexpNode) -> Result<WireRuns, &'static st
             }
             attached.insert(point(x, y));
             if names_net && pin.electrical_type == "power_in" {
+                let (x, y) = schematic_pin_endpoint(&pin, transform);
                 labels.push(Label {
                     kind: LabelKind::PowerSymbol,
                     net: instance.value.clone(),
@@ -868,7 +870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_fixture_retains_its_legacy_connectivity_answers() {
+    async fn the_fixture_distinguishes_electrical_identity_from_proximity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mixed-power.kicad_sch");
         fs::write(&path, MIXED_POWER).unwrap();
@@ -879,13 +881,12 @@ mod tests {
             served(&handler, "load_toolset", json!({"name": "sch_analysis"})).await;
         assert_ne!(loaded["isError"], true, "{body}");
 
-        // Captured from the stdio tools on main (305cc780) using these same bytes.
         for (reference, net, near_x, pin_x, wire) in [
             ("R1", "RAIL", 71.1201, 60.96, [60.96, 71.12]),
             ("R2", "SIGNAL", 91.4401, 91.44, [81.28, 91.44]),
         ] {
-            // The legacy trace rounds this query to the wire end. The run
-            // graph's saved-coordinate equality would leave it unnamed.
+            // A query one saved unit past the end still sees the wire nearby,
+            // but the query point itself is not a graph node on that net.
             let (result, trace) = served(
                 &handler,
                 "trace_from_point",
@@ -893,7 +894,7 @@ mod tests {
             )
             .await;
             assert_ne!(result["isError"], true, "{trace}");
-            assert_eq!(trace["net"], net, "{trace}");
+            assert_eq!(trace["net"], Value::Null, "{trace}");
             assert_eq!(
                 trace["wires_here"],
                 json!([{"x1": wire[0], "x2": wire[1], "y1": 50.8, "y2": 50.8}])

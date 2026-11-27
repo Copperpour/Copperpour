@@ -109,13 +109,17 @@ fn probe_pcb_endpoint(address: &str) -> PcbEndpointProbe {
 /// Detect KiCad's endpoint, reporting ambiguity instead of resolving it by
 /// guesswork.
 ///
-/// On Unix the candidates are this platform's default `api.sock` paths and,
-/// beside each, every `api-<pid>.sock` whose process is running: KiCad 10
-/// binds `api.sock` only while it holds `api.lock`, and a lock left by a
-/// session that did not exit cleanly — or a Project Manager holding `api.sock`
-/// while the PCB editor runs in a separate process (#87) — sends the editor to
-/// `api-<pid>.sock` (#374). Every candidate must pass the same ownership and
-/// socket-type check, because `/tmp` is shared.
+/// The candidates are this platform's default `api.sock` paths and, beside
+/// each, every live `api-<pid>.sock`: KiCad 10 binds `api.sock` only while it
+/// holds `api.lock`, and a lock left by a session that did not exit cleanly —
+/// or a Project Manager holding `api.sock` while the PCB editor runs in a
+/// separate process (#87) — sends the editor to `api-<pid>.sock` (#374, #23).
+/// On Unix, KiCad does not unlink these files on exit, so each `<pid>` is
+/// checked for a running process and every candidate must pass the ownership
+/// and socket-type check. On Windows, NNG binds each `ipc://` path as a named
+/// pipe in `\\.\pipe`, which the kernel destroys automatically when the owning
+/// process exits, so listing `\\.\pipe` yields only live `api.sock` and
+/// `api-<pid>.sock` endpoints without opening any pipe (#498, #529).
 ///
 /// One candidate is returned as before, unproven. Several are told apart first
 /// by the bounded NNG Ping of [`crate::client`], the one handshake this crate
@@ -197,7 +201,11 @@ fn adoptable_candidates_from_defaults(defaults: Vec<PathBuf>) -> Vec<PathBuf> {
             .filter(|path| is_adoptable(path))
             .collect()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_candidates_among(&defaults, &pipe_names())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         defaults
             .into_iter()
@@ -394,7 +402,7 @@ const PIPE_NAMESPACE: &str = r"\\.\pipe";
 /// security descriptor, which means opening it. An explicitly configured
 /// `ipc_address` has always carried the same exposure, so this is the state of
 /// the art on this platform rather than something detection introduces.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn is_adoptable(path: &Path) -> bool {
     is_adoptable_among(path, pipe_names)
 }
@@ -411,12 +419,104 @@ fn pipe_names() -> Vec<std::ffi::OsString> {
 
 /// [`is_adoptable`] with the namespace listing supplied, so a test can state
 /// what is bound instead of binding it.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn is_adoptable_among(path: &Path, names: impl Fn() -> Vec<std::ffi::OsString>) -> bool {
-    let wanted = path.as_os_str().to_string_lossy().to_lowercase();
+    let wanted = normalize_windows_pipe_name(&path.as_os_str().to_string_lossy());
     names()
         .iter()
-        .any(|name| name.to_string_lossy().to_lowercase() == wanted)
+        .any(|name| normalize_windows_pipe_name(&name.to_string_lossy()) == wanted)
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_pipe_name(name: &str) -> String {
+    let mut parts = Vec::new();
+    for part in name.replace('/', "\\").split('\\') {
+        if part.is_empty() && !parts.is_empty() {
+            continue;
+        }
+        parts.push(part.to_lowercase());
+    }
+    parts.join("\\")
+}
+
+#[cfg(any(windows, test))]
+fn split_windows_pipe_name(name: &str) -> Option<(&str, &str)> {
+    let idx = name.rfind(['\\', '/'])?;
+    let dir = name[..idx].trim_end_matches(['\\', '/']);
+    let file = &name[idx + 1..];
+    if dir.is_empty() || file.is_empty() {
+        return None;
+    }
+    Some((dir, file))
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_pid_socket(file_name: &str) -> Option<u32> {
+    let lower = file_name.to_ascii_lowercase();
+    let pid = lower
+        .strip_prefix("api-")?
+        .strip_suffix(".sock")?
+        .parse::<u32>()
+        .ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// Select the bound default `api.sock` pipes and every sibling `api-<pid>.sock`
+/// pipe from a snapshot of `\\.\pipe` names.
+///
+/// Matching is case-insensitive and treats `/` and `\` as equivalent because
+/// KiCad's spelling of `%TEMP%` may differ from ours. Matched pipe names are
+/// returned verbatim from `bound_pipes` so NNG dials the exact pipe KiCad
+/// bound, with default `api.sock` entries before sorted `api-<pid>.sock`
+/// siblings.
+#[cfg(any(windows, test))]
+fn windows_candidates_among(
+    defaults: &[PathBuf],
+    bound_pipes: &[std::ffi::OsString],
+) -> Vec<PathBuf> {
+    let mut primary = Vec::new();
+    let mut fallbacks = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
+
+    for default in defaults {
+        let default_str = default.as_os_str().to_string_lossy();
+        let wanted_default = normalize_windows_pipe_name(&default_str);
+        if let Some(matched) = bound_pipes
+            .iter()
+            .find(|name| normalize_windows_pipe_name(&name.to_string_lossy()) == wanted_default)
+        {
+            if seen_keys.insert(wanted_default) {
+                primary.push(PathBuf::from(matched));
+            }
+        }
+    }
+
+    for default in defaults {
+        let default_str = default.as_os_str().to_string_lossy();
+        let Some((default_dir, _)) = split_windows_pipe_name(&default_str) else {
+            continue;
+        };
+        let wanted_dir = normalize_windows_pipe_name(default_dir);
+        for name in bound_pipes {
+            let pipe_str = name.to_string_lossy();
+            let Some((pipe_dir, pipe_file)) = split_windows_pipe_name(&pipe_str) else {
+                continue;
+            };
+            if normalize_windows_pipe_name(pipe_dir) != wanted_dir {
+                continue;
+            }
+            if parse_windows_pid_socket(pipe_file).is_some() {
+                let key = normalize_windows_pipe_name(&pipe_str);
+                if seen_keys.insert(key) {
+                    fallbacks.push(PathBuf::from(name));
+                }
+            }
+        }
+    }
+
+    fallbacks.sort();
+    primary.extend(fallbacks);
+    primary
 }
 
 /// Neither a Unix socket nor a Windows pipe to look for, so nothing is
@@ -699,6 +799,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_candidates_collects_default_and_pid_siblings_only() {
+        let default = PathBuf::from(r"C:\Users\someone\AppData\Local\Temp\kicad\api.sock");
+        let bound: Vec<std::ffi::OsString> = [
+            r"some-other-pipe",
+            r"C:\elsewhere\kicad\api-999.sock",
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api-200.sock",
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api-100.sock",
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api-0.sock",
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api-x.sock",
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api-300.lock",
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api.sock",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        let found = windows_candidates_among(&[default], &bound);
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from(r"C:\Users\someone\AppData\Local\Temp\kicad\api.sock"),
+                PathBuf::from(r"C:\Users\someone\AppData\Local\Temp\kicad\api-100.sock"),
+                PathBuf::from(r"C:\Users\someone\AppData\Local\Temp\kicad\api-200.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_candidates_matches_case_and_slash_variants_preserving_bound_name() {
+        let default = PathBuf::from(r"C:\Users\Someone\AppData\Local\Temp\kicad\api.sock");
+        let bound: Vec<std::ffi::OsString> = [
+            r"c:/users/someone/appdata/local/temp//kicad/API.SOCK",
+            r"c:\users\someone\appdata\local\temp\kicad\API-42.SOCK",
+            r"C:\Users\Someone\AppData\Local\Temp\\kicad\api-42.sock",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        let found = windows_candidates_among(&[default], &bound);
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from(r"c:/users/someone/appdata/local/temp//kicad/API.SOCK"),
+                PathBuf::from(r"c:\users\someone\appdata\local\temp\kicad\API-42.SOCK"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_candidates_finds_pid_sibling_without_default_pipe() {
+        let default = PathBuf::from(r"C:\Users\someone\AppData\Local\Temp\kicad\api.sock");
+        let bound = vec![std::ffi::OsString::from(
+            r"C:\Users\someone\AppData\Local\Temp\kicad\api-42.sock",
+        )];
+
+        let found = windows_candidates_among(&[default], &bound);
+        assert_eq!(
+            found,
+            vec![PathBuf::from(
+                r"C:\Users\someone\AppData\Local\Temp\kicad\api-42.sock"
+            )]
+        );
+    }
+
+    /// Windows multi-instance discovery: both `api.sock` and `api-<pid>.sock`
+    /// pipes are returned by `candidate_endpoints_in` without connecting to
+    /// either server (#498, #23).
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn detection_finds_default_and_pid_pipes_without_connecting() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let kicad_dir = std::env::temp_dir()
+            .join(format!("copperpour-23-{}", std::process::id()))
+            .join("kicad");
+        let default_path = kicad_dir.join("api.sock");
+        let pid_path = kicad_dir.join(format!("api-{}.sock", std::process::id()));
+
+        let default_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(format!(r"{PIPE_NAMESPACE}\{}", default_path.display()))
+            .expect("bind default pipe");
+        let pid_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(format!(r"{PIPE_NAMESPACE}\{}", pid_path.display()))
+            .expect("bind pid fallback pipe");
+
+        let candidates = candidate_endpoints_in(&kicad_dir);
+        assert_eq!(
+            candidates,
+            vec![format_address(&default_path), format_address(&pid_path)],
+            "both default and api-<pid>.sock pipes must be discovered"
+        );
+
+        for (label, server) in [("default", default_server), ("pid", pid_server)] {
+            let connected =
+                tokio::time::timeout(std::time::Duration::from_millis(100), server.connect()).await;
+            assert!(
+                connected.is_err(),
+                "discovery connected to {label} pipe; against KiCad's NNG server that wedges it"
+            );
+        }
+    }
+
     /// With KiCad running, detection works with no configuration at all —
     /// the property #529 is about, and the one no offline test can assert.
     ///
@@ -726,10 +932,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     mod pid_sockets {
         use super::super::*;
 
+        #[cfg(unix)]
         fn touch(dir: &Path, name: &str) -> PathBuf {
             let path = dir.join(name);
             std::fs::write(&path, b"").unwrap();
@@ -737,6 +944,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn only_live_pid_sockets_are_fallbacks() {
             let dir = tempfile::tempdir().unwrap();
             let primary = dir.path().join("api.sock");
@@ -748,6 +956,7 @@ mod tests {
             assert_eq!(found, vec![dir.path().join("api-200.sock")]);
         }
 
+        #[cfg(unix)]
         fn paths(names: &[&str]) -> Vec<PathBuf> {
             names
                 .iter()
@@ -756,6 +965,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn one_candidate_is_used_without_a_ping() {
             let chosen = choose_endpoint(
                 &paths(&["api-42.sock"]),
@@ -766,6 +976,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn the_only_candidate_that_answers_is_used() {
             let chosen = choose_endpoint(
                 &paths(&["api.sock", "api-42.sock"]),
@@ -778,6 +989,7 @@ mod tests {
         /// Two live PCB KiCads, or none answering: no guess, every candidate is
         /// reported (#374).
         #[test]
+        #[cfg(unix)]
         fn several_candidates_without_one_answer_are_all_reported() {
             let all = vec![
                 "ipc:///k/api.sock".to_string(),
@@ -804,6 +1016,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn no_candidate_is_not_found() {
             assert_eq!(
                 choose_endpoint(&[], |_| true, |_| PcbEndpointProbe::ServesPcb),
@@ -914,6 +1127,7 @@ mod tests {
             })
         }
 
+        #[cfg(unix)]
         fn spawn_status_docs_endpoint(
             path: &Path,
             status: crate::gen::kiapi::common::ApiStatusCode,
@@ -945,6 +1159,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn probing_keeps_the_candidate_snapshot_when_paths_disappear() {
             let dir = tempfile::tempdir().unwrap();
             let first = dir.path().join("api.sock");
@@ -964,6 +1179,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn project_manager_schematic_and_pcb_editor_selects_pcb_editor() {
             let dir = tempfile::tempdir().unwrap();
             let kicad_dir = dir.path().join("kicad");
@@ -989,6 +1205,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn two_pcb_editors_beside_project_manager_stay_ambiguous() {
             let dir = tempfile::tempdir().unwrap();
             let kicad_dir = dir.path().join("kicad");
@@ -1021,6 +1238,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn undecided_endpoint_prevents_guessing_pcb_editor() {
             use crate::gen::kiapi::common::ApiStatusCode;
             for status in [ApiStatusCode::AsNotReady, ApiStatusCode::AsUnimplemented] {
@@ -1057,6 +1275,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn project_manager_and_schematic_without_pcb_editor_stay_ambiguous() {
             let dir = tempfile::tempdir().unwrap();
             let kicad_dir = dir.path().join("kicad");

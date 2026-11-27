@@ -222,6 +222,18 @@ impl Stroke {
     pub fn from_sexp(node: &SexpNode) -> Option<Self> {
         Some(Stroke(node.clone()))
     }
+    /// `(stroke (width 0) (type default))`: the stroke KiCad gives a new wire
+    /// (`SCH_LINE::SCH_LINE` sets width 0, `LINE_STYLE::DEFAULT` and no colour)
+    /// and writes for it (`STROKE_PARAMS::Format`, KiCad 10.0.8).
+    pub fn wire_default() -> Self {
+        Stroke(tagged(
+            "stroke",
+            vec![
+                tagged("width", vec![atom("0")]),
+                tagged("type", vec![atom("default")]),
+            ],
+        ))
+    }
     pub fn to_sexp(&self) -> SexpNode {
         self.0.clone()
     }

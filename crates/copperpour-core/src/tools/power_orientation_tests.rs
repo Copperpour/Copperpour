@@ -470,6 +470,15 @@ async fn an_obstructed_lone_batch_stub_writes_no_part_of_the_batch() {
 
 #[tokio::test]
 async fn a_batch_reports_the_blocked_pin_and_commits_only_the_clear_stub() {
+    batch_commits_clear_stub_with_blocked_overrides(&[45]).await;
+}
+
+#[tokio::test]
+async fn equal_unused_overrides_do_not_abort_a_clear_power_stub() {
+    batch_commits_clear_stub_with_blocked_overrides(&[45, 45]).await;
+}
+
+async fn batch_commits_clear_stub_with_blocked_overrides(rotations: &[i32]) {
     let handler = handler().await;
     let (_dir, path) = fixture();
     let label = serve(
@@ -481,11 +490,17 @@ async fn a_batch_reports_the_blocked_pin_and_commits_only_the_clear_stub() {
     .await;
     assert_eq!(label["is_error"], false, "{label}");
     let before = read_schematic(&path).unwrap().1;
+    let pins: Vec<_> =
+        std::iter::once(json!({"reference": "R1", "pin_number": "2"}))
+            .chain(rotations.iter().map(
+                |rotation| json!({"reference": "J4", "pin_number": "1", "rotation": rotation}),
+            ))
+            .collect();
     let reply = serve(
         &handler,
         "batch_add_power_symbol",
         &path,
-        json!({"power_net": "GND", "pins": pins(&["R1.2", "J4.1"])}),
+        json!({"power_net": "GND", "pins": pins}),
     )
     .await;
     assert_eq!(reply["is_error"], false, "{reply}");
