@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 #[path = "sch_layout_score_guard_tests.rs"]
 mod guards;
+#[path = "sch_layout_library_tests.rs"]
+mod library;
 
 const CROWDED: &str = "region_cleanup_kicad10/crowded/crowded.kicad_sch";
 const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";

@@ -16,8 +16,9 @@ not ranking terms. Unavailable terms are `null` and appear in `not_compared`.
 are `null`.
 
 `blocked` means the comparison could not establish that the two sheets preserve
-pin nets, symbol identity, or saved PCB and BOM properties. Use `verdict` for
-decisions and `reasons` for human-readable details. For an intentional power-symbol
+pin nets, symbol identity, saved PCB and BOM properties, or the embedded symbol
+metadata described below. Use `verdict` for decisions and `reasons` for
+human-readable details. For an intentional power-symbol
 removal, pass its placed UUID in `removed_power_symbol_uuids`. Remaining pins
 must keep their nets, and each named net must retain its name and scoped aliases.
 The comparison does not check the ERC effect of removing a power symbol.
@@ -29,6 +30,21 @@ literal variant override is allowed when no unresolved inputs can affect exports
 For now, a placement edit on a sheet with a rule area, an edit to a possible
 Component Class input, or a saved change that could affect an exported text
 expression is refused. The comparison does not evaluate those effects.
+
+For each retained symbol, the comparison checks `lib_name`, the embedded
+definition's jumper flag and groups, included library fields, and unit or
+body-style records and names, including units not placed on the sheet. It checks
+pin numbers, names, electrical types, positions, and saved order. It ignores
+symbol drawings and pin-text formatting and does not read external libraries.
+It does not compare embedded Description, `ki_keywords`, or `ki_fp_filters`;
+see [#938](https://github.com/Copperpour/Copperpour/issues/938).
+
+Use snapshots with the same schematic format version. KiCad can read identical
+saved tokens differently across versions. When a symbol is retained, the
+comparison refuses differing versions and reports both versions once. The exact
+comparison can also block library-only edits that do not change an export, such
+as spelling out a default unit name. Review deliberate library edits separately
+before choosing a new baseline. See [#942](https://github.com/Copperpour/Copperpour/issues/942).
 
 Otherwise `improved` means the first tier with a different sum went down and
 no individual term in the first two tiers went up. The tiers, in order, are
