@@ -1484,7 +1484,7 @@ async fn handle_batch_edit(
                 match set_property_value(&content, reference, &field, &new_val, may_create) {
                     Ok(result) => result,
                     Err(error) => {
-                        errors.push(error);
+                        errors.push(error.to_string());
                         continue;
                     }
                 };

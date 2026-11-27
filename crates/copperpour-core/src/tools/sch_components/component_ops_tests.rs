@@ -1379,3 +1379,648 @@ mod root_editor_lock_tests {
         }
     }
 }
+
+mod structured_error_kind_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use copperpour_sexp::paths::display_path;
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+
+    async fn call_raw(handler: &McpHandler, name: &str, arguments: Value) -> (bool, Value) {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 741,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let is_error = response["isError"].as_bool().unwrap_or(false);
+        let body: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        (is_error, body)
+    }
+
+    async fn test_handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    fn ecc83_multiunit_source() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap()
+    }
+
+    fn setup_workspace_with_device_lib() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let library = fixtures.join("reference_prefix_kicad10/Device.kicad_sym");
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+                crate::tools::library::quote_lib_table_string(&library.display().to_string())
+            ),
+        )
+        .unwrap();
+        let sch = dir.path().join("ecc83-pp.kicad_sch");
+        std::fs::write(&sch, ecc83_multiunit_source()).unwrap();
+        (dir, sch)
+    }
+
+    /// Replace the first `ecc83-pp:ECC83` definition in `lib_symbols` with an
+    /// unflattened `(extends ...)` stub so `get_schematic_pin_locations` hits
+    /// its stub refusal on a variant derived from the KiCad-resaved fixture.
+    fn with_ecc83_extends_stub(source: &str) -> String {
+        let needle = "\t\t(symbol \"ecc83-pp:ECC83\"";
+        let start = source
+            .find(needle)
+            .expect("ecc83_multiunit.kicad_sch defines ecc83-pp:ECC83");
+        let (rel_start, rel_end) =
+            copperpour_sexp::writer::find_block_with_leading_whitespace(source, start + 2)
+                .expect("ecc83-pp:ECC83 lib_symbol block is balanced");
+        let mut out = String::with_capacity(source.len());
+        out.push_str(&source[..rel_start]);
+        out.push_str("\n\t\t(symbol \"ecc83-pp:ECC83\" (extends \"ecc83-pp:Base\"))");
+        out.push_str(&source[rel_end..]);
+        out
+    }
+
+    /// Inject a private `"Note"` into U1 unit 1 and a public `"Note"` into U1
+    /// unit 2, leaving U1 unit 3 without `"Note"` so adding `"Note"` to missing
+    /// units faces an undecidable private-vs-public choice on a valid 3-unit sheet.
+    fn with_mixed_note_visibility(source: &str) -> String {
+        let u1_unit1_anchor = "(property \"Reference\" \"U1\"\n\t\t\t(at 163.83 55.88 0)";
+        let u1_unit2_anchor = "(property \"Reference\" \"U1\"\n\t\t\t(at 161.29 99.06 0)";
+        assert!(source.contains(u1_unit1_anchor));
+        assert!(source.contains(u1_unit2_anchor));
+        source
+            .replacen(
+                u1_unit1_anchor,
+                "(property private \"Note\" \"a\" (at 160.02 64.77 0) (effects (font (size 1.27 1.27)) (hide yes)))\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 163.83 55.88 0)",
+                1,
+            )
+            .replacen(
+                u1_unit2_anchor,
+                "(property \"Note\" \"b\" (at 157.48 107.95 0) (effects (font (size 1.27 1.27)) (hide yes)))\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 161.29 99.06 0)",
+                1,
+            )
+    }
+
+    /// Inject a structurally malformed `(property "Note")` (missing quoted value)
+    /// into U1 unit 1 while keeping the surrounding S-expression parseable.
+    fn with_malformed_note_property(source: &str) -> String {
+        let u1_unit1_anchor = "(property \"Reference\" \"U1\"\n\t\t\t(at 163.83 55.88 0)";
+        assert!(source.contains(u1_unit1_anchor));
+        source.replacen(
+            u1_unit1_anchor,
+            "(property \"Note\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 163.83 55.88 0)",
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn served_placement_and_batch_invalid_unit_return_invalid_argument() {
+        let handler = test_handler().await;
+        let (_dir, sch) = setup_workspace_with_device_lib();
+        let before = std::fs::read_to_string(&sch).unwrap();
+
+        let (is_error, body) = call_raw(
+            &handler,
+            "add_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "lib_id": "Device:R",
+                "x": 50.8,
+                "y": 50.8,
+                "unit": 2
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "unit", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid unit 2 for 'Device:R'"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), before);
+
+        let (is_error, body) = call_raw(
+            &handler,
+            "batch_place_components",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 50.8, "y": 50.8, "unit": 2 }
+                ]
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["failures"][0]["kind"], "invalid_argument", "{body}");
+        assert!(
+            body["failures"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid unit 2 for 'Device:R'"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn served_move_connected_returns_unsupported_capability() {
+        let handler = test_handler().await;
+        let (is_error, body) = call_raw(&handler, "move_connected", json!({})).await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "unsupported_capability", "{body}");
+        assert_eq!(body["error"]["capability"], "move_connected", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("move_connected is not implemented"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_query_refusals_return_stale_target_and_malformed_file() {
+        let handler = test_handler().await;
+        let (_dir, sch) = setup_workspace_with_device_lib();
+        let baseline = ecc83_multiunit_source();
+
+        for tool in ["get_schematic_component", "get_schematic_pin_locations"] {
+            let (is_error, body) = call_raw(
+                &handler,
+                tool,
+                json!({ "schematic": sch.to_str().unwrap(), "reference": "R999" }),
+            )
+            .await;
+            assert!(is_error, "{tool}: {body}");
+            assert_eq!(body["error"]["kind"], "stale_target", "{tool}: {body}");
+            assert_eq!(body["error"]["target"], "component R999", "{tool}: {body}");
+            assert!(
+                body["message"].as_str().unwrap().contains("R999"),
+                "{tool}: {body}"
+            );
+        }
+
+        // Missing embedded definition in lib_symbols -> malformed_file.
+        let missing_def =
+            baseline.replace("(symbol \"ecc83-pp:ECC83\"", "(symbol \"ecc83-pp:Other\"");
+        std::fs::write(&sch, missing_def).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "get_schematic_pin_locations",
+            json!({ "schematic": sch.to_str().unwrap(), "reference": "U1" }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("has no embedded definition"),
+            "{body}"
+        );
+
+        // Unflattened (extends ...) stub derived from the resaved fixture -> malformed_file.
+        std::fs::write(&sch, with_ecc83_extends_stub(&baseline)).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "get_schematic_pin_locations",
+            json!({ "schematic": sch.to_str().unwrap(), "reference": "U1" }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("(extends \"ecc83-pp:Base\") stub"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_library_ops_refusals_return_structured_error_kinds() {
+        let handler = test_handler().await;
+        let (_dir, sch) = setup_workspace_with_device_lib();
+        let baseline = ecc83_multiunit_source();
+
+        // Place R98 for single-unit checks.
+        let (is_error, placed) = call_raw(
+            &handler,
+            "add_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "lib_id": "Device:R",
+                "x": 50.8,
+                "y": 50.8,
+                "reference": "R98"
+            }),
+        )
+        .await;
+        assert!(!is_error, "{placed}");
+        let single_unit_before = std::fs::read_to_string(&sch).unwrap();
+
+        // add_component_annotation with built-in field -> invalid_argument.
+        let (is_error, body) = call_raw(
+            &handler,
+            "add_component_annotation",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "R98",
+                "key": "Value",
+                "value": "10k"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "key", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("'Value' is a built-in field"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), single_unit_before);
+
+        // group_components with empty references -> invalid_argument.
+        let (is_error, body) = call_raw(
+            &handler,
+            "group_components",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "group_name": "power",
+                "references": []
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "references", "{body}");
+        assert_eq!(body["message"], "No references provided", "{body}");
+
+        // update_symbols_from_library with missing reference -> stale_target.
+        let (is_error, body) = call_raw(
+            &handler,
+            "update_symbols_from_library",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "references": ["R999"]
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+        assert_eq!(body["error"]["target"], "component R999", "{body}");
+
+        // replace_component missing reference -> stale_target.
+        let (is_error, body) = call_raw(
+            &handler,
+            "replace_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "R999",
+                "new_lib_id": "Device:R"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+        assert_eq!(body["error"]["target"], "component R999", "{body}");
+
+        // replace_component out-of-range unit -> invalid_argument.
+        let (is_error, body) = call_raw(
+            &handler,
+            "replace_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "R98",
+                "new_lib_id": "Device:R",
+                "unit": 2
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "unit", "{body}");
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), single_unit_before);
+
+        // Multi-unit schematic checks on the resaved 3-unit U1 (ecc83-pp:ECC83).
+        std::fs::write(&sch, &baseline).unwrap();
+
+        // replace_component with unit override on multi-unit placement -> invalid_argument.
+        let (is_error, body) = call_raw(
+            &handler,
+            "replace_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "new_lib_id": "Device:R",
+                "unit": 1
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "unit", "{body}");
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), baseline);
+
+        // replace_component replacing 3-unit U1 with 1-unit Device:R -> plan_blocked.
+        let (is_error, body) = call_raw(
+            &handler,
+            "replace_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "new_lib_id": "Device:R"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(body["error"]["operation"], "replace_component", "{body}");
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), baseline);
+
+        // replace_component with inconsistent lib_ids across units -> malformed_file.
+        let inconsistent = baseline.replacen(
+            "(lib_id \"ecc83-pp:ECC83\")",
+            "(lib_id \"ecc83-pp:Other\")",
+            1,
+        );
+        std::fs::write(&sch, &inconsistent).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "replace_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "new_lib_id": "ecc83-pp:ECC83"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("inconsistent library ids"),
+            "{body}"
+        );
+
+        // add_component_annotation when units have mixed private/public copies -> plan_blocked
+        // (valid KiCad file, undecidable visibility choice for the missing unit 3).
+        let mixed = with_mixed_note_visibility(&baseline);
+        std::fs::write(&sch, &mixed).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "add_component_annotation",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "key": "Note",
+                "value": "c"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(
+            body["error"]["operation"], "add_component_annotation",
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("both private and public copies"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), mixed);
+
+        // add_component_annotation on a structurally malformed property block -> malformed_file.
+        let malformed = with_malformed_note_property(&baseline);
+        std::fs::write(&sch, &malformed).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "add_component_annotation",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "key": "Other",
+                "value": "v"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), malformed);
+    }
+
+    #[tokio::test]
+    async fn served_edit_component_refusals_preserve_distinct_error_kinds() {
+        let handler = test_handler().await;
+        let (_dir, sch) = setup_workspace_with_device_lib();
+        let baseline = ecc83_multiunit_source();
+        std::fs::write(&sch, &baseline).unwrap();
+
+        // Reserved field in `fields` -> invalid_argument (field: "fields").
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "fields": { "Value": "12AX7" }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "fields", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("No fields were updated on 'U1'"),
+            "{body}"
+        );
+
+        // Non-string value in `fields` -> invalid_argument (field: "fields").
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "fields": { "Note": 42 }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "fields", "{body}");
+
+        // Invalid `field_placements` entry -> invalid_argument (field: "field_placements").
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "field_placements": { "Value": {} }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "field_placements", "{body}");
+
+        // Multi-unit field position without `unit` -> invalid_argument (field: "unit").
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "field_placements": { "Value": { "x": 60.0 } }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "unit", "{body}");
+
+        // Missing target field in `field_placements` -> stale_target.
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "field_placements": { "DoesNotExist": { "hide": true } }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+        assert_eq!(body["error"]["target"], "component U1", "{body}");
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), baseline);
+
+        // Mixed private/public custom property across units -> plan_blocked.
+        let mixed = with_mixed_note_visibility(&baseline);
+        std::fs::write(&sch, &mixed).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "fields": { "Note": "c" }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(
+            body["error"]["operation"], "edit_schematic_component",
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), mixed);
+
+        // `remove_fields` on a malformed property block -> malformed_file (plan_property_removal).
+        let malformed = with_malformed_note_property(&baseline);
+        std::fs::write(&sch, &malformed).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "remove_fields": ["Note"]
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("No fields were updated on 'U1': Note:"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), malformed);
+
+        // Missing built-in Value property on unit 2 -> malformed_file.
+        let unit2_value = "\t\t(property \"Value\" \"ECC83\"\n\t\t\t(at 162.56 116.84 0)\n\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n";
+        assert!(baseline.contains(unit2_value));
+        let missing_value = baseline.replacen(unit2_value, "", 1);
+        std::fs::write(&sch, &missing_value).unwrap();
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "value": "12AX7"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("No fields were updated on 'U1': Value:"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), missing_value);
+
+        // Combined malformed built-in field + invalid custom field: malformed_file takes precedence.
+        let (is_error, body) = call_raw(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": sch.to_str().unwrap(),
+                "reference": "U1",
+                "value": "12AX7",
+                "fields": { "Note": 42 }
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], display_path(&sch), "{body}");
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), missing_value);
+    }
+}

@@ -56,8 +56,10 @@ use transform::{
     handle_rotate_schematic_component,
 };
 
+use crate::mcp::error::ToolErrorKind;
+use crate::mcp::protocol::CallToolResult;
 #[cfg(test)]
-use crate::mcp::protocol::{CallToolResult, ToolContent};
+use crate::mcp::protocol::ToolContent;
 #[cfg(test)]
 use crate::tools::{
     find_all_symbol_instance_blocks, sch_wiring::observed_no_connect_moves, ToolContext,
@@ -87,8 +89,50 @@ use readback::{
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tool;
+use crate::tools::reference_hint::component_not_found;
 use crate::tools::ToolDef;
 use serde_json::json;
+
+pub(super) fn component_not_found_error(
+    sch_path: &std::path::Path,
+    reference: &str,
+) -> CallToolResult {
+    let message = component_not_found(sch_path, reference);
+    CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: format!("component {reference}"),
+            reason: message.clone(),
+        },
+        message,
+    )
+}
+
+pub(super) fn invalid_unit_error(unit: u32, lib_id: &str, unit_count: u32) -> CallToolResult {
+    let message = format!(
+        "Invalid unit {unit} for '{lib_id}': the symbol has {unit_count} unit(s) (valid: 1..={unit_count})."
+    );
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "unit".to_owned(),
+            reason: message.clone(),
+        },
+        message,
+    )
+}
+
+pub(super) fn malformed_schematic_error(
+    sch_path: &std::path::Path,
+    message: impl Into<String>,
+) -> CallToolResult {
+    let message = message.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::MalformedFile {
+            path: copperpour_sexp::paths::display_path(sch_path),
+            reason: message.clone(),
+        },
+        message,
+    )
+}
 
 pub(crate) fn field_placements_schema() -> serde_json::Value {
     json!({

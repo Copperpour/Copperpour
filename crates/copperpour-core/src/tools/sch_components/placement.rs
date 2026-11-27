@@ -357,10 +357,7 @@ pub(crate) fn place_one_component(
     // netlister mis-assigns its pins (#35).
     let unit_count = cse::library::symbol_unit_count(lib_id, src).unwrap_or(1);
     if unit < 1 || unit > unit_count {
-        return Err(CallToolResult::error(format!(
-            "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
-            unit, lib_id, unit_count, unit_count
-        )));
+        return Err(super::invalid_unit_error(unit, lib_id, unit_count));
     }
     in_use.check(sch, lib_id, unit, &fields.value, &reference)?;
 
