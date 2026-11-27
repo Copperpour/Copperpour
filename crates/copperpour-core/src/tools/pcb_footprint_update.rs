@@ -1,8 +1,9 @@
 use super::library::PadFabricationProperty;
 use super::library_footprint::{
     apply_pad_margins, apply_reference_points, carries_kicad_10_0_7_fields, carries_net_ties,
-    default_thermal_spoke_angle, fab_property, needs_kicad_10_0_7_summary, pad_margins, pad_zones,
-    points, validate_supported_children, LibraryPoint, PadZoneSettings, SolderMargins,
+    carries_parent_fields, default_thermal_spoke_angle, fab_property, needs_kicad_10_0_7_summary,
+    pad_margins, pad_zones, points, validate_supported_children, LibraryPoint, PadZoneSettings,
+    SolderMargins,
 };
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
@@ -78,6 +79,7 @@ struct PreparedUpdate {
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
     text_effects: Vec<FieldEffectsChange>,
+    old_nets: BTreeMap<String, kiapi::board::types::Net>,
 }
 
 /// A field's text effects, in board millimetres and degrees. A `None`
@@ -258,28 +260,63 @@ impl PreservedState {
         updated: &kiapi::board::types::FootprintInstance,
         old_nets: &BTreeMap<String, kiapi::board::types::Net>,
     ) -> Self {
-        let new_nets: BTreeMap<String, String> = updated
+        let new_pads: Vec<kiapi::board::types::Pad> = updated
             .definition
             .iter()
             .flat_map(|definition| definition.items.iter())
             .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
             .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
-            .filter_map(|pad| pad.net.map(|net| (pad.number, net.name)))
             .collect();
+        let angle_microdeg = |angle: Option<&kiapi::common::types::Angle>| {
+            let deg = angle.map(|a| a.value_degrees).unwrap_or(0.0);
+            ((deg.rem_euclid(360.0) * 1e6).round() as i64).rem_euclid(360_000_000)
+        };
+        let pad_nets = old_nets.iter().all(|(number, expected)| {
+            let mut saw_pad = false;
+            for pad in new_pads.iter().filter(|pad| pad.number == *number) {
+                saw_pad = true;
+                if pad.net.as_ref().map(|net| net.name.as_str()) != Some(expected.name.as_str()) {
+                    return false;
+                }
+            }
+            saw_pad
+        });
         Self {
             position: updated.position == current.position,
-            rotation: updated.orientation == current.orientation,
+            rotation: angle_microdeg(updated.orientation.as_ref())
+                == angle_microdeg(current.orientation.as_ref()),
             layer: updated.layer == current.layer,
             locked: updated.locked == current.locked,
             kiid: updated.id == current.id,
             symbol_path: updated.symbol_path == current.symbol_path
                 && updated.symbol_sheet_name == current.symbol_sheet_name
                 && updated.symbol_sheet_filename == current.symbol_sheet_filename,
-            pad_nets: old_nets.iter().all(|(number, net)| {
-                new_nets.get(number).map(String::as_str) == Some(net.name.as_str())
-            }),
-            instance_overrides: updated.overrides == current.overrides,
+            pad_nets,
+            instance_overrides: normalized_overrides(updated.overrides.as_ref())
+                == normalized_overrides(current.overrides.as_ref()),
         }
+    }
+
+    /// Names of properties planned as preserved that did not hold in `observed`.
+    fn lost_fields(&self, observed: &Self) -> Vec<&'static str> {
+        let checks = [
+            ("position", self.position, observed.position),
+            ("rotation", self.rotation, observed.rotation),
+            ("layer", self.layer, observed.layer),
+            ("locked", self.locked, observed.locked),
+            ("kiid", self.kiid, observed.kiid),
+            ("symbol_path", self.symbol_path, observed.symbol_path),
+            ("pad_nets", self.pad_nets, observed.pad_nets),
+            (
+                "instance_overrides",
+                self.instance_overrides,
+                observed.instance_overrides,
+            ),
+        ];
+        checks
+            .into_iter()
+            .filter_map(|(name, planned, actual)| (planned && !actual).then_some(name))
+            .collect()
     }
 }
 
@@ -287,7 +324,7 @@ impl PreservedState {
 struct PlannedUpdate {
     reference: String,
     library_id: String,
-    /// Not reported; the group guard looks the footprint up by it.
+    /// Not reported; the group guard and post-commit readback look the footprint up by it.
     #[serde(skip)]
     kiid: String,
     changed_domains: BTreeSet<ChangedDomain>,
@@ -297,6 +334,12 @@ struct PlannedUpdate {
     /// Not reported; the apply holds the board to them when it changes them.
     #[serde(skip)]
     net_ties: Vec<kiapi::board::types::NetTieDefinition>,
+    /// Not reported; post-commit readback compares observed state against this snapshot (#85).
+    #[serde(skip)]
+    before: kiapi::board::types::FootprintInstance,
+    /// Not reported; post-commit readback derives observed `preserved.pad_nets` from this.
+    #[serde(skip)]
+    old_nets: BTreeMap<String, kiapi::board::types::Net>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -487,15 +530,23 @@ pub(crate) async fn handle_update_footprints_from_library(
             client.run_commit("Update footprints from libraries", |client| {
                 client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
             })?;
+            // Every apply verifies a fresh board readback rather than trusting
+            // the request payload (#85): target KIID presence, footprint and
+            // child `parent` KIIDs, preserved instance state, and any reset
+            // text effects or net-tie pad groups.
+            let readback_footprints = match client
+                .get_items_in(readback_document, ObjectType::KotPcbFootprint)
+            {
+                Ok(footprints) => footprints,
+                Err(error) => {
+                    return Ok(uncertain_after_commit(
+                        &ipc_board_path,
+                        format!("the board could not be read back after the commit: {error:#}"),
+                    ));
+                }
+            };
             if plan.changes.iter().any(|change| !change.text_effects.is_empty()) {
-                // KiCad may drop a text attribute it does not take over IPC,
-                // so the reset is proven against the board, not the request.
-                let missing = match client
-                    .get_items_in(readback_document.clone(), ObjectType::KotPcbFootprint)
-                {
-                    Ok(footprints) => text_effects_not_held(&footprints, &plan.changes),
-                    Err(error) => vec![format!("the board could not be read back: {error:#}")],
-                };
+                let missing = text_effects_not_held(&readback_footprints, &plan.changes);
                 if !missing.is_empty() {
                     return Ok(text_effects_uncertain(&ipc_board_path, &missing));
                 }
@@ -505,30 +556,24 @@ pub(crate) async fn handle_update_footprints_from_library(
                 .iter()
                 .any(|change| change.changed_domains.contains(&ChangedDomain::NetTies))
             {
-                // Which pads a footprint may short is proven against the
-                // board too: a KiCad that dropped the groups would otherwise
-                // report a refresh that changed nothing (#85).
-                let reason = match client
-                    .get_items_in(readback_document, ObjectType::KotPcbFootprint)
-                {
-                    Ok(footprints) => {
-                        let missing = net_ties_not_held(&footprints, &plan.changes);
-                        (!missing.is_empty()).then(|| {
-                            format!(
-                                "the board read after the commit does not hold the library's \
-                                 net-tie pad groups on {}",
-                                missing.join(", ")
-                            )
-                        })
-                    }
-                    Err(error) => Some(format!(
-                        "the board could not be read back to check its net-tie pad groups: \
-                         {error:#}"
-                    )),
-                };
-                if let Some(reason) = reason {
-                    return Ok(uncertain_after_commit(&ipc_board_path, reason));
+                let missing = net_ties_not_held(&readback_footprints, &plan.changes);
+                if !missing.is_empty() {
+                    return Ok(uncertain_after_commit(
+                        &ipc_board_path,
+                        format!(
+                            "the board read after the commit does not hold the library's \
+                             net-tie pad groups on {}",
+                            missing.join(", ")
+                        ),
+                    ));
                 }
+            }
+            if let Err(reason) = verify_post_commit_readback(
+                &readback_footprints,
+                &mut plan.changes,
+                carries_parent_fields(&kicad),
+            ) {
+                return Ok(uncertain_after_commit(&ipc_board_path, reason));
             }
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
@@ -1241,6 +1286,8 @@ fn plan_updates(
                 preserved: prepared.preserved,
                 text_effects: prepared.text_effects,
                 net_ties: library.net_ties.clone(),
+                before: candidate.instance,
+                old_nets: prepared.old_nets,
             });
             prepared_items.push(prepared.item);
         }
@@ -1439,6 +1486,9 @@ fn build_updated_instance(
     routed_nets: &BTreeSet<String>,
     resets: Resets,
 ) -> Result<PreparedUpdate> {
+    if current.id.as_ref().is_none_or(|id| id.value.is_empty()) {
+        bail!("board footprint has no KIID");
+    }
     let current_definition = current
         .definition
         .as_ref()
@@ -1732,6 +1782,7 @@ fn build_updated_instance(
         changed_domains,
         preserved,
         text_effects,
+        old_nets,
     })
 }
 
@@ -1869,6 +1920,196 @@ fn net_ties_not_held(footprints: &[prost_types::Any], changes: &[PlannedUpdate])
         })
         .map(|change| change.reference.clone())
         .collect()
+}
+
+/// Verifies every updated footprint against the fresh post-commit board
+/// readback (#85): target KIID presence, footprint container `parent` KIID,
+/// child `parent` KIIDs regenerated by KiCad 10.0.6+, and observed
+/// `PreservedState`. Replaces each `change.preserved` with the observed value
+/// so the applied response never echoes request state as readback evidence.
+fn verify_post_commit_readback(
+    footprints: &[prost_types::Any],
+    changes: &mut [PlannedUpdate],
+    expects_parent_fields: bool,
+) -> std::result::Result<(), String> {
+    let read: BTreeMap<String, kiapi::board::types::FootprintInstance> = footprints
+        .iter()
+        .filter_map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+        })
+        .filter_map(|instance| Some((instance.id.as_ref()?.value.clone(), instance)))
+        .collect();
+
+    for change in changes {
+        let Some(observed) = read.get(&change.kiid) else {
+            return Err(format!(
+                "updated footprint '{}' (KIID '{}') was not found in post-commit readback",
+                change.reference, change.kiid
+            ));
+        };
+        if observed.parent != change.before.parent {
+            let before_parent = change
+                .before
+                .parent
+                .as_ref()
+                .map(|id| id.value.as_str())
+                .unwrap_or("<none>");
+            let after_parent = observed
+                .parent
+                .as_ref()
+                .map(|id| id.value.as_str())
+                .unwrap_or("<none>");
+            return Err(format!(
+                "updated footprint '{}' changed its parent KIID in post-commit readback \
+                 ('{before_parent}' -> '{after_parent}')",
+                change.reference
+            ));
+        }
+        let expect_child_parents = expects_parent_fields || has_any_child_parent(&change.before);
+        let mismatches = child_parent_mismatches(observed, &change.kiid, expect_child_parents);
+        if !mismatches.is_empty() {
+            return Err(format!(
+                "updated footprint '{}' has unexpected child parent KIIDs in post-commit \
+                 readback: {}",
+                change.reference,
+                mismatches.join("; ")
+            ));
+        }
+        let observed_preserved = PreservedState::derive(&change.before, observed, &change.old_nets);
+        let lost = change.preserved.lost_fields(&observed_preserved);
+        change.preserved = observed_preserved;
+        if !lost.is_empty() {
+            return Err(format!(
+                "updated footprint '{}' did not preserve {} in post-commit readback",
+                change.reference,
+                lost.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_child_parent(
+    mismatches: &mut Vec<String>,
+    label: &str,
+    parent: Option<&kiapi::common::types::Kiid>,
+    expected_kiid: &str,
+    require_present: bool,
+) {
+    match parent {
+        Some(actual) if actual.value == expected_kiid => {}
+        Some(actual) => mismatches.push(format!(
+            "{label} parent is '{}' (expected '{expected_kiid}')",
+            actual.value
+        )),
+        None if require_present => mismatches.push(format!(
+            "{label} parent is missing (expected '{expected_kiid}')"
+        )),
+        None => {}
+    }
+}
+
+fn visit_child_parents(
+    instance: &kiapi::board::types::FootprintInstance,
+    mut visit: impl FnMut(std::result::Result<(&str, Option<&kiapi::common::types::Kiid>), String>),
+) {
+    for (name, field) in [
+        ("reference field", &instance.reference_field),
+        ("value field", &instance.value_field),
+        ("datasheet field", &instance.datasheet_field),
+        ("description field", &instance.description_field),
+    ] {
+        if let Some(text) = field.as_ref().and_then(|field| field.text.as_ref()) {
+            visit(Ok((name, text.parent.as_ref())));
+        }
+    }
+    let Some(definition) = instance.definition.as_ref() else {
+        visit(Err("footprint definition is missing".to_string()));
+        return;
+    };
+    for item in &definition.items {
+        if item.type_url.ends_with("kiapi.board.types.Pad") {
+            match kiapi::board::types::Pad::decode(item.value.as_slice()) {
+                Ok(pad) => {
+                    let pad_label = format!("pad '{}'", pad.number);
+                    visit(Ok((&pad_label, pad.parent.as_ref())));
+                    if let Some(stack) = pad.pad_stack.as_ref() {
+                        for layer in &stack.copper_layers {
+                            for (index, shape) in layer.custom_shapes.iter().enumerate() {
+                                let shape_label =
+                                    format!("pad '{}' custom shape {index}", pad.number);
+                                visit(Ok((&shape_label, shape.parent.as_ref())));
+                            }
+                        }
+                    }
+                }
+                Err(error) => visit(Err(format!("undecodable pad: {error}"))),
+            }
+        } else if item
+            .type_url
+            .ends_with("kiapi.board.types.BoardGraphicShape")
+        {
+            match kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()) {
+                Ok(shape) => visit(Ok(("graphic shape", shape.parent.as_ref()))),
+                Err(error) => visit(Err(format!("undecodable graphic shape: {error}"))),
+            }
+        } else if item.type_url.ends_with("kiapi.board.types.BoardText") {
+            match kiapi::board::types::BoardText::decode(item.value.as_slice()) {
+                Ok(text) => visit(Ok(("user text", text.parent.as_ref()))),
+                Err(error) => visit(Err(format!("undecodable user text: {error}"))),
+            }
+        } else if item.type_url.ends_with("kiapi.board.types.Field") {
+            match kiapi::board::types::Field::decode(item.value.as_slice()) {
+                Ok(field) => {
+                    if let Some(text) = field.text.as_ref() {
+                        let label = format!("custom field '{}'", field.name);
+                        visit(Ok((&label, text.parent.as_ref())));
+                    }
+                }
+                Err(error) => visit(Err(format!("undecodable custom field: {error}"))),
+            }
+        } else if item.type_url.ends_with("kiapi.board.types.ReferencePoint") {
+            match kiapi::board::types::ReferencePoint::decode(item.value.as_slice()) {
+                Ok(point) => visit(Ok(("reference point", point.parent.as_ref()))),
+                Err(error) => visit(Err(format!("undecodable reference point: {error}"))),
+            }
+        }
+        // Other child kinds (zones, dimensions, text boxes, barcodes, tables)
+        // are refused in library sources by `validate_supported_children`.
+    }
+}
+
+fn has_any_child_parent(instance: &kiapi::board::types::FootprintInstance) -> bool {
+    let mut found = false;
+    visit_child_parents(instance, |entry| {
+        if let Ok((_, Some(_))) = entry {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Returns a description of every child whose `parent` KIID does not match
+/// `expected_kiid` (or is `None` when `require_present` is true).
+fn child_parent_mismatches(
+    instance: &kiapi::board::types::FootprintInstance,
+    expected_kiid: &str,
+    require_present: bool,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    visit_child_parents(instance, |entry| match entry {
+        Ok((label, parent)) => {
+            check_child_parent(
+                &mut mismatches,
+                label,
+                parent,
+                expected_kiid,
+                require_present,
+            );
+        }
+        Err(error) => mismatches.push(error),
+    });
+    mismatches
 }
 
 /// Equal at KiCad's nm resolution, with angles compared modulo 360° (modulo
@@ -5321,6 +5562,7 @@ mod tests {
     struct MutationCapture {
         begin_count: usize,
         update_batches: Vec<usize>,
+        updated_items: Vec<Vec<prost_types::Any>>,
         commit_actions: Vec<kiapi::common::commands::CommitAction>,
     }
 
@@ -5328,6 +5570,70 @@ mod tests {
         kicad: crate::test_support::MockIpcServer,
         capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
         native_board: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    /// Simulates KiCad 10.0.6+ regenerating every child's read-only `parent`
+    /// KIID to the parent footprint's KIID when `UpdateItems` commits.
+    fn populate_child_parents(item: &prost_types::Any) -> prost_types::Any {
+        let mut instance =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let Some(fp_id) = instance.id.clone() else {
+            return item.clone();
+        };
+        for field in [
+            &mut instance.reference_field,
+            &mut instance.value_field,
+            &mut instance.datasheet_field,
+            &mut instance.description_field,
+        ] {
+            if let Some(text) = field.as_mut().and_then(|field| field.text.as_mut()) {
+                text.parent = Some(fp_id.clone());
+            }
+        }
+        if let Some(definition) = instance.definition.as_mut() {
+            for child in &mut definition.items {
+                if child.type_url.ends_with("kiapi.board.types.Pad") {
+                    let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+                    pad.parent = Some(fp_id.clone());
+                    if let Some(stack) = pad.pad_stack.as_mut() {
+                        for layer in &mut stack.copper_layers {
+                            for shape in &mut layer.custom_shapes {
+                                shape.parent = Some(fp_id.clone());
+                            }
+                        }
+                    }
+                    *child = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                } else if child
+                    .type_url
+                    .ends_with("kiapi.board.types.BoardGraphicShape")
+                {
+                    let mut shape =
+                        kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())
+                            .unwrap();
+                    shape.parent = Some(fp_id.clone());
+                    *child = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
+                } else if child.type_url.ends_with("kiapi.board.types.BoardText") {
+                    let mut text =
+                        kiapi::board::types::BoardText::decode(child.value.as_slice()).unwrap();
+                    text.parent = Some(fp_id.clone());
+                    *child = builders::pack_any(&text, "kiapi.board.types.BoardText");
+                } else if child.type_url.ends_with("kiapi.board.types.Field") {
+                    let mut field =
+                        kiapi::board::types::Field::decode(child.value.as_slice()).unwrap();
+                    if let Some(text) = field.text.as_mut() {
+                        text.parent = Some(fp_id.clone());
+                    }
+                    *child = builders::pack_any(&field, "kiapi.board.types.Field");
+                } else if child.type_url.ends_with("kiapi.board.types.ReferencePoint") {
+                    let mut point =
+                        kiapi::board::types::ReferencePoint::decode(child.value.as_slice())
+                            .unwrap();
+                    point.parent = Some(fp_id.clone());
+                    *child = builders::pack_any(&point, "kiapi.board.types.ReferencePoint");
+                }
+            }
+        }
+        builders::pack_any(&instance, "kiapi.board.types.FootprintInstance")
     }
 
     fn api_ok() -> kiapi::common::ApiResponse {
@@ -5385,6 +5691,28 @@ mod tests {
         keeps_updates: bool,
         version: (u32, u32, u32),
     ) -> PlannerMock {
+        spawn_planner_mock_with_readback(
+            board,
+            footprints,
+            fail_update,
+            keeps_updates,
+            version,
+            version >= (10, 0, 6),
+            None,
+        )
+    }
+
+    /// The mock with explicit control over whether `UpdateItems` regenerates
+    /// child `parent` KIIDs or returns a fixed post-commit readback list.
+    fn spawn_planner_mock_with_readback(
+        board: &Path,
+        footprints: Vec<prost_types::Any>,
+        fail_update: bool,
+        keeps_updates: bool,
+        version: (u32, u32, u32),
+        regenerate_child_parents: bool,
+        post_commit_readback: Option<Vec<prost_types::Any>>,
+    ) -> PlannerMock {
         let board_name = board.to_string_lossy().to_string();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
@@ -5393,14 +5721,12 @@ mod tests {
             "(kicad_pcb {})",
             footprints
                 .iter()
-                .map(|item| {
+                .filter_map(|item| {
                     let instance =
                         kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-                            .unwrap();
-                    format!(
-                        "(footprint \"Mock:Part\" (uuid \"{}\"))",
-                        instance.id.unwrap().value
-                    )
+                            .ok()?;
+                    let uuid = instance.id?.value;
+                    Some(format!("(footprint \"Mock:Part\" (uuid \"{uuid}\"))"))
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -5511,13 +5837,41 @@ mod tests {
             } else if message.type_url.ends_with("UpdateItems") {
                 let update =
                     kiapi::common::commands::UpdateItems::decode(message.value.as_slice()).unwrap();
-                captured
-                    .lock()
-                    .unwrap()
-                    .update_batches
-                    .push(update.items.len());
-                if keeps_updates && !fail_update {
-                    *footprints.lock().unwrap() = update.items.clone();
+                {
+                    let mut guard = captured.lock().unwrap();
+                    guard.update_batches.push(update.items.len());
+                    guard.updated_items.push(update.items.clone());
+                }
+                if !fail_update {
+                    if let Some(override_readback) = post_commit_readback.clone() {
+                        *footprints.lock().unwrap() = override_readback;
+                    } else if keeps_updates {
+                        let mut stored = footprints.lock().unwrap();
+                        for updated in &update.items {
+                            let stored_item = if regenerate_child_parents {
+                                populate_child_parents(updated)
+                            } else {
+                                updated.clone()
+                            };
+                            let updated_id = kiapi::board::types::FootprintInstance::decode(
+                                updated.value.as_slice(),
+                            )
+                            .ok()
+                            .and_then(|fp| fp.id.map(|id| id.value));
+                            if let Some(slot) = stored.iter_mut().find(|existing| {
+                                kiapi::board::types::FootprintInstance::decode(
+                                    existing.value.as_slice(),
+                                )
+                                .ok()
+                                .and_then(|fp| fp.id.map(|id| id.value))
+                                    == updated_id
+                            }) {
+                                *slot = stored_item;
+                            } else {
+                                stored.push(stored_item);
+                            }
+                        }
+                    }
                 }
                 let updated_items = update
                     .items
@@ -6007,6 +6361,8 @@ mod tests {
             preserved: prepared.preserved.clone(),
             text_effects: prepared.text_effects.clone(),
             net_ties: Vec::new(),
+            before: applied.clone(),
+            old_nets: prepared.old_nets.clone(),
         };
         let unchanged = builders::pack_any(&applied, "kiapi.board.types.FootprintInstance");
         assert_eq!(
@@ -8683,6 +9039,619 @@ mod tests {
             }
             assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
         }
+    }
+
+    const ISSUE_85_NET_TIE_2_MOD: &str =
+        include_str!("../../tests/fixtures/net_tie_2_smd_pad0.5mm_kicad10.kicad_mod");
+    const ISSUE_85_LED_MOD: &str =
+        include_str!("../../tests/fixtures/issue_85_led_d5.0mm_kicad10.kicad_mod");
+    const ISSUE_85_SFH2201_MOD: &str =
+        include_str!("../../tests/fixtures/custom_pads_sfh2201_kicad10.kicad_mod");
+    const ISSUE_85_C_0603_MOD: &str =
+        include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+    const ISSUE_85_BEFORE_NT1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_before_NT1.ipc.bin");
+    const ISSUE_85_AFTER_NT1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_after_NT1.ipc.bin");
+    const ISSUE_85_BEFORE_D1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_before_D1.ipc.bin");
+    const ISSUE_85_AFTER_D1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_after_D1.ipc.bin");
+    const ISSUE_85_BEFORE_Q1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_before_Q1.ipc.bin");
+    const ISSUE_85_AFTER_Q1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_after_Q1.ipc.bin");
+    const ISSUE_85_BEFORE_C1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_before_C1.ipc.bin");
+    const ISSUE_85_AFTER_C1: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_parent_after_C1.ipc.bin");
+
+    fn decode_captured_footprint(bytes: &[u8]) -> kiapi::board::types::FootprintInstance {
+        kiapi::board::types::FootprintInstance::decode(bytes).expect("captured footprint decodes")
+    }
+
+    fn issue_85_project() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("parent_check.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20241229))\n").unwrap();
+        for (lib, name, source) in [
+            ("NetTie", "NetTie-2_SMD_Pad0.5mm", ISSUE_85_NET_TIE_2_MOD),
+            ("LED_THT", "LED_D5.0mm", ISSUE_85_LED_MOD),
+            ("OptoDevice", "Osram_SFH2201", ISSUE_85_SFH2201_MOD),
+            ("Capacitor_SMD", "C_0603_1608Metric", ISSUE_85_C_0603_MOD),
+        ] {
+            let pretty = temp.path().join(format!("{lib}.pretty"));
+            std::fs::create_dir_all(&pretty).unwrap();
+            std::fs::write(pretty.join(format!("{name}.kicad_mod")), source).unwrap();
+        }
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table\n\
+             (lib (name \"NetTie\")(type \"KiCad\")(uri \"${KIPRJMOD}/NetTie.pretty\"))\n\
+             (lib (name \"LED_THT\")(type \"KiCad\")(uri \"${KIPRJMOD}/LED_THT.pretty\"))\n\
+             (lib (name \"OptoDevice\")(type \"KiCad\")(uri \"${KIPRJMOD}/OptoDevice.pretty\"))\n\
+             (lib (name \"Capacitor_SMD\")(type \"KiCad\")(uri \"${KIPRJMOD}/Capacitor_SMD.pretty\"))\n\
+             )\n",
+        )
+        .unwrap();
+        (temp, board)
+    }
+
+    /// Real KiCad 10.0.8 captures (#85 part B): before and after a live
+    /// parent-footprint update, KiCad preserves `FootprintInstance.id` and
+    /// `FootprintInstance.parent` (the board's KIID), regenerates `parent` on
+    /// every rebuilt child (pads, custom pad shapes, graphics, user text,
+    /// reference points, library custom fields), leaves untouched footprints
+    /// byte-for-byte identical, and converges to `noop` on the next dry run.
+    #[test]
+    fn kicad_10_0_8_captures_regenerate_child_parents_and_converge_to_noop() {
+        assert_eq!(
+            ISSUE_85_BEFORE_C1, ISSUE_85_AFTER_C1,
+            "unselected footprint C1 must be byte-for-byte unchanged"
+        );
+        let (_temp, board) = issue_85_project();
+        let net_codes = BTreeMap::from([("GND".to_string(), 1), ("AGND".to_string(), 2)]);
+        let kicad = kicad_10_0_8();
+
+        for (label, before_bytes, after_bytes) in [
+            ("NT1", ISSUE_85_BEFORE_NT1, ISSUE_85_AFTER_NT1),
+            ("D1", ISSUE_85_BEFORE_D1, ISSUE_85_AFTER_D1),
+            ("Q1", ISSUE_85_BEFORE_Q1, ISSUE_85_AFTER_Q1),
+        ] {
+            let before = decode_captured_footprint(before_bytes);
+            let after = decode_captured_footprint(after_bytes);
+            let fp_id = before.id.as_ref().unwrap().value.as_str();
+            assert_eq!(after.id, before.id, "{label} kept its KIID");
+            assert!(
+                before.parent.is_some(),
+                "{label} carries the board KIID as FootprintInstance.parent"
+            );
+            assert_eq!(
+                after.parent, before.parent,
+                "{label} preserved FootprintInstance.parent"
+            );
+            assert!(
+                child_parent_mismatches(&before, fp_id, true).is_empty(),
+                "{label} before capture has every child parented to {fp_id}"
+            );
+            assert!(
+                child_parent_mismatches(&after, fp_id, true).is_empty(),
+                "{label} after capture has every child regenerated with parent {fp_id}"
+            );
+
+            // Request payload sent to UpdateItems keeps FootprintInstance.id/parent
+            // and leaves newly built children with parent: None (never tries to
+            // reparent by writing read-only child parent fields).
+            let before_any = builders::pack_any(&before, "kiapi.board.types.FootprintInstance");
+            let plan = plan_updates(
+                &board,
+                &[before_any],
+                CopperStack::new(2).unwrap(),
+                &net_codes,
+                &BTreeSet::new(),
+                &UpdateFilters::default(),
+                &kicad,
+            );
+            assert_eq!(plan.status, PlanStatus::Ready, "{label} before plans Ready");
+            let request = decode_captured_footprint(&plan.prepared_items[0].value);
+            assert_eq!(request.id, before.id, "{label} request targets exact KIID");
+            assert_eq!(
+                request.parent, before.parent,
+                "{label} request preserves FootprintInstance.parent"
+            );
+            let request_pads = decoded_pads(&request);
+            assert!(
+                !request_pads.is_empty() && request_pads.iter().all(|pad| pad.parent.is_none()),
+                "{label} request leaves newly built pad parents as None"
+            );
+
+            // Post-commit readback against the real KiCad 10.0.8 after capture passes.
+            let after_any = builders::pack_any(&after, "kiapi.board.types.FootprintInstance");
+            let mut changes = plan.changes;
+            assert!(
+                verify_post_commit_readback(std::slice::from_ref(&after_any), &mut changes, true)
+                    .is_ok(),
+                "{label} real KiCad after-capture passes post-commit readback verification"
+            );
+
+            // Second dry run against the real KiCad after capture converges to noop.
+            let second_plan = plan_updates(
+                &board,
+                &[after_any],
+                CopperStack::new(2).unwrap(),
+                &net_codes,
+                &BTreeSet::new(),
+                &UpdateFilters::default(),
+                &kicad,
+            );
+            assert_eq!(
+                second_plan.status,
+                PlanStatus::Noop,
+                "{label} after capture converges to noop: {:?}",
+                second_plan.changes
+            );
+        }
+    }
+
+    /// Served dispatch (#85 part B): updating only NT1 on a multi-footprint
+    /// board targets only NT1's KIID in `UpdateItems`, never touches D1 or C1,
+    /// and succeeds when readback returns KiCad's real regenerated child
+    /// parents (`issue_85_parent_after_NT1.ipc.bin`).
+    #[tokio::test]
+    async fn served_apply_targets_only_selected_kiid_and_verifies_observed_parents() {
+        let (_temp, board) = issue_85_project();
+        let before_items = vec![
+            builders::pack_any(
+                &decode_captured_footprint(ISSUE_85_BEFORE_NT1),
+                "kiapi.board.types.FootprintInstance",
+            ),
+            builders::pack_any(
+                &decode_captured_footprint(ISSUE_85_BEFORE_D1),
+                "kiapi.board.types.FootprintInstance",
+            ),
+            builders::pack_any(
+                &decode_captured_footprint(ISSUE_85_BEFORE_C1),
+                "kiapi.board.types.FootprintInstance",
+            ),
+        ];
+        let after_readback = vec![
+            builders::pack_any(
+                &decode_captured_footprint(ISSUE_85_AFTER_NT1),
+                "kiapi.board.types.FootprintInstance",
+            ),
+            builders::pack_any(
+                &decode_captured_footprint(ISSUE_85_BEFORE_D1),
+                "kiapi.board.types.FootprintInstance",
+            ),
+            builders::pack_any(
+                &decode_captured_footprint(ISSUE_85_BEFORE_C1),
+                "kiapi.board.types.FootprintInstance",
+            ),
+        ];
+        let nt1_kiid = decode_captured_footprint(ISSUE_85_BEFORE_NT1)
+            .id
+            .unwrap()
+            .value;
+        let mock = spawn_planner_mock_with_readback(
+            &board,
+            before_items,
+            false,
+            true,
+            (10, 0, 8),
+            false,
+            Some(after_readback),
+        );
+        let handler = served(mock.kicad.address()).await;
+        let plan = result_json(
+            &served_call(
+                &handler,
+                serde_json::json!({
+                    "board": board,
+                    "references": ["NT1"],
+                }),
+            )
+            .await,
+        );
+        assert_eq!(plan["status"], "ready", "{plan}");
+
+        let applied = served_call(
+            &handler,
+            serde_json::json!({
+                "board": board,
+                "references": ["NT1"],
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }),
+        )
+        .await;
+        let body = result_json(&applied);
+        assert!(!applied.is_error, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert_eq!(body["changes"][0]["preserved"]["kiid"], true);
+        assert_eq!(body["changes"][0]["preserved"]["pad_nets"], true);
+
+        let sent = &mock.capture.lock().unwrap().updated_items;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), 1, "only NT1 was sent in UpdateItems");
+        let sent_fp = decode_captured_footprint(&sent[0][0].value);
+        assert_eq!(
+            sent_fp.id.as_ref().map(|id| id.value.as_str()),
+            Some(nt1_kiid.as_str()),
+            "UpdateItems targeted NT1's exact KIID"
+        );
+    }
+
+    /// Served dispatch (#85 part B): echoing the request back (rebuilt
+    /// children still have `parent: None`) on KiCad 10.0.8 must NOT be treated
+    /// as observed parent evidence — apply returns `mutation_outcome_uncertain`.
+    #[tokio::test]
+    async fn served_apply_rejects_echoed_request_without_regenerated_child_parents() {
+        let (_temp, board) = issue_85_project();
+        let before_nt1 = builders::pack_any(
+            &decode_captured_footprint(ISSUE_85_BEFORE_NT1),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let mock = spawn_planner_mock_with_readback(
+            &board,
+            vec![before_nt1],
+            false,
+            true,
+            (10, 0, 8),
+            false, // echo request verbatim (rebuilt pads/graphics have parent: None)
+            None,
+        );
+        let handler = served(mock.kicad.address()).await;
+        let plan = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(plan["status"], "ready", "{plan}");
+
+        let applied = served_call(
+            &handler,
+            serde_json::json!({
+                "board": board,
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }),
+        )
+        .await;
+        let body = result_json(&applied);
+        assert!(applied.is_error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("unexpected child parent KIIDs"),
+            "{body}"
+        );
+    }
+
+    /// Served dispatch (#85 part B): a board footprint with no KIID is refused
+    /// as `status: conflict` before any IPC write.
+    #[tokio::test]
+    async fn served_plan_refuses_footprint_without_kiid_before_writing() {
+        let (_temp, board) = issue_85_project();
+        let mut missing_id = decode_captured_footprint(ISSUE_85_BEFORE_NT1);
+        missing_id.id = None;
+        let mock = spawn_planner_mock(
+            &board,
+            builders::pack_any(&missing_id, "kiapi.board.types.FootprintInstance"),
+            false,
+        );
+        let handler = served(mock.kicad.address()).await;
+        let plan = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(plan["status"], "conflict", "{plan}");
+        assert_eq!(
+            plan["diagnostics"][0]["code"], "footprint_update_conflict",
+            "{plan}"
+        );
+        assert!(
+            plan["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no KIID"),
+            "{plan}"
+        );
+        assert!(mock.capture.lock().unwrap().update_batches.is_empty());
+    }
+
+    /// Post-commit readback rejects missing target KIID, changed footprint
+    /// parent KIID, wrong child parent KIID across every child kind, and lost
+    /// preserved state, while accepting `parent: None` on pre-10.0.6 KiCad.
+    #[test]
+    fn post_commit_readback_catches_parent_identity_and_preservation_mismatches() {
+        let (_temp, board) = issue_85_project();
+        let net_codes = BTreeMap::from([("GND".to_string(), 1), ("AGND".to_string(), 2)]);
+        let kicad = kicad_10_0_8();
+
+        let make_changes = |before_bytes: &[u8]| {
+            let before = decode_captured_footprint(before_bytes);
+            let plan = plan_updates(
+                &board,
+                &[builders::pack_any(
+                    &before,
+                    "kiapi.board.types.FootprintInstance",
+                )],
+                CopperStack::new(2).unwrap(),
+                &net_codes,
+                &BTreeSet::new(),
+                &UpdateFilters::default(),
+                &kicad,
+            );
+            assert_eq!(plan.status, PlanStatus::Ready);
+            plan.changes
+        };
+
+        // 1. Target footprint KIID missing from readback.
+        let mut changes = make_changes(ISSUE_85_BEFORE_NT1);
+        let mut wrong_kiid = decode_captured_footprint(ISSUE_85_AFTER_NT1);
+        wrong_kiid.id = Some(kiapi::common::types::Kiid {
+            value: "00000000-0000-0000-0000-000000000000".to_string(),
+        });
+        let err = verify_post_commit_readback(
+            &[builders::pack_any(
+                &wrong_kiid,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            &mut changes,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("was not found in post-commit readback"),
+            "{err}"
+        );
+
+        // 2. FootprintInstance.parent changed on readback.
+        let mut changes = make_changes(ISSUE_85_BEFORE_NT1);
+        let mut wrong_fp_parent = decode_captured_footprint(ISSUE_85_AFTER_NT1);
+        wrong_fp_parent.parent = Some(kiapi::common::types::Kiid {
+            value: "11111111-1111-1111-1111-111111111111".to_string(),
+        });
+        let err = verify_post_commit_readback(
+            &[builders::pack_any(
+                &wrong_fp_parent,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            &mut changes,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("changed its parent KIID"), "{err}");
+
+        // 3. Wrong child parent KIID on D1's ReferencePoint (the last child kind).
+        let mut changes = make_changes(ISSUE_85_BEFORE_D1);
+        let mut wrong_rp_parent = decode_captured_footprint(ISSUE_85_AFTER_D1);
+        for item in &mut wrong_rp_parent.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.ReferencePoint") {
+                let mut rp =
+                    kiapi::board::types::ReferencePoint::decode(item.value.as_slice()).unwrap();
+                rp.parent = Some(kiapi::common::types::Kiid {
+                    value: "22222222-2222-2222-2222-222222222222".to_string(),
+                });
+                *item = builders::pack_any(&rp, "kiapi.board.types.ReferencePoint");
+            }
+        }
+        let err = verify_post_commit_readback(
+            &[builders::pack_any(
+                &wrong_rp_parent,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            &mut changes,
+            false, // rejected even when KiCad < 10.0.6
+        )
+        .unwrap_err();
+        assert!(err.contains("reference point parent is"), "{err}");
+
+        // 4. Wrong child parent KIID on Q1's custom pad shape.
+        let mut changes = make_changes(ISSUE_85_BEFORE_Q1);
+        let mut wrong_custom_parent = decode_captured_footprint(ISSUE_85_AFTER_Q1);
+        for item in &mut wrong_custom_parent.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                if let Some(shape) = pad
+                    .pad_stack
+                    .as_mut()
+                    .and_then(|s| s.copper_layers.first_mut())
+                    .and_then(|l| l.custom_shapes.first_mut())
+                {
+                    shape.parent = Some(kiapi::common::types::Kiid {
+                        value: "33333333-3333-3333-3333-333333333333".to_string(),
+                    });
+                    *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                    break;
+                }
+            }
+        }
+        let err = verify_post_commit_readback(
+            &[builders::pack_any(
+                &wrong_custom_parent,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            &mut changes,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("custom shape 0 parent is"), "{err}");
+
+        // 5. Lost preserved state (pad net dropped on readback).
+        let mut changes = make_changes(ISSUE_85_BEFORE_NT1);
+        let mut dropped_net = decode_captured_footprint(ISSUE_85_AFTER_NT1);
+        for item in &mut dropped_net.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.net = None;
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        let err = verify_post_commit_readback(
+            &[builders::pack_any(
+                &dropped_net,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            &mut changes,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("did not preserve pad_nets"), "{err}");
+        assert!(
+            !changes[0].preserved.pad_nets,
+            "change.preserved reflects observed readback, not request"
+        );
+    }
+
+    /// Pre-10.0.6 compatibility: KiCad 10.0.5 does not populate `parent`
+    /// fields before or after `UpdateItems`, so apply accepts `parent: None`.
+    #[tokio::test]
+    async fn served_apply_on_kicad_10_0_5_accepts_absent_parent_fields() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock_with_readback(
+            &board,
+            vec![items[2].clone()],
+            false,
+            true,
+            (10, 0, 5),
+            false,
+            None,
+        );
+        let handler = served(mock.kicad.address()).await;
+        let plan = result_json(
+            &served_call(
+                &handler,
+                serde_json::json!({ "board": board, "references": ["SW1"] }),
+            )
+            .await,
+        );
+        assert_eq!(plan["status"], "ready", "{plan}");
+
+        let applied = served_call(
+            &handler,
+            serde_json::json!({
+                "board": board,
+                "references": ["SW1"],
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }),
+        )
+        .await;
+        let body = result_json(&applied);
+        assert!(!applied.is_error, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+    }
+
+    /// `PreservedState::derive` handles KiCad readback normalization for
+    /// rotation (-90° vs 270°) and overrides (None vs default inherited), and
+    /// catches a dropped net on one pad of a shared pad number.
+    #[test]
+    fn preserved_state_normalizes_rotation_overrides_and_checks_duplicate_pad_numbers() {
+        let mut before = decode_captured_footprint(ISSUE_85_BEFORE_NT1);
+        before.orientation = Some(kiapi::common::types::Angle {
+            value_degrees: -90.0,
+        });
+        before.overrides = None;
+
+        let mut after = decode_captured_footprint(ISSUE_85_AFTER_NT1);
+        after.orientation = Some(kiapi::common::types::Angle {
+            value_degrees: 270.0,
+        });
+        after.overrides = Some(kiapi::board::types::FootprintDesignRuleOverrides {
+            zone_connection: kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+            ..Default::default()
+        });
+        let old_nets = BTreeMap::from([
+            ("1".to_string(), builders::net("GND", 1)),
+            ("2".to_string(), builders::net("AGND", 2)),
+        ]);
+        let preserved = PreservedState::derive(&before, &after, &old_nets);
+        assert!(preserved.rotation, "270° matches -90°");
+        assert!(
+            preserved.instance_overrides,
+            "default inherited overrides match None"
+        );
+        assert!(preserved.pad_nets);
+
+        // Duplicate pad "1": one loses its net while a second keeps it — test
+        // both orders so neither a first-wins nor a last-wins check masks it.
+        let mut pad1_without_net = decoded_pads(&after)
+            .into_iter()
+            .find(|pad| pad.number == "1")
+            .unwrap();
+        pad1_without_net.net = None;
+        let packed_netless = builders::pack_any(&pad1_without_net, "kiapi.board.types.Pad");
+
+        let mut dup_first = after.clone();
+        dup_first
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .insert(0, packed_netless.clone());
+        assert!(
+            !PreservedState::derive(&before, &dup_first, &old_nets).pad_nets,
+            "dropping net on the first of two pads sharing a number must fail pad_nets"
+        );
+
+        let mut dup_last = after.clone();
+        dup_last
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(packed_netless);
+        assert!(
+            !PreservedState::derive(&before, &dup_last, &old_nets).pad_nets,
+            "dropping net on the last of two pads sharing a number must fail pad_nets"
+        );
+    }
+
+    /// Pre-10.0.6 fallback: even when the reported KiCad version is `< 10.0.6`,
+    /// if the pre-update footprint already carried child `parent` KIIDs, a
+    /// readback that drops them (`parent: None`) returns
+    /// `mutation_outcome_uncertain`.
+    #[tokio::test]
+    async fn served_apply_on_pre_10_0_6_requires_child_parents_when_before_had_them() {
+        let (_temp, board) = issue_85_project();
+        let before_nt1 = builders::pack_any(
+            &decode_captured_footprint(ISSUE_85_BEFORE_NT1),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let mock = spawn_planner_mock_with_readback(
+            &board,
+            vec![before_nt1],
+            false,
+            true,
+            (10, 0, 5),
+            false, // echo request verbatim (rebuilt children have parent: None)
+            None,
+        );
+        let handler = served(mock.kicad.address()).await;
+        let plan = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(plan["status"], "ready", "{plan}");
+
+        let applied = served_call(
+            &handler,
+            serde_json::json!({
+                "board": board,
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }),
+        )
+        .await;
+        let body = result_json(&applied);
+        assert!(applied.is_error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("unexpected child parent KIIDs"),
+            "{body}"
+        );
     }
 }
 
