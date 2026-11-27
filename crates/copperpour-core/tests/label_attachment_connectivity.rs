@@ -21,6 +21,12 @@ const ONE_UNIT: &str =
     include_str!("fixtures/label_attachment_kicad10/one-unit/opamp_stage.kicad_sch");
 const TWO_UNITS: &str =
     include_str!("fixtures/label_attachment_kicad10/two-units/opamp_stage.kicad_sch");
+const DIAGONAL_OFFSET: &str =
+    include_str!("fixtures/label_attachment_kicad10/diagonal-offset/opamp_stage.kicad_sch");
+const DIAGONAL_TWO: &str =
+    include_str!("fixtures/label_attachment_kicad10/diagonal-two/opamp_stage.kicad_sch");
+const DIAGONAL_PASSING_PIN: &str =
+    include_str!("fixtures/label_attachment_kicad10/diagonal-passing-pin/opamp_stage.kicad_sch");
 const PROJECT: &str =
     include_str!("fixtures/block_placement_kicad10/opamp_stage/opamp_stage.kicad_pro");
 const POWER_ROUNDED: &str =
@@ -642,4 +648,37 @@ async fn wire_runs_use_electrical_names_without_cutting_at_off_wire_labels() {
             assert_eq!(run["net"], name, "{run}");
         }
     }
+}
+
+#[tokio::test]
+async fn a_diagonal_label_must_hit_the_saved_segment() {
+    assert_membership(DIAGONAL_OFFSET, true).await;
+    assert_membership(DIAGONAL_TWO, false).await;
+}
+#[tokio::test]
+async fn an_exact_junction_attaches_to_an_unsplit_diagonal() {
+    let handler = handler().await;
+    let sheet = Sheet::new(SHALLOW_WIRE);
+    let trace = call(
+        &handler,
+        &sheet,
+        "trace_from_point",
+        json!({"x": 162.56, "y": 88.9002}),
+    )
+    .await;
+    assert_eq!(
+        trace["junctions_here"],
+        json!([{"x": 162.56, "y": 88.9002}])
+    );
+    assert_eq!(trace["net"], "TOLERANT_OUT", "{trace}");
+}
+
+#[tokio::test]
+async fn a_lone_passing_diagonal_does_not_authorize_a_route_into_a_pin_label() {
+    let body = route_refusal(DIAGONAL_PASSING_PIN, [20.32, 30.48], [33.02, 30.48]).await;
+    assert_eq!(
+        body["error"]["reasons"],
+        json!(["the straight route would join J2 pin 1 and label A at (30.48, 30.48) on net A"]),
+        "{body}"
+    );
 }

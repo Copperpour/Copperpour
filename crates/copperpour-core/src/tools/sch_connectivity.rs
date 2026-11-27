@@ -262,10 +262,32 @@ fn on_saved_segment(p: NetRoot, a: NetRoot, b: NetRoot) -> bool {
 }
 
 /// A label can meet an endpoint or a segment interior with one IU of
-/// rounding allowance. The index supplies only horizontal and vertical wires.
+/// rounding allowance. KiCad's segment hit first bounds the point in both
+/// axes, then applies the rounded squared-distance check on diagonals.
 fn label_hits_segment(p: NetRoot, a: NetRoot, b: NetRoot) -> bool {
     let axis_distance = |p: i64, a: i64, b: i64| p.abs_diff(p.clamp(a.min(b), a.max(b)));
-    axis_distance(p.0, a.0, b.0) <= 1 && axis_distance(p.1, a.1, b.1) <= 1
+    if axis_distance(p.0, a.0, b.0) > 1 || axis_distance(p.1, a.1, b.1) > 1 {
+        return false;
+    }
+    if a.0 == b.0 || a.1 == b.1 {
+        return true;
+    }
+    let (dx, dy) = (i128::from(b.0 - a.0), i128::from(b.1 - a.1));
+    let (px, py) = (i128::from(p.0 - a.0), i128::from(p.1 - a.1));
+    let length_squared = dx * dx + dy * dy;
+    let dot = dx * px + dy * py;
+    match dot.clamp(0, length_squared) {
+        // The closest point is an endpoint. This also covers zero-length wires.
+        0 => px * px + py * py < 4,
+        t if t == length_squared => (px - dx).pow(2) + (py - dy).pow(2) < 4,
+        _ => {
+            // Keep KiCad's evaluation order in SEG::SquaredDistance. Near the
+            // cutoff, the cross-product formula need not round to the same hit.
+            let dot = dot as f64;
+            let distance = (px * px + py * py) as f64 - dot * dot / length_squared as f64;
+            distance.round() < 4.0
+        }
+    }
 }
 
 pub(super) fn saved_label_touches_wire(label: &Label, wire: &Wire) -> bool {
@@ -282,11 +304,13 @@ pub(super) fn saved_label_touches_wire(label: &Label, wire: &Wire) -> bool {
     }
 }
 
-/// Axis-aligned wires indexed by their exact integer row or column.
+/// Axis-aligned wires use exact integer row/column keys. The small list of
+/// diagonal wires is also checked, including near-axis routes.
 #[derive(Default)]
 struct SavedWireIndex {
     rows: HashMap<i64, Vec<[NetRoot; 2]>>,
     columns: HashMap<i64, Vec<[NetRoot; 2]>>,
+    diagonals: Vec<[NetRoot; 2]>,
 }
 
 impl SavedWireIndex {
@@ -298,19 +322,23 @@ impl SavedWireIndex {
                 index.columns.entry(a.0).or_default().push([a, b]);
             } else if a.1 == b.1 {
                 index.rows.entry(a.1).or_default().push([a, b]);
+            } else {
+                index.diagonals.push([a, b]);
             }
         }
         index
     }
 
     fn candidates(&self, p: NetRoot, radius: i64) -> impl Iterator<Item = &[NetRoot; 2]> {
-        (-radius..=radius).flat_map(move |step| {
-            self.columns
-                .get(&(p.0 + step))
-                .into_iter()
-                .chain(self.rows.get(&(p.1 + step)))
-                .flatten()
-        })
+        (-radius..=radius)
+            .flat_map(move |step| {
+                self.columns
+                    .get(&(p.0 + step))
+                    .into_iter()
+                    .chain(self.rows.get(&(p.1 + step)))
+                    .flatten()
+            })
+            .chain(&self.diagonals)
     }
 }
 
@@ -711,25 +739,52 @@ fn saved_drawn_graph(
     allow_label_roundoff: bool,
 ) -> NetGraph {
     let index = SavedWireIndex::new(wires);
+    let occupied = OnceCell::new();
     seed_drawn_graph_with(tree, wires, labels, schematic_point, |graph, x, y, kind| {
         let point = schematic_point(x, y);
-        let roundoff = allow_label_roundoff
-            && matches!(
-                kind,
-                Some(LabelKind::NetLabel | LabelKind::GlobalLabel | LabelKind::HierarchicalLabel)
-            );
-        if roundoff {
-            for &[a, b] in index.candidates(point, 1) {
-                if label_hits_segment(point, a, b) {
-                    graph.union(point, a);
+        let is_label = matches!(
+            kind,
+            Some(LabelKind::NetLabel | LabelKind::GlobalLabel | LabelKind::HierarchicalLabel)
+        );
+        let roundoff = allow_label_roundoff && is_label;
+        let mut hits = index
+            .candidates(point, i64::from(roundoff))
+            .filter(|&&[a, b]| {
+                if roundoff {
+                    label_hits_segment(point, a, b)
+                } else {
+                    on_saved_segment(point, a, b)
                 }
-            }
-        } else {
-            for &[a, b] in index.candidates(point, 0) {
-                if on_saved_segment(point, a, b) {
-                    graph.union(point, a);
-                }
-            }
+            });
+        let Some(&[a, b]) = hits.next() else { return };
+        let second = hits.next();
+        // Adding diagonals must not create a false baseline join at a pin or
+        // no-connect on a lone passing line. Leave existing orthogonal
+        // attachment unchanged here; #952 covers that case.
+        if is_label
+            && a.0 != b.0
+            && a.1 != b.1
+            && second.is_none()
+            && occupied
+                .get_or_init(|| {
+                    super::drawn_symbol_pin_inventory(tree)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|(_, pins)| {
+                            pins.into_iter()
+                                .map(|(pin, t)| schematic_pin_endpoint(&pin, t))
+                        })
+                        .chain(extract_no_connects(tree))
+                        .map(|(x, y)| schematic_point(x, y))
+                        .collect::<HashSet<_>>()
+                })
+                .contains(&point)
+        {
+            return;
+        }
+        graph.union(point, a);
+        for &[a, _] in second.into_iter().chain(hits) {
+            graph.union(point, a);
         }
     })
 }
@@ -1716,6 +1771,33 @@ mod agreement_tests {
             assert!(super::label_hits_segment(near, a, b));
             assert!(!super::label_hits_segment(beyond, a, b));
         }
+    }
+
+    #[test]
+    fn a_diagonal_hit_rounds_squared_distance_before_comparing() {
+        // (10, 2) is about 3.61 IU² from the segment: it rounds to 4.
+        assert!(!super::label_hits_segment((10, 2), (0, 0), (1000, 10)));
+    }
+
+    #[test]
+    fn a_junction_one_saved_unit_off_a_diagonal_is_not_attached() {
+        use super::net_graph_for;
+        use copperpour_sexp::{
+            parse_sexp,
+            schematic::{extract_labels, extract_wires},
+            SexpNode,
+        };
+
+        let mut tree = parse_sexp(include_str!(
+            "../../tests/fixtures/label_attachment_kicad10/shallow-wire-route/opamp_stage.kicad_sch"
+        ))
+        .unwrap();
+        let SexpNode::List(items) = &mut tree else {
+            panic!("expected a schematic tree");
+        };
+        items.push(parse_sexp("(junction (at 162.56 88.9003))").unwrap());
+        let mut graph = net_graph_for(&tree, &extract_wires(&tree), &extract_labels(&tree));
+        assert_ne!(graph.root_at(162.56, 88.9003), graph.root_at(190.5, 88.9));
     }
 
     #[test]
