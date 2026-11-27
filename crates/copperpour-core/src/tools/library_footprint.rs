@@ -103,6 +103,12 @@ pub(crate) fn carries_kicad_10_0_7_fields(version: &copperpour_ipc::IpcKiCadVers
     (version.major, version.minor, version.patch) >= (10, 0, 7)
 }
 
+/// Whether `version`'s API populates read-only `parent` KIIDs on footprints
+/// and their children (`board_types.proto`: `Since: 10.0.6`).
+pub(crate) fn carries_parent_fields(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (version.major, version.minor, version.patch) >= (10, 0, 6)
+}
+
 /// Whether `version`'s API keeps a footprint's net-tie pad groups. Every
 /// KiCad 10 release sends a group as its pad numbers, split at commas and
 /// whitespace (`FOOTPRINT::Serialize`), and joins them again when it takes a
