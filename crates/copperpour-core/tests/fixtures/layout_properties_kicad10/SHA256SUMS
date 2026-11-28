@@ -8,6 +8,8 @@ aefeabed527c681f5bb3c46786abdbb4e458695920013e48bfe91cc7ff135006  ./area-dnp/spa
 326c2b5d5dab01c5317a176b93767953d812285b9cd45f85e7e1e645f4a0df36  ./base/sparse.kicad_sch
 46823f1c871cce5ce82611a4397bb29d9f3e4da22d4e804934aaa600c15504a6  ./before-sim/sparse.kicad_pro
 23be26cca8367f24436becd47a3c1a643b1bf730dfe9f6dd4eb794a003a5b502  ./before-sim/sparse.kicad_sch
+d9e2159ddb4e72ff2abc7fd62cf0072c98fe00b27b74d731d0ed1c5199dddc73  ./net-name/after/sparse.kicad_sch
+0b2c6422cc7ee81669d531b818aecdea00e0a6c1669f025b82213d59fdcc2a66  ./net-name/before/sparse.kicad_sch
 f0705c8cb3947c533aec77b4281c6cab64e07050b167e59205df352630904bbf  ./parent-dnp/bank.kicad_sch
 6cfac5cb27d34ebf6de43675b4368d5d4fdb30a800286c4ebc5e8d7768a1517e  ./parent-dnp/cell.kicad_sch
 b580202be02ccd79603cbc72d5f130f04d507f5f816f1af64e6fbefc18332d71  ./parent-dnp/nested_pages.kicad_pro

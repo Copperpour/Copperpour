@@ -67,8 +67,8 @@ pub(super) fn compare_tool_def() -> ToolDef {
          fields, units, and pins. Embedded Description, ki_keywords, and ki_fp_filters \
          are not compared (https://github.com/Copperpour/Copperpour/issues/938). \
          Refuse different schematic format versions when symbols are retained. \
-         Compare saved rule-area flags and Component Classes. Refuse changes that could \
-         affect unresolved area effects, Netclass assignments, or exported text expressions. \
+         Compare saved rule-area flags, Component Classes, and inputs to exported text \
+         expressions. Refuse changes that could affect unresolved exports or Netclass assignments. \
          Use verdict for decisions; reasons are human-readable diagnostics. \
          No writes, editor access, or ERC.",
         json!({ "type": "object",

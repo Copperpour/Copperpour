@@ -17,6 +17,8 @@ struct Directive<'a> {
     name: &'a str,
     attached: Option<bool>,
     uncertain_anchor: Option<&'a SexpNode>,
+    // A literal class does not depend on other directive fields.
+    expression_owner: Option<&'a SexpNode>,
 }
 
 struct Inputs<'a> {
@@ -54,6 +56,7 @@ impl<'a> Inputs<'a> {
                             name,
                             attached,
                             uncertain_anchor: attached.is_none().then_some(directive),
+                            expression_owner: opaque_expression(name).then_some(directive),
                         })
                     })
                     .collect();
@@ -265,12 +268,13 @@ fn competing_variant_names(path: Option<&SexpNode>) -> bool {
         .any(|variant| variant.find_all("name").len() > 1)
 }
 
-fn compare_view(
-    (old, old_inputs, (before, was_path, was)): (&Source<'_>, &Inputs<'_>, View<'_>),
-    (new, new_inputs, (after, now_path, now)): (&Source<'_>, &Inputs<'_>, View<'_>),
+fn compare_view<'a>(
+    (old, old_inputs, (before, was_path, was)): (&Source<'a>, &Inputs<'a>, View<'a>),
+    (new, new_inputs, (after, now_path, now)): (&Source<'a>, &Inputs<'a>, View<'a>),
     same_areas: bool,
     who: &str,
     reasons: &mut Vec<String>,
+    expressions: &expressions::Comparison<'a>,
 ) {
     // The headless loader populates area membership before selecting the
     // export variant. Use the loaded field geometry, then apply variant flags.
@@ -292,11 +296,23 @@ fn compare_view(
         &now_geometry,
         view_reference(after, new.tree, now_path),
     );
-    let same_inputs = same_areas
+    let same_placement_inputs = same_areas
         && before == after
         && was_path == now_path
         && old.version == new.version
         && was_fields == now_fields;
+    let expression_changed = |text| expressions.affects([before, after], [None; 2], text);
+    // When text prevents a bound, an unchanged placement record is not
+    // proof of unchanged reachability: a different symbol can supply text.
+    let same_inputs = same_placement_inputs
+        && (!was_effects
+            .flags
+            .values()
+            .chain(now_effects.flags.values())
+            .chain(was_effects.classes.values())
+            .chain(now_effects.classes.values())
+            .any(|effect| matches!(effect, Effect::Unknown(source) if *source != "direct field"))
+            || !ordered_fields(before).any(|(_, value, _)| expression_changed(value)));
     let emit = |reasons: &mut Vec<String>, detail: String| {
         let reason = format!("{who} {detail}");
         if !reasons.contains(&reason) {
@@ -341,10 +357,36 @@ fn compare_view(
                 Effect::Known(source) if was.is_some() != now.is_some() => {
                     sources.insert(*source);
                 }
-                Effect::Unknown(source) if !same_inputs || opaque_expression(name) => {
+                Effect::Unknown(source) if !same_inputs => {
                     unknown = Some(*source);
                 }
                 _ => {}
+            }
+        }
+    }
+    for name in was_effects
+        .classes
+        .keys()
+        .copied()
+        .filter(|name| opaque_expression(name))
+    {
+        if !now_effects.classes.contains_key(name) {
+            unknown = Some("saved class text");
+        } else if was_effects.classes[name] == Effect::Unknown("direct field")
+            && expressions.affects([before, after], [was, now], name)
+        {
+            unknown = Some("direct field");
+        }
+    }
+    for area in &old_inputs.areas {
+        for directive in &area.classes {
+            let Some(owner) = directive.expression_owner else {
+                continue;
+            };
+            if was_effects.classes.contains_key(directive.name)
+                && expressions.affects([owner, owner], [None; 2], directive.name)
+            {
+                emit(reasons, "cannot establish unchanged Component Class or rule-area effects: directive expression inputs changed".into());
             }
         }
     }
@@ -374,7 +416,12 @@ fn compare_view(
     }
 }
 
-pub(super) fn changes(old: &Source<'_>, new: &Source<'_>, reasons: &mut Vec<String>) {
+pub(super) fn changes<'a>(
+    old: &Source<'a>,
+    new: &Source<'a>,
+    expressions: &expressions::Comparison<'a>,
+    reasons: &mut Vec<String>,
+) {
     let (was, now) = (Inputs::read(old), Inputs::read(new));
     if let Some(area) = area_netclass_input(old, &was).or_else(|| area_netclass_input(new, &now)) {
         reasons.push(format!(
@@ -407,6 +454,7 @@ pub(super) fn changes(old: &Source<'_>, new: &Source<'_>, reasons: &mut Vec<Stri
             same_areas,
             &who,
             reasons,
+            expressions,
         );
         let (was_paths, now_paths) = (instances(before), instances(after));
         for key @ (project, path) in keys(&was_paths, &now_paths) {
@@ -418,6 +466,7 @@ pub(super) fn changes(old: &Source<'_>, new: &Source<'_>, reasons: &mut Vec<Stri
                 same_areas,
                 &context,
                 reasons,
+                expressions,
             );
             if (!was.areas.is_empty() || !now.areas.is_empty())
                 && (!same_areas || before != after)
@@ -436,10 +485,39 @@ pub(super) fn changes(old: &Source<'_>, new: &Source<'_>, reasons: &mut Vec<Stri
                     same_areas,
                     &format!("{context}, variant {name:?}"),
                     reasons,
+                    expressions,
                 );
             }
         }
     }
+}
+
+pub(super) fn same_sheet_flag(token: &str, pair: [(&SexpNode, &SexpNode); 2]) -> bool {
+    let (name, default) = match token {
+        "DNP" => ("dnp", false),
+        "EXCLUDE_FROM_BOM" => ("in_bom", true),
+        "EXCLUDE_FROM_BOARD" => ("on_board", true),
+        _ => ("exclude_from_sim", false),
+    };
+    let [(before, old), (after, new)] = pair;
+    let applicable = |(sheet, tree): (&SexpNode, &SexpNode)| {
+        let bounds = sheet_box(sheet);
+        tree.find_all("rule_area")
+            .into_iter()
+            .filter(|area| {
+                record_values(area, name)
+                    .last()
+                    .is_some_and(|value| (value == "yes") != default)
+            })
+            .map(|area| bounds.classify(&RuleArea::from_node(area)))
+            .collect::<Vec<_>>()
+    };
+    let [was, now] = pair.map(applicable);
+    record_values(before, name).eq(record_values(after, name))
+        && (was == now && !was.contains(&None)
+            || (before == after
+                && !ordered_fields(before).any(|(_, value, _)| opaque_expression(value))
+                && old.find_all("rule_area") == new.find_all("rule_area")))
 }
 
 fn area_netclass_input<'a>(source: &Source<'a>, inputs: &Inputs<'a>) -> Option<&'a str> {

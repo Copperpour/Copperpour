@@ -33,8 +33,14 @@ The comparison uses saved rule-area outlines and placement bounds to compare
 effective export flags and Component Classes. If it cannot prove a placement's
 membership, it refuses the change. It also refuses edits when an attached
 directive may assign a Netclass, since the comparison cannot prove those
-assignments are unchanged. It still refuses saved edits that could affect
-exported text expressions without evaluating their expansion.
+assignments are unchanged.
+For exported text, the comparison checks saved field, title, page and
+same-sheet cross-reference inputs. It checks pin inputs without resolving the
+exact pin name or alternate, and refuses a `NET_CLASS` expression if saved
+connection inputs differ. A field move can pass with an expression whose
+inputs stay equal. If expression equality cannot be proved, the comparison
+refuses edits to possible saved inputs. It does not establish the value of
+project variables or expressions in other sheets.
 
 For each retained symbol, the comparison checks `lib_name`, the embedded
 definition's jumper flag and groups, included library fields, and unit or
