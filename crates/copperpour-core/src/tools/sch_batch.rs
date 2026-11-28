@@ -5,6 +5,7 @@
 //! This fixes the Python bug where `batch_connect_to_net` did N separate
 //! read/write cycles.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
@@ -13,7 +14,7 @@ use crate::tools::{
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
-    geometry::{points_coincident, round6, snap_point},
+    geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
@@ -26,7 +27,7 @@ use copperpour_sexp::{
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
+use super::sch_connectivity::{schematic_point, ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
@@ -38,8 +39,8 @@ use super::sch_components::{
     ComponentDeleteTargetError, ComponentMutationIntent,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, clear_stub_direction, contact_instance_paths,
-    route_between_pins, route_blocked, PinRoute,
+    add_stub_label, add_stub_wire, check_net_label_pin, clear_stub_direction,
+    contact_instance_paths, route_between_pins, route_blocked, PinRoute,
 };
 use super::PlacedPins;
 
@@ -53,6 +54,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect multiple component pins to a named net. By default it adds a net label \
              at each pin endpoint with no wire. Pass stub_length, direction and label_type \
              for connect_to_net's placement, applied to every pin in the call. \
+             Skips and reports a pin if KiCad would read the wire or label anchor away \
+             from its tip. Labels and wires are deduplicated at their saved positions. \
              Single file read → all edits → single file write. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
@@ -567,18 +570,32 @@ pub(crate) async fn handle_batch_connect_to_net(
     } else {
         Vec::new()
     };
-    // Every pin the call names joins the net, so a stub may end on another (#117).
-    let requested: Vec<(f64, f64)> = pins
+    let mut blocked_anchors = Vec::new();
+    let placements: Vec<_> = pins
+        .iter()
+        .map(|spec| {
+            let reference = spec["reference"]
+                .as_str()
+                .ok_or("Missing 'reference' in pin spec")?;
+            let pin_number = spec["pin_number"]
+                .as_str()
+                .ok_or("Missing 'pin_number' in pin spec")?;
+            let pin = placed_pins
+                .resolve(reference, pin_number)
+                .map_err(|refusal| refusal.describe())?;
+            if let Err(reason) = check_net_label_pin(reference, &pin) {
+                blocked_anchors.push(reason.clone());
+                return Err(reason);
+            }
+            Ok::<_, String>((reference, pin_number, pin))
+        })
+        .collect();
+    // A stub may end on another requested pin (#117), but not on an anchor
+    // that was refused and will not receive a label.
+    let requested: Vec<(f64, f64)> = placements
         .iter()
         .filter(|_| stub_length > 0.0)
-        .filter_map(|spec| {
-            let reference = spec["reference"].as_str()?;
-            let pin_number = spec["pin_number"].as_str()?;
-            placed_pins
-                .resolve(reference, pin_number)
-                .ok()
-                .map(|pin| pin.endpoint())
-        })
+        .filter_map(|placement| placement.as_ref().ok().map(|(_, _, pin)| pin.endpoint()))
         .collect();
     let mut is_changed = false;
 
@@ -587,32 +604,17 @@ pub(crate) async fn handle_batch_connect_to_net(
     let mut errors: Vec<String> = Vec::new();
     // Label positions already carrying this net, so a second never lands on
     // the first. Seeded from the file, extended as we go.
-    let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
+    let mut labelled: HashSet<_> = extract_labels(&tree)
         .iter()
         .filter(|l| l.net == net_name)
-        .map(|l| (l.x, l.y))
+        .map(|l| schematic_point(l.x, l.y))
         .collect();
 
-    for pin_spec in &pins {
-        let reference = match pin_spec["reference"].as_str() {
-            Some(r) => r,
-            None => {
-                errors.push("Missing 'reference' in pin spec".into());
-                continue;
-            }
-        };
-        let pin_number = match pin_spec["pin_number"].as_str() {
-            Some(p) => p,
-            None => {
-                errors.push("Missing 'pin_number' in pin spec".into());
-                continue;
-            }
-        };
-
-        let pin = match placed_pins.resolve(reference, pin_number) {
-            Ok(pin) => pin,
-            Err(refusal) => {
-                errors.push(refusal.describe());
+    for placement in placements {
+        let (reference, pin_number, pin) = match placement {
+            Ok(placement) => placement,
+            Err(reason) => {
+                errors.push(reason);
                 continue;
             }
         };
@@ -650,9 +652,8 @@ pub(crate) async fn handle_batch_connect_to_net(
         // Symbols stack several pins on one endpoint; a label each renders as
         // a smear. They stay connected by that endpoint. Two stubs can also
         // end on one spot, so the label is judged apart from this pin's wire.
-        let needs_label = !labelled
-            .iter()
-            .any(|(x, y)| points_coincident(*x, *y, lx, ly, 0.01));
+        // A nearby legacy label might not touch this pin or stub.
+        let needs_label = labelled.insert(schematic_point(round6(lx), round6(ly)));
         let needs_wire = match sch.as_ref() {
             Some(sch) if stub_length > 0.0 => !has_wire(sch, (px, py), (lx, ly)),
             _ => false,
@@ -668,7 +669,6 @@ pub(crate) async fn handle_batch_connect_to_net(
             } else {
                 inserts.push_str(&format_net_label(&net_name, lx, ly, rotation));
             }
-            labelled.push((lx, ly));
         }
         let duplicate = !needs_wire && !needs_label;
         is_changed |= !duplicate;
@@ -718,15 +718,24 @@ pub(crate) async fn handle_batch_connect_to_net(
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
     }
-    let mut result = CallToolResult::json(&body);
     // As batch_connect_pins: a call that connected nothing failed (#117).
-    result.is_error = added.is_empty() && !errors.is_empty();
+    let is_error = added.is_empty() && !errors.is_empty();
+    if is_error && !blocked_anchors.is_empty() {
+        body["message"] = json!("batch_connect_to_net did not place a label");
+        body["error"] = json!(ToolErrorKind::PlanBlocked {
+            operation: "batch_connect_to_net".into(),
+            reasons: blocked_anchors,
+        });
+    }
+    let mut result = CallToolResult::json(&body);
+    result.is_error = is_error;
     Ok(result)
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
 fn has_wire(sch: &cse::Schematic, a: (f64, f64), b: (f64, f64)) -> bool {
-    let at = |p: (f64, f64), q: (f64, f64)| points_coincident(p.0, p.1, q.0, q.1, 0.01);
+    let point = |(x, y)| schematic_point(round6(x), round6(y));
+    let at = |p, q| point(p) == point(q);
     sch.wires
         .iter()
         .any(|w| (at(w.start, a) && at(w.end, b)) || (at(w.start, b) && at(w.end, a)))
@@ -5398,7 +5407,9 @@ mod batch_connect_options_tests {
                 assert!(
                     labels
                         .iter()
-                        .any(|l| points_coincident(l.x, l.y, x, y, 1e-6) && l.rotation == rot),
+                        .any(|l| copperpour_sexp::geometry::points_coincident(
+                            l.x, l.y, x, y, 1e-6
+                        ) && l.rotation == rot),
                     "{options}: no label at ({x}, {y}) rot {rot}"
                 );
             }
