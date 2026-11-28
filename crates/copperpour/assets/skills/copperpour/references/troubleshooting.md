@@ -130,9 +130,16 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
 
 1. If the client supports dynamic tool discovery, call `list_toolboxes` and
    `load_toolset` for the needed toolset.
-2. Check `get_recent_calls` to see whether calls reached the server. Remember
+2. If the loaded tools stay unknown to the client, find the tool's name with
+   `find_tools` and run it with `call_tool`. This works in the same session,
+   because `eager_toolsets` only helps after a restart. By default `call_tool`
+   runs only read-only tools: a write tool needs to be in the client's own tool
+   list, or the operator has to set `call_tool_allow_writes`. For which clients
+   see a loaded toolset, see "Which clients see a loaded toolset" in
+   `docs/TROUBLESHOOTING.md` rather than guessing from the steps here.
+3. Check `get_recent_calls` to see whether calls reached the server. Remember
    that absence from `get_recent_calls` does not prove a specific client failure.
-3. Suggest client-specific configuration only when the client is known (for
+4. Suggest client-specific configuration only when the client is known (for
    example from `initialize` `clientInfo` or user context). Setting
    `eager_toolsets: true` helps clients that cache the initial `tools/list`,
    but it is not a universal fix for clients with hard tool-count limits.
