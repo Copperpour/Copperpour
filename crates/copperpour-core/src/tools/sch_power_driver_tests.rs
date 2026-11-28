@@ -669,6 +669,36 @@ fn an_inactive_power_pin_and_a_hidden_passive_alternate_cannot_supply_a_name() {
 }
 
 #[tokio::test]
+async fn connect_pins_reports_only_effective_drivers_on_a_foreign_rail() {
+    let handler = handler().await;
+    let sheet = Witness::from_fixture(Path::new("decoupling_pin_types_kicad10.kicad_sch"));
+    let before = sheet.files();
+    let (error, body) = sheet
+        .call(
+            &handler,
+            "connect_pins",
+            json!({"ref1": "U2", "pin1": "1", "ref2": "U1", "pin2": "8"}),
+        )
+        .await;
+    assert!(error, "{body}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+    let reasons = rows(&body["error"]["reasons"]);
+    assert_eq!(reasons.len(), 2, "{body}");
+    let vertical = reasons[1].as_str().unwrap();
+    assert!(
+        vertical.starts_with("the vertical-first route would join "),
+        "{body}"
+    );
+    // KiCad exports U2.4 on GND even though no power symbol or wire is
+    // drawn at that pin. The saved-pin route guard knows its net.
+    assert!(
+        vertical.contains("U2 pin 4 at (160.02, 55.88) on net GND"),
+        "{body}"
+    );
+    assert_eq!(sheet.files(), before);
+}
+
+#[tokio::test]
 async fn route_conflicts_report_the_primary_name_without_relaxing_the_guard() {
     let handler = handler().await;
     let pair = json!({"ref1": "R1", "pin1": "2", "ref2": "R2", "pin2": "1"});
