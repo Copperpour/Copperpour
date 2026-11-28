@@ -532,7 +532,9 @@ pub fn tools() -> Vec<ToolDef> {
             "replace_component",
             "Replace every placed unit of a component with a new library symbol while \
              preserving unit numbers. A unit override is accepted only for a single \
-             placement. The old embedded definition is removed after its last use on the \
+             placement. A replaced placement stops using its sheet-local alias. Repeated \
+             library IDs on a selected placement are refused before writing. \
+             The old embedded definition is removed after its last use on the \
              sheet, reported as removed_lib_symbol (null if nothing was removed). \
              New definitions use the schematic writer's nested layout. \
              Junction dots are re-judged once for the whole replacement, \

@@ -2,8 +2,8 @@
 
 use super::deletion::ComponentDeleteTargetError;
 use super::properties::{
-    closing_quote, dnp_property_refusal, escape_property_text, is_dnp_property,
-    is_reserved_property, set_property_value, PropertyWriteError,
+    dnp_property_refusal, escape_property_text, is_dnp_property, is_reserved_property,
+    set_property_value, PropertyWriteError,
 };
 use super::readback::{
     commit_verified_component_mutation, component_target_from_source, copy_component_observation,
@@ -25,7 +25,8 @@ use copperpour_sexp::{
     parse_sexp,
     schematic::{extract_symbol_instances, read_schematic},
     writer::{
-        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
+        apply_edits, direct_children_with_tag, find_balanced_block, find_block_starts,
+        find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
     },
     SchematicCommand,
 };
@@ -685,49 +686,50 @@ pub(super) async fn handle_replace_component(
         ));
     }
 
-    // Replace the library id in every unit block. Shared component identity
-    // must not leave one unit pointing at the old symbol (#182).
-    let lib_id_pat = "(lib_id \"";
-    let escaped_lib_id = escape_property_text(&new_lib_id);
+    // Replace the library ID in every selected unit (#182). KiCad uses
+    // lib_name instead of lib_id when a placement has a sheet-local alias.
+    let lib_id_field = format!("(lib_id \"{}\")", escape_property_text(&new_lib_id));
     let mut edits = Vec::new();
     let mut old_lib_ids = Vec::new();
     for (start, end) in &blocks {
         let block = &content[*start..*end];
-        let Some(relative) = block.find(lib_id_pat) else {
+        let lib_id_fields = direct_children_with_tag(block, "symbol", "lib_id");
+        let &[(id_start, id_end)] = lib_id_fields.as_slice() else {
             return Ok(malformed_schematic_error(
                 &sch_path,
-                format!("A unit of '{}' has no lib_id", reference),
+                format!("A unit of '{reference}' must have exactly one lib_id"),
             ));
         };
-        let value_start = *start + relative + lib_id_pat.len();
-        let Some(value_end) = closing_quote(&content, value_start) else {
+        let field = parse_sexp(&block[id_start..id_end])?;
+        let Some(copperpour_sexp::SexpNode::Str(old_id)) = field.get(1) else {
             return Ok(malformed_schematic_error(&sch_path, "Malformed lib_id"));
         };
-        old_lib_ids.push(content[value_start..value_end].to_string());
+        old_lib_ids.push(old_id.clone());
         edits.push(SexpEdit::replace(
-            value_start,
-            value_end,
-            escaped_lib_id.clone(),
+            start + id_start,
+            start + id_end,
+            lib_id_field.clone(),
         ));
+        for (field_start, field_end) in direct_children_with_tag(block, "symbol", "lib_name") {
+            let field_start = block[..field_start].trim_end().len();
+            edits.push(SexpEdit::delete(start + field_start, start + field_end));
+        }
     }
 
-    // Add the optional unit edits without a second source read. The multi-unit
-    // guard above means this scan has at most one block.
+    // Update the placement and its instance records, not quoted text that
+    // looks like a unit field (which may be part of a lib_name edit).
     if let Some(unit) = new_unit {
         let (start, end) = blocks[0];
         let block = &content[start..end];
-        let mut from = 0usize;
-        while let Some(relative) = block[from..].find("(unit ") {
-            let number_start = from + relative + "(unit ".len();
-            let Some(close) = block[number_start..].find(')') else {
-                break;
-            };
+        for (field_start, field_end) in find_block_starts(block, "unit")
+            .into_iter()
+            .filter_map(|offset| find_balanced_block(block, offset))
+        {
             edits.push(SexpEdit::replace(
-                start + number_start,
-                start + number_start + close,
-                unit.to_string(),
+                start + field_start,
+                start + field_end,
+                format!("(unit {unit})"),
             ));
-            from = number_start + close;
         }
     }
 
@@ -744,6 +746,9 @@ pub(super) async fn handle_replace_component(
         ));
     }
     let old_lib_id = old_lib_ids.remove(0);
+    let (start, end) = blocks[0];
+    let former_placement = parse_sexp(&content[start..end])?;
+    let old_key = placed_symbol_key(&former_placement);
     content = apply_edits(content, edits);
 
     // Ensure the new library symbol definition is present. Bail BEFORE writing:
@@ -754,20 +759,19 @@ pub(super) async fn handle_replace_component(
     }
 
     let after_tree = parse_sexp(&content)?;
-    let old_key = embedded_definition_key(&target.units[0].lib_id);
     // A repeated cache section makes it ambiguous which saved block is the
     // effective definition. Keep those blocks intact.
-    let removed_lib_symbol = if old_key != embedded_definition_key(&new_lib_id)
-        && after_tree.find_all("lib_symbols").len() == 1
-        && !after_tree
-            .find_all("symbol")
-            .iter()
-            .any(|symbol| placed_symbol_key(symbol).as_deref() == Some(old_key.as_ref()))
-    {
-        remove_embedded_lib_symbol(&mut content, &old_key)
-    } else {
-        None
-    };
+    let removed_lib_symbol = old_key
+        .as_deref()
+        .filter(|&key| {
+            key != embedded_definition_key(&new_lib_id).as_ref()
+                && after_tree.find_all("lib_symbols").len() == 1
+                && !after_tree
+                    .find_all("symbol")
+                    .iter()
+                    .any(|symbol| placed_symbol_key(symbol).as_deref() == Some(key))
+        })
+        .and_then(|key| remove_embedded_lib_symbol(&mut content, key));
     // A replacement changes pin geometry while preserving only symbol UUID,
     // unit and pin number. Carry a marker through that narrower, explicitly
     // one-to-one identity before the junction pass sees the new endpoints;
