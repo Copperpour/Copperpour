@@ -23,6 +23,30 @@ fn is_freerouting_jar(path: &Path) -> bool {
             .is_some_and(|name| name.to_ascii_lowercase().contains("freerouting"))
 }
 
+/// How a Freerouting JAR ranks among others in the same directory: the
+/// dotted version in its file name (`freerouting-2.6.0.jar` is 2.6.0), a
+/// release above a pre-release of the same version (`-SNAPSHOT`, `-beta`), and
+/// a name without a version below every versioned one.
+fn freerouting_jar_rank(path: &Path) -> (Vec<u64>, bool) {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let Some(start) = stem.find(|c: char| c.is_ascii_digit()) else {
+        return (Vec::new(), false);
+    };
+    let rest = &stem[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let version = rest[..end]
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().unwrap_or(u64::MAX))
+        .collect();
+    (version, end == rest.len())
+}
+
 fn find_freerouting_jar_below(root: &Path, remaining_depth: usize) -> Option<PathBuf> {
     if is_freerouting_jar(root) {
         return Some(root.to_path_buf());
@@ -38,9 +62,17 @@ fn find_freerouting_jar_below(root: &Path, remaining_depth: usize) -> Option<Pat
         .collect::<Vec<_>>();
     entries.sort();
 
+    // Several JARs side by side (an upgrade dropped next to the old one) are
+    // ranked by the version in their file name, not by name order, which put
+    // 2.5.0 before 2.6.0 and would put 2.10.0 before 2.9.0.
     entries
         .iter()
-        .find(|path| is_freerouting_jar(path))
+        .filter(|path| is_freerouting_jar(path))
+        .max_by(|a, b| {
+            freerouting_jar_rank(a)
+                .cmp(&freerouting_jar_rank(b))
+                .then_with(|| b.cmp(a))
+        })
         .cloned()
         .or_else(|| {
             entries.into_iter().find_map(|path| {
@@ -185,7 +217,9 @@ pub(crate) fn freerouting_jar_path_description() -> String {
         .join("; ");
     format!(
         "Path to a Freerouting JAR (optional). When omitted, Copperpour searches, in order: \
-         {locations}. Relative paths are taken from the server's working directory. \
+         {locations}. When one directory holds several Freerouting JARs, the highest \
+         version in their file names is used. Relative paths are taken from the server's \
+         working directory. \
          There is no configuration setting for it."
     )
 }
@@ -2117,6 +2151,51 @@ mod freerouting_tests {
         )
         .await;
         assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+    }
+
+    #[test]
+    fn picks_the_highest_version_among_jars_in_one_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "freerouting-2.5.0.jar",
+            "freerouting-2.10.0-SNAPSHOT.jar",
+            "freerouting-2.6.0.jar",
+            "freerouting-2.10.0.jar",
+            "freerouting-executable.jar",
+        ] {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        assert_eq!(
+            find_freerouting_jar_below(temp.path(), 5),
+            Some(temp.path().join("freerouting-2.10.0.jar"))
+        );
+
+        std::fs::remove_file(temp.path().join("freerouting-2.10.0.jar")).unwrap();
+        assert_eq!(
+            find_freerouting_jar_below(temp.path(), 5),
+            Some(temp.path().join("freerouting-2.10.0-SNAPSHOT.jar"))
+        );
+    }
+
+    #[test]
+    fn prefers_a_versioned_jar_and_breaks_ties_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["freerouting.jar", "freerouting-2.5.0.jar"] {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        assert_eq!(
+            find_freerouting_jar_below(temp.path(), 5),
+            Some(temp.path().join("freerouting-2.5.0.jar"))
+        );
+
+        let unversioned = tempfile::tempdir().unwrap();
+        for name in ["freerouting-b.jar", "freerouting-a.jar"] {
+            std::fs::write(unversioned.path().join(name), b"fixture").unwrap();
+        }
+        assert_eq!(
+            find_freerouting_jar_below(unversioned.path(), 5),
+            Some(unversioned.path().join("freerouting-a.jar"))
+        );
     }
 
     #[test]
