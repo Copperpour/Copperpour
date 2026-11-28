@@ -253,9 +253,10 @@ pub(super) fn build_pcb(
             keepouts: dsn::Keepouts(
                 rule_areas
                     .iter()
-                    .flat_map(|area| {
-                        area.layers.iter().map(|layer| dsn::Keepout {
-                            kind: area.kind.dsn_kind(),
+                    .filter_map(|area| area.kind.dsn_kind().map(|kind| (area, kind)))
+                    .flat_map(|(area, kind)| {
+                        area.layers.iter().map(move |layer| dsn::Keepout {
+                            kind: kind.clone(),
                             id_: String::new(),
                             sequence_number: None,
                             shape: dsn::Shape::Polygon(dsn_closed_polygon(layer, &area.outline)),

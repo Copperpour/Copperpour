@@ -446,7 +446,7 @@ add_rule_area(board, layers, points? | rect?, name?,
 - Pass either `points` (`[{x, y}, ...]`) or `rect` (`{x1, y1, x2, y2}`), never both.
 - Defaults match KiCad: `keepout_tracks`, `keepout_vias`, and `keepout_pads` default to `true`; `keepout_copper_pours` and `keepout_footprints` default to `false` (for an antenna keepout, set `keepout_copper_pours: true`).
 - Live only: requires the board open in KiCad's PCB Editor; refills copper zones afterward and verifies readback.
-- **Freerouting profile:** `export_specctra_dsn` supports netless tracks/vias keep-outs on copper layers, with straight edges and whole-micrometre vertices (for example, `113.001` mm is supported; `113.0006` mm is refused). Pour/pad/footprint-only areas, enabled placement, cutouts, arc edges and footprint-contained zones remain unsupported. The export validates this profile before either the Rust or native writer runs.
+- **Freerouting profile:** `export_specctra_dsn` supports netless tracks/vias keep-outs on copper layers, with straight edges and whole-micrometre vertices (for example, `113.001` mm is supported; `113.0006` mm is refused). Pour/pad/footprint-only areas (tracks and vias allowed) are recorded in the manifest as `fill_only` and listed in `rule_areas_not_exported`, but not written to the DSN: refill and DRC enforce them after apply. Enabled placement, cutouts, arc edges and footprint-contained zones remain unsupported. The export validates this profile before either the Rust or native writer runs.
 
 ### refill_zones
 

@@ -20,7 +20,26 @@ impl RoutingSnapshot {
             String::new(),
             "KiCad-native board boundary; source revision bound, not flattened by the Rust writer",
         )?;
-        adopt_native_with_identity(baseline, identity, native_dsn)
+        // KiCad 10.0.8 and older write a fill-only rule area as a full keep-out,
+        // which would forbid routing inside it: remove it before correlation (#81).
+        let fill_only = self
+            .rule_areas
+            .iter()
+            .filter(|area| area.kind == RuleAreaKind::FillOnly)
+            .flat_map(|area| {
+                area.layers.iter().map(|layer| {
+                    (
+                        RuleAreaKind::Keepout,
+                        layer.clone(),
+                        closed_outline(&area.outline),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let (native_dsn, dropped) = drop_native_fill_only_keepouts(native_dsn, &fill_only)?;
+        let mut bundle = adopt_native_with_identity(baseline, identity, native_dsn)?;
+        bundle.native_keepouts_dropped = dropped;
+        Ok(bundle)
     }
 
     /// The same identities the existing native correlator checks, constructed
@@ -107,6 +126,7 @@ impl RoutingSnapshot {
         let mut keepouts = self
             .rule_areas
             .iter()
+            .filter(|area| area.kind != RuleAreaKind::FillOnly)
             .flat_map(|area| {
                 area.layers
                     .iter()
@@ -441,6 +461,113 @@ pub(super) fn normalize_courtyard_outline_polygons(source: &str) -> String {
     String::from_utf8(out).expect("UTF-8 input stays valid UTF-8")
 }
 
+/// The identity of one `structure` child that is a rule-area keep-out, or
+/// `None` for any other node, including a board cutout.
+fn dsn_keepout_identity(node: &SexpNode) -> Result<Option<DsnKeepoutIdentity>> {
+    let kind = match node.head() {
+        Some("keepout") => RuleAreaKind::Keepout,
+        Some("wire_keepout") => RuleAreaKind::WireKeepout,
+        Some("via_keepout") => RuleAreaKind::ViaKeepout,
+        Some(other @ ("place_keepout" | "bend_keepout" | "elongate_keepout")) => {
+            bail!("DSN contains unsupported keep-out kind '{other}'");
+        }
+        _ => return Ok(None),
+    };
+    let head = node.head().unwrap_or("keepout");
+    let _id = dsn_atom(node, 1, &format!("{head} id"))?;
+    let children = node.children().map_or(0, <[SexpNode]>::len);
+    let polygon = node
+        .get(2)
+        .filter(|polygon| polygon.head() == Some("polygon") && children == 3)
+        .with_context(|| format!("DSN {head} is not one polygon"))?;
+    // KiCad's native DSN exporter encodes internal board cutouts (`Edge.Cuts`
+    // holes/circles) as `(keepout "" (polygon signal 0 ...))` with flattened
+    // floating-point points rather than rule-area keep-outs on copper layers.
+    if kind == RuleAreaKind::Keepout && dsn_atom(polygon, 1, "polygon layer").ok() == Some("signal")
+    {
+        let _ = dsn_polygon(polygon)?;
+        return Ok(None);
+    }
+    let (layer, points) = dsn_integer_polygon(polygon, &format!("DSN {head}"))?;
+    Ok(Some((kind, layer, points)))
+}
+
+/// Byte spans of the direct children of the DSN `structure` node, in file order.
+fn dsn_structure_child_spans(source: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut spans = Vec::new();
+    // Each open list: its start offset and whether it is `structure`.
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !in_quotes && bytes[i..].starts_with(b"(string_quote \")") {
+            i += b"(string_quote \")".len();
+            continue;
+        }
+        match bytes[i] {
+            b'"' => in_quotes = !in_quotes,
+            b'(' if !in_quotes => {
+                let head_end = bytes[i + 1..]
+                    .iter()
+                    .position(|b| b.is_ascii_whitespace() || *b == b'(' || *b == b')')
+                    .map_or(bytes.len(), |end| i + 1 + end);
+                open.push((i, &bytes[i + 1..head_end] == b"structure"));
+            }
+            b')' if !in_quotes => {
+                if let Some((start, _)) = open.pop() {
+                    if open.last().is_some_and(|(_, is_structure)| *is_structure) {
+                        spans.push((start, i + 1));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// Removes from KiCad's native DSN the full `keepout` it writes for each
+/// fill-only rule area (KiCad 10.0.8 and older; KiCad#25959). Each expected
+/// keep-out is removed at most once; returns the DSN and how many were removed.
+fn drop_native_fill_only_keepouts(
+    native_dsn: String,
+    fill_only: &[DsnKeepoutIdentity],
+) -> Result<(String, usize)> {
+    if fill_only.is_empty() {
+        return Ok((native_dsn, 0));
+    }
+    let mut expected = fill_only.to_vec();
+    let mut removals = Vec::new();
+    for (start, end) in dsn_structure_child_spans(&native_dsn) {
+        let text = &native_dsn[start..end];
+        if !text.starts_with("(keepout") {
+            continue;
+        }
+        let node = parse_dsn_sexp(text).context("parse KiCad native DSN keep-out")?;
+        let Some(identity) = dsn_keepout_identity(&node)? else {
+            continue;
+        };
+        if let Some(index) = expected.iter().position(|candidate| *candidate == identity) {
+            expected.swap_remove(index);
+            // Take the line break and indentation before the node with it.
+            let before = &native_dsn[..start];
+            let line_start = before
+                .rfind('\n')
+                .filter(|&newline| before[newline..].trim().is_empty())
+                .unwrap_or(start);
+            removals.push((line_start, end));
+        }
+    }
+    let dropped = removals.len();
+    let mut dsn = native_dsn;
+    for (start, end) in removals.into_iter().rev() {
+        dsn.replace_range(start..end, "");
+    }
+    Ok((dsn, dropped))
+}
+
 pub(super) fn parse_dsn_sexp(source: &str) -> Result<SexpNode> {
     // Specctra represents the quote delimiter as the bare token
     // `(string_quote ")`. KiCad's S-expression parser correctly treats the
@@ -496,33 +623,9 @@ pub(super) fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
 
     let mut keepouts = Vec::new();
     for node in structure.children().unwrap_or(&[]) {
-        let kind = match node.head() {
-            Some("keepout") => RuleAreaKind::Keepout,
-            Some("wire_keepout") => RuleAreaKind::WireKeepout,
-            Some("via_keepout") => RuleAreaKind::ViaKeepout,
-            Some(other @ ("place_keepout" | "bend_keepout" | "elongate_keepout")) => {
-                bail!("DSN contains unsupported keep-out kind '{other}'");
-            }
-            _ => continue,
-        };
-        let head = node.head().unwrap_or("keepout");
-        let _id = dsn_atom(node, 1, &format!("{head} id"))?;
-        let children = node.children().map_or(0, <[SexpNode]>::len);
-        let polygon = node
-            .get(2)
-            .filter(|polygon| polygon.head() == Some("polygon") && children == 3)
-            .with_context(|| format!("DSN {head} is not one polygon"))?;
-        // KiCad's native DSN exporter encodes internal board cutouts (`Edge.Cuts`
-        // holes/circles) as `(keepout "" (polygon signal 0 ...))` with flattened
-        // floating-point points rather than rule-area keep-outs on copper layers.
-        if kind == RuleAreaKind::Keepout
-            && dsn_atom(polygon, 1, "polygon layer").ok() == Some("signal")
-        {
-            let _ = dsn_polygon(polygon)?;
-            continue;
+        if let Some(keepout) = dsn_keepout_identity(node)? {
+            keepouts.push(keepout);
         }
-        let (layer, points) = dsn_integer_polygon(polygon, &format!("DSN {head}"))?;
-        keepouts.push((kind, layer, points));
     }
     keepouts.sort();
 

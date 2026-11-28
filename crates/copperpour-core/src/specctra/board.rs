@@ -155,10 +155,11 @@ pub(super) fn locked_routing(
 /// The board's copper zones (#430) and rule-area keep-outs (#81). Each zone is
 /// exported as its outline, one `plane` per copper layer it covers, and each
 /// representable rule area as one keep-out (`keepout`, `wire_keepout`, or
-/// `via_keepout`) per copper layer it covers. Anything those cannot express
-/// without approximation is refused: a zone inside a footprint, a copper zone
-/// without a net, a pour/pad/footprint-only rule area, placement zones, an
-/// outline with a cutout, an arc edge, or a layer off the copper stack.
+/// `via_keepout`) per copper layer it covers. A pour/pad/footprint-only rule
+/// area is recorded as `FillOnly` and written to no DSN keep-out. Anything
+/// those cannot express without approximation is refused: a zone inside a
+/// footprint, a copper zone without a net, placement zones, an outline with a
+/// cutout, an arc edge, or a layer off the copper stack.
 pub(super) fn board_zones_and_rule_areas(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
@@ -196,6 +197,7 @@ pub(super) fn board_zones_and_rule_areas(
             let kind = rule_area_kind(zone, &label)?;
             let outline = zone_straight_outline(zone, &label, None, exact_rule_area_um)?;
             rule_areas.push(RuleAreaModel {
+                label: label.clone(),
                 kind,
                 layers: covered,
                 outline,
@@ -352,9 +354,7 @@ fn rule_area_kind(zone: &SexpNode, label: &str) -> Result<RuleAreaKind> {
         (true, true) => Ok(RuleAreaKind::Keepout),
         (true, false) => Ok(RuleAreaKind::WireKeepout),
         (false, true) => Ok(RuleAreaKind::ViaKeepout),
-        (false, false) => bail!(
-            "unsupported routing profile: {label} allows both tracks and vias (pour/pad/footprint-only keep-outs cannot be represented in Specctra DSN without blocking routing)"
-        ),
+        (false, false) => Ok(RuleAreaKind::FillOnly),
     }
 }
 

@@ -56,11 +56,28 @@ pub(crate) struct ExportBundle {
     /// copper layer it covers.
     pub copper_zone_count: usize,
     /// Rule areas of the exported board, each written as one keep-out per
-    /// copper layer it covers.
+    /// copper layer it covers, except fill-only ones.
     pub rule_area_count: usize,
+    /// Fill-only rule areas, recorded in the manifest but not written to the
+    /// DSN: they put no constraint on routing (#81).
+    pub rule_areas_not_exported: Vec<NotExportedRuleArea>,
+    /// Full keep-outs that KiCad's native exporter wrote for fill-only rule
+    /// areas and that adoption removed from the native DSN (#81).
+    pub native_keepouts_dropped: usize,
     /// The sides the exported footprints sit on: `front`, `back` or `both`.
     pub component_side: &'static str,
 }
+
+/// A fill-only rule area the export left out of the DSN, and why (#81).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct NotExportedRuleArea {
+    pub label: String,
+    pub layers: Vec<String>,
+    pub reason: &'static str,
+}
+
+/// Why a fill-only rule area is not written to the DSN.
+pub(crate) const FILL_ONLY_REASON: &str = "allows tracks and vias: only copper fills, pads or footprints are restricted, which refill and DRC enforce after apply";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +201,9 @@ pub(crate) enum RuleAreaKind {
     WireKeepout,
     /// Forbids vias while allowing tracks (`via_keepout`).
     ViaKeepout,
+    /// Allows tracks and vias; only copper fills, pads or footprints are
+    /// restricted. Not written to the DSN: a router places none of these (#81).
+    FillOnly,
 }
 
 impl RuleAreaKind {
@@ -195,16 +215,19 @@ impl RuleAreaKind {
         matches!(self, Self::Keepout | Self::ViaKeepout)
     }
 
-    fn dsn_kind(self) -> dsn::KeepoutKind {
+    /// The DSN keep-out kind, or `None` for an area the DSN does not carry.
+    fn dsn_kind(self) -> Option<dsn::KeepoutKind> {
         match self {
-            Self::Keepout => dsn::KeepoutKind::Normal,
-            Self::WireKeepout => dsn::KeepoutKind::Wire,
-            Self::ViaKeepout => dsn::KeepoutKind::Via,
+            Self::Keepout => Some(dsn::KeepoutKind::Normal),
+            Self::WireKeepout => Some(dsn::KeepoutKind::Wire),
+            Self::ViaKeepout => Some(dsn::KeepoutKind::Via),
+            Self::FillOnly => None,
         }
     }
 }
 
 struct RuleAreaModel {
+    label: String,
     kind: RuleAreaKind,
     layers: Vec<String>,
     outline: Vec<(i64, i64)>,
@@ -549,6 +572,17 @@ impl RoutingSnapshot {
             copper_layer_count: self.copper_layers.len(),
             copper_zone_count: self.zones.len(),
             rule_area_count: self.rule_areas.len(),
+            rule_areas_not_exported: self
+                .rule_areas
+                .iter()
+                .filter(|area| area.kind == RuleAreaKind::FillOnly)
+                .map(|area| NotExportedRuleArea {
+                    label: area.label.clone(),
+                    layers: area.layers.clone(),
+                    reason: FILL_ONLY_REASON,
+                })
+                .collect(),
+            native_keepouts_dropped: 0,
             component_side: component_side(&self.footprints),
         })
     }

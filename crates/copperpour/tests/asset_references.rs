@@ -1042,6 +1042,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // The values of that list's `reason` field, not callable tools (#870).
         "symbol_removed",
         "excluded_from_board",
+        // Specctra rule-area kind and export response field, not callable tools (#81).
+        "fill_only",
+        "rule_areas_not_exported",
     ];
 
     let mut phantom = Vec::new();

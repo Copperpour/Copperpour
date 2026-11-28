@@ -329,10 +329,15 @@ pub fn tools() -> Vec<ToolDef> {
              import-safety checks run first in every mode: an even 2-32-layer copper stack, \
              representable SMD and all-copper through-hole pads on either side, complete \
              effective routing rules, no custom DRC rules, only representable routing rule \
-             areas (`tracks`/`vias` keep-outs with straight, whole-micrometre vertices and no placement or cutouts), and no unlocked \
+             areas (straight, whole-micrometre vertices, no placement or cutouts), and no unlocked \
              tracks/vias or routed arcs. Supported netted copper zones become planes, and \
-             supported rule areas become keep-outs (`keepout`, `wire_keepout`, `via_keepout`); \
-             locked straight tracks and through vias are preserved. The default 'disable' uses only the \
+             supported rule areas become keep-outs (`keepout`, `wire_keepout`, `via_keepout`). \
+             A rule area that allows both tracks and vias (only copper fills, pads or footprints \
+             restricted) puts no constraint on routing: it is recorded in the manifest as \
+             `fill_only`, listed in `rule_areas_not_exported` and not written to the DSN; refill \
+             and DRC enforce it after apply. A full keep-out that KiCad's native exporter writes for \
+             such an area is removed and counted in `native_keepouts_dropped`. Locked \
+             straight tracks and through vias are preserved. The default 'disable' uses only the \
              Rust writer, requiring one closed Edge.Cuts loop of lines/circular arcs (flattened \
              within board max_error). On KiCad 10, 'prefer'/'require' first try the \
              authenticated ActionPlugin native exporter and validate its identities against the \
@@ -1328,6 +1333,8 @@ async fn handle_export_specctra_dsn(
             "pad_count": export.pad_count,
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
+            "rule_areas_not_exported": export.rule_areas_not_exported,
+            "native_keepouts_dropped": export.native_keepouts_dropped,
             "capabilities": {
                 "dsn_export_available": true,
                 "ses_import_available": false,
