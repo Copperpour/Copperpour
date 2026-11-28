@@ -1048,7 +1048,7 @@ fn route_on_sheet(
     if (same_x && same_y) || (!aligned && (same_x || same_y)) {
         return Ok(Err(ConnectionRefusal::ZeroLengthSegment));
     }
-    // The saved-coordinate graph cannot verify joins along a diagonal span.
+    // Keep the straight-route planner's orthogonal-only preflight.
     if aligned && !same_x && !same_y {
         return Ok(Err(ConnectionRefusal::Unsafe(vec![
             "cannot check what a diagonal straight route would join; align its endpoints in saved coordinates".into(),
@@ -1419,8 +1419,8 @@ impl RouteGuard {
         after: &copperpour_sexp::SexpNode,
     ) -> Result<Vec<String>, &'static str> {
         let wires = extract_wires(after);
-        // The old graph could attach to an almost orthogonal wire. The new
-        // graph excludes its diagonal span, so it cannot clear a route here.
+        // The route writer and its junction checks are not qualified for
+        // almost-orthogonal wires. Do not clear a route on these sheets.
         if wires.iter().any(is_near_axis_diagonal) {
             return Err("cannot be checked on a sheet with a near-axis diagonal wire");
         }
@@ -9752,6 +9752,37 @@ mod saved_route_power_tests {
                 .find(|t| schematic_point(t.at.0, t.at.1) == schematic_point(134.62, 88.9))
                 .unwrap();
             assert_eq!(rail.net, format!(" on net {primary}"), "{case}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagonal_route_join_tests {
+    use super::{draw_route, extract_wires, parse_sexp, RouteGuard};
+
+    #[test]
+    fn the_route_join_calculation_sees_a_foreign_label_at_the_diagonal_cutoff() {
+        let before = include_str!(
+            "../../tests/fixtures/label_attachment_kicad10/precision-before/opamp_stage.kicad_sch"
+        );
+        let tree = parse_sexp(before).unwrap();
+        let from = (20.0, 20.0);
+        // Public routing still refuses near-axis diagonals. Test the join
+        // calculation here, without relaxing that preflight policy.
+        for (to, expected) in [
+            (
+                (120.0377, 20.0007),
+                vec!["label REVIEW_BOUNDARY at (64.7193, 20.0005) on net REVIEW_BOUNDARY"],
+            ),
+            ((120.0377, 20.002), vec![]),
+        ] {
+            let guard = RouteGuard::new(&tree, from, &[to]).unwrap();
+            let candidate = parse_sexp(&draw_route(before, &[from, to])).unwrap();
+            assert_eq!(
+                guard.foreign_joins_with_wires(&candidate, &extract_wires(&candidate)),
+                expected,
+                "{to:?}"
+            );
         }
     }
 }
