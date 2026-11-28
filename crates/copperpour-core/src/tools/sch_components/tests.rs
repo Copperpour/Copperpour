@@ -2683,11 +2683,7 @@ async fn served_update_symbols_from_library_embeds_a_repointed_symbol_on_a_kicad
     assert_eq!(now[..kept.len()], kept[..]);
 }
 
-#[tokio::test]
-async fn issue_846_replace_prunes_only_the_last_use_of_an_embedded_definition() {
-    let (dir, _env) = stub_symbol_dir();
-    let path = dir.path().join("replace_embedded_kicad10.kicad_sch");
-    let sheet = include_str!("../../../tests/fixtures/replace_embedded_kicad10.kicad_sch");
+fn stub_stock_capacitor(dir: &std::path::Path) -> &'static str {
     let witness = include_str!("../../../tests/fixtures/dnp_kicad10.kicad_sch");
     let capacitor = copperpour_sexp::writer::find_direct_child_blocks(witness, "lib_symbols")
         .into_iter()
@@ -2695,13 +2691,22 @@ async fn issue_846_replace_prunes_only_the_last_use_of_an_embedded_definition() 
         .find(|block| block.starts_with("(symbol \"Device:C\""))
         .unwrap();
     std::fs::write(
-        dir.path().join("Device.kicad_symdir/C.kicad_sym"),
+        dir.join("Device.kicad_symdir/C.kicad_sym"),
         format!(
             "(kicad_symbol_lib (version 20241209) (generator \"eeschema\") {})",
             capacitor.replacen("\"Device:C\"", "\"C\"", 1)
         ),
     )
     .unwrap();
+    capacitor
+}
+
+#[tokio::test]
+async fn issue_846_replace_prunes_only_the_last_use_of_an_embedded_definition() {
+    let (dir, _env) = stub_symbol_dir();
+    let path = dir.path().join("replace_embedded_kicad10.kicad_sch");
+    let sheet = include_str!("../../../tests/fixtures/replace_embedded_kicad10.kicad_sch");
+    let capacitor = stub_stock_capacitor(dir.path());
 
     let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
         auto_load_toolsets: true,
@@ -2743,7 +2748,7 @@ async fn issue_846_replace_prunes_only_the_last_use_of_an_embedded_definition() 
         (
             with_r2("(lib_name \"Device:R\")\n\t\t(lib_id \"Device:C\")"),
             "Device:R",
-            &[("R2", None), ("R1", None)][..],
+            &[("R1", None), ("R2", Some("Device:R"))][..],
         ),
         (
             with_r2("(lib_name \"\")\n\t\t(lib_id \"Device:R\")"),
@@ -2807,4 +2812,140 @@ async fn issue_846_replace_prunes_only_the_last_use_of_an_embedded_definition() 
             assert!(after.contains(&format!("\n\t\t{capacitor}\n")), "{after}");
         }
     }
+}
+
+const REPLACE_SHEET_LOCAL: &str =
+    include_str!("../../../tests/fixtures/replace_sheet_local_kicad10.kicad_sch");
+
+async fn served_sheet_local_replacement(
+    path: &std::path::Path,
+    new_lib_id: &str,
+    unit: Option<u32>,
+) -> serde_json::Value {
+    let mut arguments = json!({"schematic": path, "reference": "R2", "new_lib_id": new_lib_id});
+    if let Some(unit) = unit {
+        arguments["unit"] = json!(unit);
+    }
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        auto_load_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    handler
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 984, "method": "tools/call",
+            "params": {"name": "replace_component", "arguments": arguments}
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+}
+
+#[tokio::test]
+async fn replace_component_rebinds_a_sheet_local_placement() {
+    let (dir, _env) = stub_symbol_dir();
+    stub_stock_capacitor(dir.path());
+    let path = dir.path().join("replace_sheet_local_kicad10.kicad_sch");
+    std::fs::write(&path, REPLACE_SHEET_LOCAL).unwrap();
+
+    let result = served_sheet_local_replacement(&path, "Device:C", None).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let body: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["old_lib_id"], "Device:R");
+    assert_eq!(body["new_lib_id"], "Device:C");
+
+    let (saved, tree) = read_schematic(&path).unwrap();
+    let instances = extract_symbol_instances(&tree);
+    let r2 = instances
+        .iter()
+        .find(|inst| inst.reference == "R2")
+        .unwrap();
+    let definitions = tree.find("lib_symbols").unwrap().find_all("symbol");
+    let resolved = copperpour_sexp::schematic::find_lib_symbol(&definitions, r2).unwrap();
+    assert_eq!(
+        resolved.get(1).and_then(|name| name.as_str()),
+        Some("Device:C")
+    );
+    assert_eq!(body["removed_lib_symbol"], "R_1");
+    assert_eq!(embedded_names(&saved), ["Device:R", "Device:C"]);
+
+    let r1_before = crate::tools::find_symbol_instance_block(REPLACE_SHEET_LOCAL, "R1").unwrap();
+    let r1_after = crate::tools::find_symbol_instance_block(&saved, "R1").unwrap();
+    assert_eq!(
+        &saved[r1_after.0..r1_after.1],
+        &REPLACE_SHEET_LOCAL[r1_before.0..r1_before.1]
+    );
+}
+
+#[tokio::test]
+async fn replace_component_ignores_unit_text_in_the_alias_being_removed() {
+    let (dir, _env) = stub_symbol_dir();
+    let library = dir.path().join("Device.kicad_symdir/OPAMP_DUAL.kicad_sym");
+    let symbol = std::fs::read_to_string(&library).unwrap();
+    std::fs::write(
+        &library,
+        symbol.replace("OPAMP_DUAL_3_1", "OPAMP_DUAL_10_1"),
+    )
+    .unwrap();
+
+    // Rename just the alias and its definition in the test copy. Unit 10
+    // makes a raw text edit inside the alias longer than the removal span.
+    let sheet =
+        ["", "_0_1", "_1_1"]
+            .into_iter()
+            .fold(REPLACE_SHEET_LOCAL.to_owned(), |sheet, suffix| {
+                sheet.replace(
+                    &format!("\"R_1{suffix}\""),
+                    &format!("\"R (unit 1)_1{suffix}\""),
+                )
+            });
+    let path = dir.path().join("replace_sheet_local_kicad10.kicad_sch");
+    std::fs::write(&path, sheet).unwrap();
+    let result = served_sheet_local_replacement(&path, "Device:OPAMP_DUAL", Some(10)).await;
+    assert_ne!(result["isError"], true, "{result}");
+
+    let body: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["removed_lib_symbol"], "R (unit 1)_1");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let (start, end) = crate::tools::find_symbol_instance_block(&saved, "R2").unwrap();
+    let r2 = parse_sexp(&saved[start..end]).unwrap();
+    assert_eq!(r2.find_str("lib_id"), Some("Device:OPAMP_DUAL"));
+    assert!(r2.find("lib_name").is_none());
+    assert_eq!(r2.find_str("unit"), Some("10"));
+    let instance = r2
+        .find("instances")
+        .unwrap()
+        .find("project")
+        .unwrap()
+        .find("path")
+        .unwrap();
+    assert_eq!(instance.find_str("unit"), Some("10"));
+}
+
+#[tokio::test]
+async fn replace_component_refuses_a_repeated_selected_lib_id_without_writing() {
+    let (dir, _env) = stub_symbol_dir();
+    stub_stock_capacitor(dir.path());
+    let path = dir.path().join("replace_sheet_local_kicad10.kicad_sch");
+    let sheet = REPLACE_SHEET_LOCAL.replacen(
+        "(lib_name \"R_1\")\n\t\t(lib_id \"Device:R\")",
+        "(lib_name \"R_1\")\n\t\t(lib_id \"Device:R\")\n\t\t(lib_id \"Device:R\")",
+        1,
+    );
+    assert_ne!(sheet, REPLACE_SHEET_LOCAL);
+    std::fs::write(&path, &sheet).unwrap();
+    let result = served_sheet_local_replacement(&path, "Device:C", None).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let body: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        "A unit of 'R2' must have exactly one lib_id"
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), sheet);
 }
