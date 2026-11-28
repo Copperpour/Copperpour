@@ -49,7 +49,9 @@ The required checks are the GitHub Actions app's `ci.yml` checks.
 `release.yml` builds every platform's release artifacts on GitHub Actions too,
 and `e2e-kicad.yml` installs KiCad on `windows-latest` and runs the real-KiCad
 gate: weekly, as part of `release.yml`, on demand, and on a PR when a
-maintainer applies the `run:e2e-kicad` label.
+maintainer applies the `run:e2e-kicad` label. `freerouting-jar.yml` runs the
+Freerouting bridge's real-Java tests against the released Freerouting JARs:
+on a PR that touches the bridge, weekly, and on demand. It is not required.
 
 - A contributor's first PR waits for a maintainer to approve its workflow runs
   (GitHub's setting for first-time contributors). Fork PRs run with a read-only

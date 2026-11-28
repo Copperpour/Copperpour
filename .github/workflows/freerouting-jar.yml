@@ -1,0 +1,74 @@
+name: Freerouting (real JAR)
+
+# The Freerouting bridge talks to a Java process, and the unit tests stand in
+# for it with a fake `java` script that answers whatever they expect. That is
+# how `check_freerouting` probed with `--version`, an option no Freerouting
+# release has, and reported every real JAR as unavailable without a test
+# failing (#982). This workflow runs the `#[ignore]` tests that start a real
+# Java on the released JARs.
+#
+# It runs for a PR that touches the bridge or this file, weekly, and on demand.
+# The tests run one at a time: each starts a Freerouting server, and every
+# server listens on the same fixed ports.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/copperpour-core/src/autorouting/freerouting/**"
+      - "crates/copperpour-core/src/java_runtime.rs"
+      - ".github/workflows/freerouting-jar.yml"
+  schedule:
+    - cron: "41 6 * * 1" # Mondays 06:41 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: freerouting-jar-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-jar:
+    name: Freerouting ${{ matrix.freerouting.version }} on a real Java
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        freerouting:
+          - version: "2.5.0"
+            sha256: f6f51bb02245e8e717f9359bd260cc9c5c0b1bc0acc8b7cb2cd5b8ffeb5de3c7
+          - version: "2.6.0"
+            sha256: a2929fe37767a71d119f52ac99a1615a9aa2b0538742fa514ddafd72a7785729
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+      - uses: Swatinem/rust-cache@v2
+      # Freerouting 2.5 and later are built for Java 25.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Download the Freerouting release JAR
+        env:
+          VERSION: ${{ matrix.freerouting.version }}
+          SHA256: ${{ matrix.freerouting.sha256 }}
+        run: |
+          jar="$RUNNER_TEMP/freerouting-$VERSION.jar"
+          curl --fail --location --silent --show-error --retry 3 --output "$jar" \
+            "https://github.com/freerouting/freerouting/releases/download/v$VERSION/freerouting-$VERSION.jar"
+          echo "$SHA256  $jar" | sha256sum --check
+          echo "FREEROUTING_JAR=$jar" >> "$GITHUB_ENV"
+      - name: Real-JAR tests
+        run: >-
+          cargo test -p copperpour-core --locked --lib autorouting::freerouting
+          -- --ignored --test-threads=1
