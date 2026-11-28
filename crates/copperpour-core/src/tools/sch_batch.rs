@@ -239,8 +239,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect multiple component pin pairs by reference and pin number, in a single \
              file read/write cycle. Routes as connect_pins does; a pair whose route would \
              join another net, miss a pin or draw a zero-length segment is skipped and listed \
-              in errors. Verified contacts on the saved sheet, including hidden pins, are \
-              listed in already_connected, not counted as drawn routes.",
+             in errors. Repeated position records on any placed symbol block routes. \
+             Verified contacts on the saved sheet, including hidden pins, are listed in \
+             already_connected, not counted as drawn routes.",
             json!({
                 "type": "object",
                 "properties": {

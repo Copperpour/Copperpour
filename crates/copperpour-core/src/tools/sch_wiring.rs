@@ -422,8 +422,9 @@ pub fn tools() -> Vec<ToolDef> {
              preferring an elbow that crosses fewer symbol bodies, then fewer label and field \
              text runs. Refuses with plan_blocked if no candidate avoids joining another net \
              in KiCad, including pins with legacy saved angles, or if a wire would miss a pin \
-             or have zero length. Also refuses unverified contact or a saved symbol angle that \
-             prevents KiCad from loading the sheet. A straight route must be horizontal or \
+             or have zero length. Also refuses unverified contact, repeated position records \
+             on any placed symbol, or a saved symbol angle that prevents KiCad from loading \
+             the sheet. A straight route must be horizontal or \
              vertical in saved coordinates. Refuses routes it cannot check on a sheet with \
              an almost horizontal or vertical diagonal wire. \
              Reports already_connected with x and y without writing for verified pin-tip \
@@ -713,6 +714,7 @@ pub(crate) enum ConnectionRefusal {
     UnprovenContact,
     PinNotPlaced,
     MissedPin,
+    RepeatedSavedPosition(String),
     UnsupportedSavedOrientation(String),
     Unsafe(Vec<String>),
 }
@@ -731,6 +733,11 @@ impl ConnectionRefusal {
             }
             Self::MissedPin => {
                 vec!["KiCad would read a wire end away from its requested pin".into()]
+            }
+            Self::RepeatedSavedPosition(reference) => {
+                vec![format!(
+                    "{reference} has more than one saved position record"
+                )]
             }
             Self::UnsupportedSavedOrientation(reference) => vec![format!(
                 "{reference} has a saved symbol angle KiCad cannot load"
@@ -759,12 +766,12 @@ fn saved_wire_point((x, y): (f64, f64)) -> (f64, f64) {
     (kicad_schematic_mm(round6(x)), kicad_schematic_mm(round6(y)))
 }
 
-fn kicad_reads_symbol_angle(symbol: &copperpour_sexp::SexpNode) -> bool {
+fn kicad_reads_symbol_angle(position: Option<&copperpour_sexp::SexpNode>) -> bool {
     use copperpour_sexp::SexpNode::Atom;
     // KiCad requires a numeric token and switches on its truncated value.
     // The general-purpose parse_at defaults missing or malformed angles to zero.
     let read_angle = || {
-        let [_, _, _, Atom(value)] = symbol.find("at")?.children()? else {
+        let [_, _, _, Atom(value)] = position?.children()? else {
             return None;
         };
         let angle: f64 = value.parse().ok()?;
@@ -994,16 +1001,30 @@ pub(crate) fn route_between_pins<'a>(
     }
     // Preserve unverified-contact refusals, but check the whole sheet before
     // reporting verified contact or drawing a route.
-    if let Some(symbol) = tree
-        .find_all("symbol")
-        .into_iter()
-        .find(|symbol| !kicad_reads_symbol_angle(symbol))
-    {
-        let reference = copperpour_sexp::schematic::symbol_instance(symbol)
-            .map_or_else(|| "A placed symbol".into(), |instance| instance.reference);
-        return Ok(Err(ConnectionRefusal::UnsupportedSavedOrientation(
-            reference,
-        )));
+    for symbol in tree.find_all("symbol") {
+        let positions = symbol.find_all("at");
+        // KiCad reads every record and uses the last; our pin lookups use the first.
+        if positions.len() > 1 {
+            // The position can be unreadable even when the reference is intact.
+            let reference = symbol
+                .find_all("property")
+                .into_iter()
+                .find(|field| field.get(1).and_then(|name| name.as_str()) == Some("Reference"))
+                .and_then(|field| field.get(2)?.as_str())
+                .filter(|reference| !reference.is_empty())
+                .or_else(|| symbol.find_str("uuid"))
+                .unwrap_or("A placed symbol");
+            return Ok(Err(ConnectionRefusal::RepeatedSavedPosition(
+                reference.into(),
+            )));
+        }
+        if !kicad_reads_symbol_angle(positions.first().copied()) {
+            let reference = copperpour_sexp::schematic::symbol_instance(symbol)
+                .map_or_else(|| "A placed symbol".into(), |instance| instance.reference);
+            return Ok(Err(ConnectionRefusal::UnsupportedSavedOrientation(
+                reference,
+            )));
+        }
     }
     if touching {
         let (x, y) = from_tip;
@@ -9993,6 +10014,78 @@ mod coincident_route_tests {
                    "errors": [format!("#PWR01.1 -> R30.1: {reason}")]})
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    fn repeated_position_route_args(tool: &str) -> serde_json::Value {
+        let pair = json!({"ref1": "R20", "pin1": "2", "ref2": "R21", "pin2": "2"});
+        if tool == "connect_pins" {
+            pair
+        } else {
+            json!({"connections": [pair]})
+        }
+    }
+
+    async fn check_repeated_symbol_position(tool: &str, positions: &str) {
+        let token = "\n\t\t(at 59.69 50.8 90)";
+        assert_eq!(SHEET.matches(token).count(), 1);
+        let reason = "R1 has more than one saved position record";
+        let input = SHEET.replacen(token, positions, 1);
+        let (handler, _dir, path) = setup(&input).await;
+        let result = serve(&handler, tool, &path, repeated_position_route_args(tool)).await;
+        if tool == "connect_pins" {
+            assert_blocked(&result, tool, reason);
+        } else {
+            assert_eq!(
+                result,
+                json!({"is_error": true, "connected_count": 0, "already_connected": [],
+                       "errors": [format!("R20.2 -> R21.2: {reason}")]}),
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), input);
+    }
+
+    const MALFORMED_SECOND: &str = "\n\t\t(at 59.69 50.8 90)\n\t\t(at 124.46 140.97 wrong)";
+    const VALID_SECOND: &str = "\n\t\t(at 59.69 50.8 90)\n\t\t(at 124.46 140.97 0)";
+
+    #[tokio::test]
+    async fn connect_pins_refuses_a_malformed_second_symbol_position() {
+        check_repeated_symbol_position("connect_pins", MALFORMED_SECOND).await;
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_refuses_a_malformed_second_symbol_position() {
+        check_repeated_symbol_position("batch_connect_pins", MALFORMED_SECOND).await;
+    }
+
+    #[tokio::test]
+    async fn connect_pins_refuses_a_valid_second_symbol_position() {
+        check_repeated_symbol_position("connect_pins", VALID_SECOND).await;
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_refuses_a_valid_second_symbol_position() {
+        check_repeated_symbol_position("batch_connect_pins", VALID_SECOND).await;
+    }
+
+    #[tokio::test]
+    async fn named_pin_routes_name_the_repeated_position_with_unreadable_coordinates() {
+        for tool in ["connect_pins", "batch_connect_pins"] {
+            check_repeated_symbol_position(
+                tool,
+                "\n\t\t(at wrong 50.8 90)\n\t\t(at 124.46 140.97 0)",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn named_pin_routes_draw_on_a_single_position_sheet() {
+        for tool in ["connect_pins", "batch_connect_pins"] {
+            let (handler, _dir, path) = setup(SHEET).await;
+            let result = serve(&handler, tool, &path, repeated_position_route_args(tool)).await;
+            assert_eq!(result["is_error"], false, "{tool}: {result}");
+            assert_added_wire(&path, (63.5, 143.51), (81.28, 143.51));
+        }
     }
 
     #[tokio::test]
