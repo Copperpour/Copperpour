@@ -1604,6 +1604,36 @@ impl<'a> ConnectivityIndex<'a> {
             .count()
     }
 
+    /// A fallback before pruning: the tolerant exit count can mistake an
+    /// interior point for an end and cannot count a diagonal's interior.
+    pub(super) fn keep_touched_dot(&self, x: f64, y: f64, pins_known: bool) -> bool {
+        let p = schematic_point(x, y);
+        let mut contacts = 0;
+        let mut interior = false;
+        for w in self.wires {
+            let [a, b] = wire_points(w);
+            if a == b || !on_saved_segment(p, a, b) {
+                continue;
+            }
+            let inside = p != a && p != b;
+            if !pins_known || (inside && a.0 != b.0 && a.1 != b.1) {
+                return true;
+            }
+            contacts += 1;
+            interior |= inside;
+        }
+        interior
+            && (contacts >= 2
+                || [
+                    &self.pin_points,
+                    &self.sheet_pin_points,
+                    &self.bus_entry_wire_points,
+                ]
+                .into_iter()
+                .flat_map(|index| index.hits_at(x, y))
+                .any(|(ex, ey, _)| schematic_point(ex, ey) == p))
+    }
+
     /// Whether a junction dot belongs at `(x, y)`: three or more exits, counted
     /// as the wire tools count them (#897). A wire passing through counts two
     /// exits even where nothing ends, so this says yes at a bare crossing; a
