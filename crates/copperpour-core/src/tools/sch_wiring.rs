@@ -5,6 +5,7 @@
 //! `new_wire_junctions`, which uses
 //! `copperpour_sexp::schematic::wire_end_needs_junction`.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::{
@@ -1601,35 +1602,74 @@ async fn handle_delete_wire(
     }))
 }
 
+/// A `stale_target` refusal: the schematic holds no item `target` names.
+fn stale_item(target: impl Into<String>, message: impl Into<String>) -> CallToolResult {
+    let message = message.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: target.into(),
+            reason: message.clone(),
+        },
+        message,
+    )
+}
+
+/// An `invalid_argument` refusal on `field` that keeps its own `message`.
+fn invalid_field(field: &str, reason: &str, message: impl Into<String>) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.to_string(),
+        },
+        message,
+    )
+}
+
 /// Byte range of the wire block the `uuid` or `x1/y1/x2/y2` arguments name.
 fn locate_wire_for_delete(
     content: &str,
     args: &serde_json::Value,
 ) -> Result<(usize, usize), CallToolResult> {
-    let range = if let Some(uuid) = opt_str(args, "uuid") {
+    let (range, target) = if let Some(uuid) = opt_str(args, "uuid") {
         let search = format!(r#"(uuid "{uuid}")"#);
         let Some(wire_offset) = content.find(&search) else {
-            return Err(CallToolResult::error(format!(
-                "Wire UUID '{uuid}' not found"
-            )));
+            return Err(stale_item(
+                format!("wire {uuid}"),
+                format!("Wire UUID '{uuid}' not found"),
+            ));
         };
-        wire_block_with_leading_whitespace(content, wire_offset)
+        (
+            wire_block_with_leading_whitespace(content, wire_offset),
+            format!("wire {uuid}"),
+        )
     } else {
-        let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
-            opt_f64(args, "x1"),
-            opt_f64(args, "y1"),
-            opt_f64(args, "x2"),
-            opt_f64(args, "y2"),
-        ) else {
-            return Err(CallToolResult::error(
+        let keys = ["x1", "y1", "x2", "y2"];
+        let [Some(x1), Some(y1), Some(x2), Some(y2)] = keys.map(|key| opt_f64(args, key)) else {
+            // Name the first missing coordinate once any is given.
+            let field = if keys.iter().all(|key| args[*key].is_null()) {
+                "uuid"
+            } else {
+                keys.into_iter()
+                    .find(|key| opt_f64(args, key).is_none())
+                    .unwrap_or("uuid")
+            };
+            return Err(invalid_field(
+                field,
+                "give uuid, or all of x1, y1, x2 and y2",
                 "Provide either uuid or all x1/y1/x2/y2 coordinates",
             ));
         };
-        find_wire_block_by_endpoints(content, x1, y1, x2, y2)
+        (
+            find_wire_block_by_endpoints(content, x1, y1, x2, y2),
+            format!("wire ({x1}, {y1})-({x2}, {y2})"),
+        )
     };
 
     range.ok_or_else(|| {
-        CallToolResult::error("Cannot locate a wire block matching the requested identity")
+        stale_item(
+            target,
+            "Cannot locate a wire block matching the requested identity",
+        )
     })
 }
 
@@ -2439,10 +2479,10 @@ async fn handle_batch_delete_wire(
     let deleted = ranges.len();
 
     if deleted == 0 && !uuids.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No wires deleted: {}",
-            errors.join("; ")
-        )));
+        return Ok(stale_item(
+            "uuids",
+            format!("No wires deleted: {}", errors.join("; ")),
+        ));
     }
 
     let removed = wires_in_ranges(&content, &ranges);
@@ -2527,7 +2567,8 @@ async fn handle_split_wire_at_point(
     let w = match target {
         Some(w) => w.clone(),
         None => {
-            return Ok(CallToolResult::error(
+            return Ok(stale_item(
+                format!("wire through ({px}, {py})"),
                 "No wire found passing through that point",
             ))
         }
@@ -2557,10 +2598,16 @@ async fn handle_split_wire_at_point(
         Some(uuid) => content
             .find(&format!(r#"(uuid "{uuid}")"#))
             .and_then(|offset| wire_block_with_leading_whitespace(&content, offset)),
-        None => find_wire_block_by_endpoints(&content, w.x1, w.y1, w.x2, w.y2),
-    };
+        None => None,
+    }
+    // An unquoted uuid (written before KiCad 8), or one an earlier item
+    // repeats, misses the text search; the endpoints still find the wire.
+    .or_else(|| find_wire_block_by_endpoints(&content, w.x1, w.y1, w.x2, w.y2));
+    // The wire was parsed from this source, so a miss is a block the text
+    // scan cannot read.
     let Some((del_start, del_end)) = block else {
-        return Ok(CallToolResult::error(
+        return Ok(super::sch_components::malformed_schematic_error(
+            &sch_path,
             "Cannot locate a wire block matching the requested identity",
         ));
     };
@@ -2922,10 +2969,10 @@ async fn handle_delete_net_label(
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
 
     if named.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No label named '{}' in this schematic",
-            net
-        )));
+        return Ok(stale_item(
+            format!("label '{net}' at ({target_x}, {target_y})"),
+            format!("No label named '{}' in this schematic", net),
+        ));
     }
 
     // Exact position match. Deleting the *nearest* label instead would silently
@@ -2943,25 +2990,36 @@ async fn handle_delete_net_label(
                 .iter()
                 .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
                 .collect();
-            return Ok(CallToolResult::error(format!(
-                "No label '{}' at ({}, {}). Found {} label(s) named '{}': {}",
-                net,
-                target_x,
-                target_y,
-                named.len(),
-                net,
-                positions.join("; ")
-            )));
+            return Ok(stale_item(
+                format!("label '{net}' at ({target_x}, {target_y})"),
+                format!(
+                    "No label '{}' at ({}, {}). Found {} label(s) named '{}': {}",
+                    net,
+                    target_x,
+                    target_y,
+                    named.len(),
+                    net,
+                    positions.join("; ")
+                ),
+            ));
         }
         _ => {
-            return Ok(CallToolResult::error(format!(
+            // Not ambiguous_target: this tool takes no uuid to choose by.
+            let message = format!(
                 "{} labels named '{}' share position ({}, {}) — delete by uuid is not \
                  supported yet; remove the duplicates in eeschema",
                 matched.len(),
                 net,
                 target_x,
                 target_y
-            )));
+            );
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: "delete_schematic_net_label".to_string(),
+                    reasons: vec![message.clone()],
+                },
+                message,
+            ));
         }
     };
 
@@ -3061,7 +3119,7 @@ async fn handle_rotate_label(
     let expected = content.clone();
     let turn = match turn_label(&content, &target, rotation)? {
         Ok(turn) => turn,
-        Err(refusal) => return Ok(CallToolResult::error(refusal)),
+        Err(miss) => return Ok(stale_item(miss.target, miss.message)),
     };
     let new_content = apply_edits(content, turn.edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
@@ -3119,20 +3177,27 @@ impl<'a> LabelRef<'a> {
     }
 }
 
+/// A label `turn_label` could not find: the item it names and why.
+struct LabelMiss {
+    target: String,
+    message: String,
+}
+
 /// The edits that turn the label `target` names in `content` to `rotation`,
 /// or why there is no such label.
 fn turn_label(
     content: &str,
     target: &LabelRef,
     rotation: f64,
-) -> anyhow::Result<Result<LabelTurn, String>> {
+) -> anyhow::Result<Result<LabelTurn, LabelMiss>> {
     let labels = find_label_blocks(content);
     let (label, x, y) = match *target {
         LabelRef::Uuid(uuid) => {
             let Some(label) = labels.iter().find(|l| l.uuid.as_deref() == Some(uuid)) else {
-                return Ok(Err(format!(
-                    "No label with uuid '{uuid}' in this schematic"
-                )));
+                return Ok(Err(LabelMiss {
+                    target: format!("label {uuid}"),
+                    message: format!("No label with uuid '{uuid}' in this schematic"),
+                }));
             };
             (label, label.x, label.y)
         }
@@ -3146,16 +3211,19 @@ fn turn_label(
                     .iter()
                     .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
                     .collect();
-                return Ok(Err(if positions.is_empty() {
-                    format!("No label named '{}' in this schematic", net)
-                } else {
-                    format!(
-                        "No label '{}' at ({}, {}). Found: {}",
-                        net,
-                        x,
-                        y,
-                        positions.join("; ")
-                    )
+                return Ok(Err(LabelMiss {
+                    target: format!("label '{net}' at ({x}, {y})"),
+                    message: if positions.is_empty() {
+                        format!("No label named '{}' in this schematic", net)
+                    } else {
+                        format!(
+                            "No label '{}' at ({}, {}). Found: {}",
+                            net,
+                            x,
+                            y,
+                            positions.join("; ")
+                        )
+                    },
                 }));
             };
             (*label, x, y)
@@ -3272,10 +3340,10 @@ async fn handle_move_labels_by_offset(
     let labels = find_label_blocks(&content);
     let matching: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
     if matching.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No label named '{}' in this schematic",
-            net
-        )));
+        return Ok(stale_item(
+            format!("label '{net}'"),
+            format!("No label named '{}' in this schematic", net),
+        ));
     }
 
     let mut edits = Vec::new();
@@ -3395,10 +3463,11 @@ async fn handle_batch_rotate_labels(
     for (i, (target, rotation)) in targets.iter().enumerate() {
         let turn = match turn_label(&content, target, *rotation)? {
             Ok(turn) => turn,
-            Err(refusal) => {
-                return Ok(CallToolResult::error(format!(
-                    "labels[{i}]: {refusal}. No label was rotated."
-                )))
+            Err(miss) => {
+                return Ok(stale_item(
+                    miss.target,
+                    format!("labels[{i}]: {}. No label was rotated.", miss.message),
+                ))
             }
         };
         // Two items for one label would write over each other.
@@ -5337,9 +5406,9 @@ async fn handle_batch_add_no_connect(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let positions = match args["positions"].as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(CallToolResult::error("Missing 'positions' array")),
+    let positions = match require_array(args, "positions") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -5381,7 +5450,8 @@ async fn handle_delete_no_connect(
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let Some((del_start, del_end)) = find_no_connect_block_at(&content, x, y) else {
-        return Ok(CallToolResult::error(
+        return Ok(stale_item(
+            format!("no_connect at ({x}, {y})"),
             "No-connect not found at that position",
         ));
     };
@@ -5440,9 +5510,11 @@ async fn handle_batch_delete_no_connect(
     let expected = content.clone();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for pos in &positions {
+    let mut malformed = None;
+    for (i, pos) in positions.iter().enumerate() {
         let (Some(x), Some(y)) = (pos["x"].as_f64(), pos["y"].as_f64()) else {
             errors.push(format!("Position {pos} needs numeric x and y"));
+            malformed.get_or_insert(i);
             continue;
         };
         match find_no_connect_block_at(&content, x, y) {
@@ -5455,10 +5527,12 @@ async fn handle_batch_delete_no_connect(
     let deleted = ranges.len();
 
     if deleted == 0 && !positions.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No no-connects deleted: {}",
-            errors.join("; ")
-        )));
+        let message = format!("No no-connects deleted: {}", errors.join("; "));
+        // A bad item is the caller's to fix before any marker is missing.
+        return Ok(match malformed {
+            Some(i) => invalid_field(&format!("positions[{i}]"), "needs numeric x and y", message),
+            None => stale_item("positions", message),
+        });
     }
 
     let edits: Vec<SexpEdit> = ranges
@@ -5554,11 +5628,9 @@ async fn handle_connect_to_net(
     // A negative length would flip the stub's direction; 0 is a label on the
     // point with no wire, as in batch_connect_to_net.
     if fixed_length.is_some_and(|length| length < 0.0 || !length.is_finite()) {
-        return Ok(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::InvalidArgument {
-                field: "stub_length".to_string(),
-                reason: "must be a finite number >= 0".into(),
-            },
+        return Ok(invalid_field(
+            "stub_length",
+            "must be a finite number >= 0",
             "'stub_length' must be a finite number >= 0 (0 places the label on the point with no wire)",
         ));
     }
@@ -5568,6 +5640,13 @@ async fn handle_connect_to_net(
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
+    let unpaired = |missing: &str| {
+        invalid_field(
+            missing,
+            "'reference' and 'pin_number' go together",
+            "'reference' and 'pin_number' must be given together",
+        )
+    };
     let (pin_x, pin_y, outward) = match (opt_str(args, "reference"), opt_str(args, "pin_number")) {
         (Some(reference), Some(pin_number)) => {
             match PlacedPins::new(&tree).resolve(reference, pin_number) {
@@ -5580,11 +5659,8 @@ async fn handle_connect_to_net(
                 }
             }
         }
-        (Some(_), None) | (None, Some(_)) => {
-            return Ok(CallToolResult::error(
-                "'reference' and 'pin_number' must be given together",
-            ))
-        }
+        (Some(_), None) => return Ok(unpaired("pin_number")),
+        (None, Some(_)) => return Ok(unpaired("reference")),
         (None, None) => match (require_f64(args, "pin_x"), require_f64(args, "pin_y")) {
             (Ok(x), Ok(y)) => (x, y, None),
             // Structured, not free text: a missing coordinate is an
@@ -5592,12 +5668,9 @@ async fn handle_connect_to_net(
             // that the caller did not take.
             (x, _) => {
                 let field = if x.is_err() { "pin_x" } else { "pin_y" };
-                return Ok(CallToolResult::error_kind(
-                    crate::mcp::error::ToolErrorKind::InvalidArgument {
-                        field: field.to_string(),
-                        reason: "give either 'reference' + 'pin_number' or 'pin_x' + 'pin_y'"
-                            .into(),
-                    },
+                return Ok(invalid_field(
+                    field,
+                    "give either 'reference' + 'pin_number' or 'pin_x' + 'pin_y'",
                     format!(
                         "Missing '{field}': give either 'reference' + 'pin_number' \
                          or 'pin_x' + 'pin_y'"
@@ -7202,6 +7275,13 @@ mod label_tests {
         );
     }
 
+    /// The message of a `stale_target` refusal.
+    fn stale_message(result: &CallToolResult) -> String {
+        let body = crate::tools::project_file_writer_tests::body_of(result);
+        assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+        body["message"].as_str().unwrap().to_string()
+    }
+
     /// A label not found at its position used to be counted and left as it
     /// was. It refuses the whole batch by name, first or last, and nothing is
     /// written.
@@ -7216,8 +7296,8 @@ mod label_tests {
             let mut labels = both_labels_turned();
             labels[missing]["y"] = json!(0.0);
             let result = batch_rotate(&handler, &path, labels).await;
-            let text = text_of(&result);
-            assert!(result.is_error, "{text}");
+            assert!(result.is_error, "{}", text_of(&result));
+            let text = stale_message(&result);
             assert!(text.starts_with(refusal), "{text}");
             assert!(text.ends_with("No label was rotated."), "{text}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
@@ -7354,7 +7434,7 @@ mod label_tests {
             rotate_label(&handler, &path, json!({ "uuid": AT_WIRE, "rotation": 180 })).await;
         assert!(result.is_error, "{}", text_of(&result));
         assert_eq!(
-            text_of(&result),
+            stale_message(&result),
             format!("No label with uuid '{AT_WIRE}' in this schematic")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
@@ -7365,7 +7445,7 @@ mod label_tests {
             let result = batch_rotate(&handler, &path, labels).await;
             assert!(result.is_error, "{}", text_of(&result));
             assert_eq!(
-                text_of(&result),
+                stale_message(&result),
                 format!(
                     "labels[{missing}]: No label with uuid '{AT_WIRE}' in this schematic. \
                      No label was rotated."
@@ -12313,3 +12393,7 @@ mod add_junction_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sch_wiring_error_kind_tests.rs"]
+mod error_kind_tests;
