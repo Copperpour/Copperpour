@@ -375,6 +375,7 @@ pub fn tools() -> Vec<ToolDef> {
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
              Name the pin with reference + pin_number, or give its coordinates directly. \
+             Refuses a named pin if KiCad would read the wire or label anchor away from its tip. \
              Returns the stub_length used, text_overlaps added by the wire and label, \
              and bounds_unresolved for symbols whose bounds could not be checked. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
@@ -5614,6 +5615,17 @@ async fn handle_batch_add_junction(
     })))
 }
 
+pub(super) fn check_net_label_pin(reference: &str, pin: &NamedPin) -> Result<(), String> {
+    // With a stub the wire starts here; without one the label is drawn here.
+    if saved_wire_point(pin.endpoint()) != schematic_pin_endpoint(&pin.pin, pin.t) {
+        return Err(format!(
+            "{reference}.{}: KiCad would read the wire or label anchor away from the pin tip",
+            pin.pin.number
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_connect_to_net(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -5638,8 +5650,8 @@ async fn handle_connect_to_net(
 
     let (source, tree) = read_schematic(&sch_path)?;
 
-    // Name the pin, or give its coordinates. Naming it cannot miss the
-    // endpoint, and the error says which pin was wrong.
+    // Name the pin, or give its coordinates. A named anchor must match where
+    // KiCad reads the pin, not just where the planner would draw it.
     let unpaired = |missing: &str| {
         invalid_field(
             missing,
@@ -5651,6 +5663,16 @@ async fn handle_connect_to_net(
         (Some(reference), Some(pin_number)) => {
             match PlacedPins::new(&tree).resolve(reference, pin_number) {
                 Ok(pin) => {
+                    if let Err(reason) = check_net_label_pin(reference, &pin) {
+                        let message = format!("connect_to_net did not place a label: {reason}");
+                        return Ok(CallToolResult::error_kind(
+                            ToolErrorKind::PlanBlocked {
+                                operation: "connect_to_net".into(),
+                                reasons: vec![reason],
+                            },
+                            message,
+                        ));
+                    }
                     let (x, y) = pin.endpoint();
                     (x, y, Some(pin.outward()))
                 }
@@ -9993,6 +10015,181 @@ mod coincident_route_tests {
                    "errors": [format!("#PWR01.1 -> R30.1: {reason}")]})
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    const MISSED_NET_ANCHOR: &str =
+        "R1.2: KiCad would read the wire or label anchor away from the pin tip";
+
+    fn fractional_net_anchor_sheet(angle: &str) -> String {
+        let position = "\n\t\t(at 59.69 50.8 90)";
+        assert_eq!(SHEET.matches(position).count(), 1);
+        SHEET.replacen(position, &format!("\n\t\t(at 59.69 50.8 {angle})"), 1)
+    }
+
+    #[tokio::test]
+    async fn connect_to_net_refuses_a_missed_net_anchor() {
+        let source = fractional_net_anchor_sheet("90.5");
+        let (handler, _dir, path) = setup(&source).await;
+        let tool = "connect_to_net";
+        let args = json!({"reference": "R1", "pin_number": "2", "net": "PROBE"});
+        let result = serve(&handler, tool, &path, args.clone()).await;
+        assert_blocked(&result, tool, MISSED_NET_ANCHOR);
+        assert_eq!(
+            result["message"],
+            format!("connect_to_net did not place a label: {MISSED_NET_ANCHOR}"),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(&handler, tool, &path, args).await;
+        assert_eq!(result["connected"], "PROBE", "{result}");
+        assert_added_wire(&path, (63.5, 50.8), (66.04, 50.8));
+    }
+
+    #[tokio::test]
+    async fn batch_connect_to_net_refuses_a_missed_net_anchor() {
+        let source = fractional_net_anchor_sheet("90.5");
+        let (handler, _dir, path) = setup(&source).await;
+        let tool = "batch_connect_to_net";
+        let args = json!({"pins": [{"reference": "R1", "pin_number": "2"}], "net": "PROBE"});
+        let result = serve(&handler, tool, &path, args).await;
+        assert_blocked(&result, tool, MISSED_NET_ANCHOR);
+        assert_eq!(result["added_count"], 0, "{result}");
+        assert_eq!(result["errors"], json!([MISSED_NET_ANCHOR]), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn batch_connect_to_net_keeps_good_stubs_next_to_a_missed_net_anchor() {
+        let source = fractional_net_anchor_sheet("90.5");
+        let (handler, _dir, path) = setup(&source).await;
+        let result = serve(
+            &handler,
+            "batch_connect_to_net",
+            &path,
+            json!({"pins": [{"reference": "R1", "pin_number": "2"},
+                            {"reference": "R20", "pin_number": "2"}],
+                   "net": "PROBE", "direction": "right", "stub_length": 2.54}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(result["added_count"], 1, "{result}");
+        assert_eq!(result["errors"], json!([MISSED_NET_ANCHOR]), "{result}");
+        assert_eq!(result["added"][0]["reference"], "R20", "{result}");
+        assert_added_wire(&path, (63.5, 143.51), (66.04, 143.51));
+        let tree = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let anchors: Vec<_> = copperpour_sexp::schematic::extract_labels(&tree)
+            .into_iter()
+            .filter(|label| label.net == "PROBE")
+            .map(|label| (label.x, label.y))
+            .collect();
+        assert_eq!(anchors, [(66.04, 143.51)]);
+    }
+
+    #[tokio::test]
+    async fn a_missed_net_anchor_does_not_allow_a_join_to_its_wire() {
+        // R1.2 is at (63.5, 50.8) in KiCad. The raw fractional tip falls
+        // just above it, on the wire leading to OTHER.
+        let (handler, _dir, path) = setup(&fractional_net_anchor_sheet("90.05")).await;
+        for (tool, args) in [
+            (
+                "move_schematic_component",
+                json!({"reference": "R20", "x": 67.31, "y": 46.99}),
+            ),
+            (
+                "add_wire",
+                json!({"x1": 63.5, "y1": 50.8, "x2": 63.5, "y2": 48.26}),
+            ),
+            (
+                "add_schematic_net_label",
+                json!({"net": "OTHER", "x": 63.5, "y": 48.26}),
+            ),
+        ] {
+            let result = serve(&handler, tool, &path, args).await;
+            assert_eq!(result["is_error"], false, "{tool}: {result}");
+        }
+        let before = std::fs::read(&path).unwrap();
+        let result = serve(
+            &handler,
+            "batch_connect_to_net",
+            &path,
+            json!({"pins": [{"reference": "R1", "pin_number": "2"},
+                            {"reference": "R20", "pin_number": "2"}],
+                   "net": "PROBE", "direction": "left", "stub_length": 3.81}),
+        )
+        .await;
+        assert_eq!(result["is_error"], true, "{result}");
+        assert_eq!(result["added_count"], 0, "{result}");
+        assert_eq!(
+            result["errors"],
+            json!([MISSED_NET_ANCHOR,
+                   "R20.2: the left stub would join R1 pin 2 at (63.5, 50.8) on net OTHER, label OTHER at (63.5, 48.26) on net OTHER"]),
+            "{result}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn retry_places_a_label_when_the_legacy_label_misses_the_pin() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        // Keep the old label at the 90.05-degree tip, but the symbol is now at 90.
+        let result = serve(
+            &handler,
+            "connect_to_net",
+            &path,
+            json!({"pin_x": 63.499999, "pin_y": 50.796675, "net": "PROBE", "stub_length": 0}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+        let request = json!({"pins": [{"reference": "R1", "pin_number": "2"}], "net": "PROBE"});
+        let result = serve(&handler, "batch_connect_to_net", &path, request.clone()).await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert!(result["added"][0].get("deduplicated").is_none(), "{result}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let mut anchors: Vec<_> =
+            copperpour_sexp::schematic::extract_labels(&parse_sexp(&saved).unwrap())
+                .into_iter()
+                .filter(|label| label.net == "PROBE")
+                .map(|label| (label.x, label.y))
+                .collect();
+        anchors.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(anchors, [(63.499999, 50.796675), (63.5, 50.8)]);
+
+        let result = serve(&handler, "batch_connect_to_net", &path, request).await;
+        assert_eq!(result["added"][0]["deduplicated"], true, "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn retry_places_a_wire_when_the_legacy_stub_misses_the_pin() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "connect_to_net",
+            &path,
+            json!({"pin_x": 63.499999, "pin_y": 50.796675, "net": "PROBE",
+                   "direction": "right", "stub_length": 2.54}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+        let before = extract_wires(&parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap());
+        let args = json!({"pins": [{"reference": "R1", "pin_number": "2"}], "net": "PROBE",
+                          "direction": "right", "stub_length": 2.54});
+        let result = serve(&handler, "batch_connect_to_net", &path, args.clone()).await;
+        assert_eq!(result["is_error"], false, "{result}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let after = extract_wires(&parse_sexp(&saved).unwrap());
+        let new: Vec<_> = after
+            .iter()
+            .filter(|wire| !before.iter().any(|old| old.uuid == wire.uuid))
+            .map(|wire| ((wire.x1, wire.y1), (wire.x2, wire.y2)))
+            .collect();
+        assert_eq!(new, [((63.5, 50.8), (66.04, 50.8))], "{result}");
+
+        let result = serve(&handler, "batch_connect_to_net", &path, args).await;
+        assert_eq!(result["added"][0]["deduplicated"], true, "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
     }
 
     #[tokio::test]
