@@ -374,3 +374,76 @@ async fn connect_to_net_names_the_missing_half_of_a_pin() {
         );
     }
 }
+
+const LOCAL_PWR_UUID: &str = "0d4d3a43-7e99-4613-b6d3-aa71f4b45928";
+
+fn assert_ambiguous_pwr(body: &Value) {
+    assert_eq!(
+        body["error"],
+        json!({
+            "kind": "ambiguous_target",
+            "target": "label 'PWR' at (114.3, 105.41)",
+            "candidates": [LOCAL_PWR_UUID, GLOBAL_PWR_UUID],
+        }),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn rotate_label_refuses_coincident_labels_and_accepts_uuid() {
+    let source = fixture("coincident_labels_kicad10.kicad_sch");
+    let (_dir, path) = sheet(&source);
+    let handler = handler().await;
+    let body = refusal(
+        &handler,
+        &path,
+        &source,
+        "rotate_schematic_label",
+        json!({ "net": "PWR", "x": 114.3, "y": 105.41, "rotation": 90 }),
+    )
+    .await;
+    assert_ambiguous_pwr(&body);
+
+    let result = served_call(
+        &handler,
+        "rotate_schematic_label",
+        json!({ "schematic": path, "uuid": body["error"]["candidates"][1], "rotation": 90 }),
+    )
+    .await;
+    assert!(!result.is_error, "{:?}", result.content);
+    let after = std::fs::read_to_string(path).unwrap();
+    let tree = copperpour_sexp::parser::parse_sexp(&after).unwrap();
+    for (tag, uuid, angle) in [
+        ("label", LOCAL_PWR_UUID, 0.0),
+        ("global_label", GLOBAL_PWR_UUID, 90.0),
+    ] {
+        let label = tree
+            .find_all(tag)
+            .into_iter()
+            .find(|node| node.find_str("uuid") == Some(uuid))
+            .unwrap();
+        assert_eq!(label.find("at").unwrap().get_f64(3), Some(angle), "{uuid}");
+    }
+}
+
+#[tokio::test]
+async fn batch_rotate_labels_refuses_coincident_labels_without_writing() {
+    let source = fixture("coincident_labels_kicad10.kicad_sch");
+    let (_dir, path) = sheet(&source);
+    let body = refusal(
+        &handler().await,
+        &path,
+        &source,
+        "batch_rotate_labels",
+        json!({ "labels": [
+            { "net": "(at 1 2)", "x": 114.3, "y": 97.79, "rotation": 180 },
+            { "net": "PWR", "x": 114.3, "y": 105.41, "rotation": 90 }
+        ] }),
+    )
+    .await;
+    assert_ambiguous_pwr(&body);
+    assert_eq!(
+        body["message"],
+        "labels[1]: 2 labels named 'PWR' share (114.3, 105.41); choose the label by uuid. No label was rotated."
+    );
+}

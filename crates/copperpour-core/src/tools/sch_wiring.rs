@@ -168,7 +168,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "rotate_schematic_label",
             "Rotate one net label, by uuid or by net and position, to a new angle and update \
-             its justify direction accordingly.",
+             its justify direction. If several labels match by net and position, retry by uuid.",
             json!({
                 "type": "object",
                 "properties": {
@@ -200,8 +200,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_rotate_labels",
             "Rotate multiple labels, each by uuid or by net and position, in a single file \
-             read/write cycle. A label not found, or named twice, refuses the batch, and \
-             nothing is written.",
+             read/write cycle. A missing or ambiguous label, or a label named twice, \
+             refuses the whole batch without writing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3119,7 +3119,7 @@ async fn handle_rotate_label(
     let expected = content.clone();
     let turn = match turn_label(&content, &target, rotation)? {
         Ok(turn) => turn,
-        Err(miss) => return Ok(stale_item(miss.target, miss.message)),
+        Err(refusal) => return Ok(refusal.into_result(None)),
     };
     let new_content = apply_edits(content, turn.edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
@@ -3177,41 +3177,64 @@ impl<'a> LabelRef<'a> {
     }
 }
 
-/// A label `turn_label` could not find: the item it names and why.
-struct LabelMiss {
+/// A label `turn_label` could not uniquely select.
+struct LabelRefusal {
     target: String,
     message: String,
+    candidates: Option<Vec<String>>,
+}
+
+impl LabelRefusal {
+    fn into_result(self, batch_index: Option<usize>) -> CallToolResult {
+        let message = match batch_index {
+            Some(i) => format!("labels[{i}]: {}. No label was rotated.", self.message),
+            None => self.message,
+        };
+        match self.candidates {
+            Some(candidates) => CallToolResult::error_kind(
+                ToolErrorKind::AmbiguousTarget {
+                    target: self.target,
+                    candidates,
+                },
+                message,
+            ),
+            None => stale_item(self.target, message),
+        }
+    }
 }
 
 /// The edits that turn the label `target` names in `content` to `rotation`,
-/// or why there is no such label.
+/// or why it could not be uniquely selected.
 fn turn_label(
     content: &str,
     target: &LabelRef,
     rotation: f64,
-) -> anyhow::Result<Result<LabelTurn, LabelMiss>> {
+) -> anyhow::Result<Result<LabelTurn, LabelRefusal>> {
     let labels = find_label_blocks(content);
     let (label, x, y) = match *target {
         LabelRef::Uuid(uuid) => {
             let Some(label) = labels.iter().find(|l| l.uuid.as_deref() == Some(uuid)) else {
-                return Ok(Err(LabelMiss {
+                return Ok(Err(LabelRefusal {
                     target: format!("label {uuid}"),
                     message: format!("No label with uuid '{uuid}' in this schematic"),
+                    candidates: None,
                 }));
             };
             (label, label.x, label.y)
         }
         LabelRef::At { net, x, y } => {
             let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
-            let Some(label) = named
+            let here: Vec<_> = named
                 .iter()
-                .find(|l| same_point(l.x, x) && same_point(l.y, y))
-            else {
+                .copied()
+                .filter(|l| same_point(l.x, x) && same_point(l.y, y))
+                .collect();
+            let Some(&label) = here.first() else {
                 let positions: Vec<String> = named
                     .iter()
                     .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
                     .collect();
-                return Ok(Err(LabelMiss {
+                return Ok(Err(LabelRefusal {
                     target: format!("label '{net}' at ({x}, {y})"),
                     message: if positions.is_empty() {
                         format!("No label named '{}' in this schematic", net)
@@ -3224,9 +3247,20 @@ fn turn_label(
                             positions.join("; ")
                         )
                     },
+                    candidates: None,
                 }));
             };
-            (*label, x, y)
+            if here.len() > 1 {
+                return Ok(Err(LabelRefusal {
+                    target: format!("label '{net}' at ({x}, {y})"),
+                    message: format!(
+                        "{} labels named '{net}' share ({x}, {y}); choose the label by uuid",
+                        here.len()
+                    ),
+                    candidates: Some(here.iter().filter_map(|l| l.uuid.clone()).collect()),
+                }));
+            }
+            (label, x, y)
         }
     };
     let net = label.net.as_str();
@@ -3454,8 +3488,7 @@ async fn handle_batch_rotate_labels(
     if labels.is_empty() {
         return Ok(CallToolResult::json(&json!({ "rotated": 0 })));
     }
-    // One read and one write, as the description says: a label that is not
-    // there refuses the whole batch, and nothing is written.
+    // One read and one write: an unresolved label refuses the whole batch.
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let mut edits = Vec::new();
@@ -3463,12 +3496,7 @@ async fn handle_batch_rotate_labels(
     for (i, (target, rotation)) in targets.iter().enumerate() {
         let turn = match turn_label(&content, target, *rotation)? {
             Ok(turn) => turn,
-            Err(miss) => {
-                return Ok(stale_item(
-                    miss.target,
-                    format!("labels[{i}]: {}. No label was rotated.", miss.message),
-                ))
-            }
+            Err(refusal) => return Ok(refusal.into_result(Some(i))),
         };
         // Two items for one label would write over each other.
         if let Some(first) = turned.iter().position(|&start| start == turn.start) {

@@ -141,9 +141,9 @@ and Windows servers do not.
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
 | `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
 | `delete_schematic_net_label` | Delete a net label by `net` name and `x`/`y` position. |
-| `rotate_schematic_label` | Rotate a net label, by uuid or position, to a new angle and update its justify direction. |
+| `rotate_schematic_label` | Rotate one net label, by uuid or by net and position, to a new angle and update its justify direction. If several labels match by net and position, retry by uuid. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
-| `batch_rotate_labels` | Rotate multiple labels, each by uuid or position, in a single file read/write cycle. |
+| `batch_rotate_labels` | Rotate multiple labels, each by uuid or by net and position, in a single file read/write cycle. A missing or ambiguous label, or a label named twice, refuses the whole batch without writing. |
 | `add_power_symbol` | `power_net` names a KiCad power library symbol. For a custom global rail name, use `add_schematic_component` with a stock global power symbol and set `value` to the rail name. Give `reference` + `pin_number` to place a power symbol on a straight outward stub, or `x` + `y` for coordinate placement on the 1.27 mm grid. `stub_length` defaults to 2.54 mm and must be a multiple of 1.27 mm. Zero preserves the old on-tip placement and facing-away default rotation. An explicit `rotation` must be an exact multiple of 90° and wins over automatic orientation; otherwise prefer the library direction where clear. Obstacles or unresolved pins on the sheet block new stubs with `plan_blocked` and no write. When pins are known, unmeasured drawing bounds appear in `bounds_unresolved` alongside saved placement and clearance findings. Allocates `#PWR` or `#FLG` across the saved hierarchy, refuses stale sheet instance metadata, and lists unreadable peer sheets in `other_sheets_unreadable`. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
