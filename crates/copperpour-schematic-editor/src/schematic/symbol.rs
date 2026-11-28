@@ -103,9 +103,10 @@ impl Symbol {
         let in_bom = node.get_bool("in_bom").unwrap_or(true);
         let on_board = node.get_bool("on_board").unwrap_or(true);
         let dnp = node.get_bool("dnp").unwrap_or(false);
-        // eeschema omits the token entirely when fields are not autoplaced — it
-        // never writes `no` — so presence is the whole state.
-        let fields_autoplaced = node.find("fields_autoplaced").is_some();
+        // Older files use a bare marker; never upgrade a negative or unknown value to `yes`.
+        let fields_autoplaced = node
+            .find("fields_autoplaced")
+            .is_some_and(|marker| marker.value() == Some("yes") || marker.children().len() == 1);
         let body_style = node
             .find("body_style")
             .and_then(|n| n.value()?.parse().ok());
@@ -781,6 +782,17 @@ mod kicad_orientation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_negative_autoplacement_does_not_round_trip_as_yes() {
+        let mut source = Symbol::new("Device:R", 0.0, 0.0).to_sexp();
+        if let SexpNode::List(children) = &mut source {
+            children.push(tagged("fields_autoplaced", vec![atom("no")]));
+        }
+        let found = Symbol::from_sexp(&source).unwrap();
+        assert!(!found.fields_autoplaced);
+        assert!(found.to_sexp().find("fields_autoplaced").is_none());
+    }
 
     fn reference_at(sym: &Symbol) -> (f64, f64) {
         let at = sym.properties[0]

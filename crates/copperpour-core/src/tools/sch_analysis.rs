@@ -1167,7 +1167,34 @@ pub(super) fn overlap_findings(
     wires: &[Wire],
     tol: f64,
 ) -> (Vec<serde_json::Value>, usize, Vec<String>) {
-    schematic_overlaps(tree, wires, tol, &[])
+    overlap_findings_with_field_clearance(tree, wires, tol, false)
+}
+
+pub(super) fn overlap_findings_with_field_clearance(
+    tree: &copperpour_sexp::SexpNode,
+    wires: &[Wire],
+    tol: f64,
+    include_power_references: bool,
+) -> (Vec<serde_json::Value>, usize, Vec<String>) {
+    schematic_overlaps(tree, wires, tol, &[], include_power_references)
+}
+
+/// The unordered UUID pairs of overlapping components touched by an edit.
+pub(super) fn component_overlap_pairs(
+    tree: &copperpour_sexp::SexpNode,
+    changed_uuids: &[&str],
+) -> BTreeSet<[String; 2]> {
+    schematic_overlaps(tree, &[], OVERLAP_TOLERANCE, changed_uuids, false)
+        .0
+        .into_iter()
+        .filter(|finding| finding["type"] == "component_overlap")
+        .filter_map(|finding| {
+            let ids = &finding["_participants"];
+            let mut pair = [ids[0].as_str()?.to_owned(), ids[1].as_str()?.to_owned()];
+            pair.sort_unstable();
+            Some(pair)
+        })
+        .collect()
 }
 
 /// The pen and text offset ratio the pin text check assumes: KiCad's
@@ -1321,6 +1348,7 @@ fn schematic_overlaps(
     wires: &[Wire],
     tol: f64,
     changed_uuids: &[&str],
+    include_power_references: bool,
 ) -> (Vec<serde_json::Value>, usize, Vec<String>) {
     let instances = tree.find_all("symbol").into_iter().filter_map(|node| {
         Some((
@@ -1536,6 +1564,7 @@ fn schematic_overlaps(
                 } => match (field.as_str(), is_power_symbol) {
                     ("Value", true) => "wire_label_overlap",
                     ("Reference" | "Value", false) => "wire_field_overlap",
+                    ("Reference", true) if include_power_references => "wire_field_overlap",
                     _ => return None,
                 },
             };
@@ -1630,7 +1659,8 @@ pub fn added_clearance_findings(
     });
     let findings = |tree| {
         let wires = extract_wires(tree);
-        let (mut result, _, mut unresolved) = schematic_overlaps(tree, &wires, 0.5, changed_uuids);
+        let (mut result, _, mut unresolved) =
+            schematic_overlaps(tree, &wires, 0.5, changed_uuids, false);
         if symbols_changed {
             let (contacts, unresolved_pins) =
                 super::sch_pin_contacts::clearance_pin_contacts(tree, &wires);

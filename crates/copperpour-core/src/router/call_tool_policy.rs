@@ -206,6 +206,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "apply_template",
     "assign_net_to_class",
     "auto_place_from_schematic",
+    "autoplace_schematic_fields",
     "batch_add_bus",
     "batch_add_junction",
     "batch_add_no_connect",

@@ -448,6 +448,32 @@ pub(super) fn cleanup_rank(baseline: &Score, tree: &SexpNode) -> Option<[i64; TI
         .then(|| TIERS.map(|tier| tier.iter().filter_map(|key| delta[key]).sum()))
 }
 
+pub(super) fn layout_verdict(before: &SexpNode, after: &SexpNode) -> &'static str {
+    LayoutBaseline::new(before).verdict(after)
+}
+
+/// Reuse the served layout comparison's score and gate for multiple trials.
+pub(super) struct LayoutBaseline<'a> {
+    tree: &'a SexpNode,
+    score: Score,
+}
+
+impl<'a> LayoutBaseline<'a> {
+    pub(super) fn new(tree: &'a SexpNode) -> Self {
+        Self {
+            tree,
+            score: measure(tree),
+        }
+    }
+
+    pub(super) fn verdict(&self, after: &SexpNode) -> &'static str {
+        verdict(
+            &measure(after).delta_from(&self.score),
+            &gate(self.tree, after, &[], NetComparison::Layout),
+        )
+    }
+}
+
 impl Score {
     fn delta_from(&self, baseline: &Self) -> Terms {
         terms()

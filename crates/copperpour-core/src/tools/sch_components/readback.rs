@@ -845,14 +845,39 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) fn load_committed_component_schematic(
+/// One-shot external save that appends the text to a sheet after a placement
+/// wrote it and before the readback snapshot, as an editor autosave would.
+#[cfg(test)]
+pub(crate) static COMPONENT_SAVE_BEFORE_SNAPSHOT: std::sync::Mutex<
+    Vec<(std::path::PathBuf, String)>,
+> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn load_committed_component_snapshot(
     path: &std::path::Path,
-) -> anyhow::Result<cse::Schematic> {
+) -> anyhow::Result<(String, cse::Schematic)> {
+    check_committed_load()?;
+    #[cfg(test)]
+    {
+        let mut saves = COMPONENT_SAVE_BEFORE_SNAPSHOT.lock().unwrap();
+        let same = |armed: &std::path::Path| {
+            std::fs::canonicalize(armed).ok() == std::fs::canonicalize(path).ok()
+        };
+        if let Some(index) = saves.iter().position(|(armed, _)| same(armed)) {
+            let saved = std::fs::read_to_string(path)? + &saves.remove(index).1;
+            std::fs::write(path, saved)?;
+        }
+    }
+    let source = copperpour_sexp::read_consistent(path)?;
+    let schematic = cse::Schematic::from_source(path, source.clone())?;
+    Ok((source, schematic))
+}
+
+fn check_committed_load() -> anyhow::Result<()> {
     #[cfg(test)]
     if let Some(reason) = COMPONENT_COMMITTED_LOAD_FAULT.with(|fault| fault.borrow_mut().take()) {
         anyhow::bail!(reason);
     }
-    Ok(cse::Schematic::load(path)?)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -115,6 +115,25 @@ pub fn refused_before_write(
     )
 }
 
+/// Add `fields`' keys to a result's JSON body, keeping keys it already has.
+pub fn extend(mut result: CallToolResult, fields: Value) -> CallToolResult {
+    let Some(ToolContent::Text { text }) = result.content.first_mut() else {
+        return result;
+    };
+    let (Ok(Value::Object(mut body)), Value::Object(fields)) =
+        (serde_json::from_str::<Value>(text), fields)
+    else {
+        return result;
+    };
+    for (key, value) in fields {
+        body.entry(key).or_insert(value);
+    }
+    if let Ok(serialized) = serde_json::to_string(&body) {
+        *text = serialized;
+    }
+    result
+}
+
 /// Add the shared envelope while preserving every existing response field.
 pub fn attach(mut result: CallToolResult, outcome: Value) -> CallToolResult {
     let Some(ToolContent::Text { text }) = result.content.first_mut() else {
