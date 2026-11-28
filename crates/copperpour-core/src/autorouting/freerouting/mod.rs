@@ -440,22 +440,27 @@ pub(crate) async fn check_freerouting(
                 mcp::JAVA_HEADLESS_ARG,
                 "-jar",
                 jar_path.to_str().unwrap_or(""),
-                "--version",
+                // Freerouting has no `--version`: it rejects the argument and
+                // exits 1. `-help` exits 0 on every release since 1.9 and
+                // logs the version first.
+                FREEROUTING_PROBE_ARG,
             ]);
             let freerouting = run_java_command(&mut freerouting_command).await;
             let (version_checked, version_output) = match freerouting {
                 Ok(output) => (output.status.success(), command_output(&output)),
                 Err(error) => (false, error),
             };
+            let freerouting_version = freerouting_version(&version_output);
 
             let bridge = mcp::probe_local(&jar_path).await;
             // Available means the JAR actually ran here, not merely that a JAR
             // and some `java` exist.
             let note = (!version_checked).then(|| {
                 format!(
-                    "Java started, but the Freerouting JAR did not run with {} (`--version` \
+                    "Java started, but the Freerouting JAR did not run with {} (`{}` \
                      failed): see version_output",
-                    java_path.display()
+                    java_path.display(),
+                    FREEROUTING_PROBE_ARG
                 )
             });
             let mut body = json!({
@@ -471,6 +476,7 @@ pub(crate) async fn check_freerouting(
                 "java_output": command_output(&java),
                 "version_checked": version_checked,
                 "version_output": version_output,
+                "freerouting_version": freerouting_version,
                 "server_protocol_version": bridge.server_protocol_version,
                 "native_mcp_tool_count": bridge.tool_count,
                 "native_mcp_diagnostics": bridge.diagnostics,
@@ -483,6 +489,24 @@ pub(crate) async fn check_freerouting(
             Ok(CallToolResult::json(&body))
         }
     }
+}
+
+/// The argument `check_freerouting` runs the JAR with to prove it starts.
+const FREEROUTING_PROBE_ARG: &str = "-help";
+
+/// The version Freerouting logs when it starts (`Freerouting v2.6.0
+/// (build-date: ...)`), if the output has it.
+fn freerouting_version(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let rest = &line[line.find("Freerouting v")? + "Freerouting v".len()..];
+        let version: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+            .collect();
+        version
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then_some(version)
+    })
 }
 
 /// The KiCad project whose design rules `route_specctra_dsn` sends, and why
@@ -1502,11 +1526,34 @@ mod freerouting_tests {
         let body = block_on(served_check_with_fake_java(
             "#!/bin/sh\n\
              if [ \"$1\" = -version ]; then echo 'openjdk version \"25.0.1\" 2025-10-21' >&2; exit 0; fi\n\
-             echo 'Freerouting 2.5.0'; exit 0\n",
+             for last; do :; done\n\
+             if [ \"$last\" = -help ]; then\n\
+               echo '2026-11-28 07:58:17.477 INFO   Freerouting v2.6.0 (build-date: 2026-11-25)'; exit 0\n\
+             fi\n\
+             echo 'WARN   Unknown command line argument: --version' >&2; exit 1\n",
         ));
         assert_eq!(body["available"], true, "{body}");
         assert_eq!(body["version_checked"], true, "{body}");
+        assert_eq!(body["freerouting_version"], "2.6.0", "{body}");
         assert!(body.get("note").is_none(), "{body}");
+    }
+
+    #[test]
+    fn freerouting_version_is_read_from_the_startup_line() {
+        assert_eq!(
+            freerouting_version(
+                "2026-11-28 07:58:17.477 INFO   Freerouting v2.6.0 (build-date: 2026-11-25)\n\
+                 2026-11-28 07:58:17.749 INFO   Hardware: 16 CPU cores"
+            )
+            .as_deref(),
+            Some("2.6.0")
+        );
+        assert_eq!(
+            freerouting_version("INFO   Freerouting v2.7.0-SNAPSHOT (build-date: x)").as_deref(),
+            Some("2.7.0-SNAPSHOT")
+        );
+        assert_eq!(freerouting_version("Error: could not start"), None);
+        assert_eq!(freerouting_version("Freerouting vNext"), None);
     }
 
     /// A directory reached twice is searched, and reported, once, under the
