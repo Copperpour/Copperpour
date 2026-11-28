@@ -67,6 +67,140 @@ fn assert_stale(body: &Value, target: &str, message: &str) {
     assert_eq!(body["error"]["reason"], message, "{body}");
 }
 
+async fn assert_wire_delete(tool: &str, source: &str, uuid: &str) {
+    let (_dir, path) = sheet(source);
+    let mut arguments = if tool == "batch_delete_schematic_wire" {
+        json!({ "uuids": [uuid] })
+    } else {
+        json!({ "uuid": uuid })
+    };
+    arguments["schematic"] = json!(path.to_str().unwrap());
+    let result = served_call(&handler().await, tool, arguments).await;
+    assert!(!result.is_error, "{tool} with {uuid}: {:?}", result.content);
+    if tool == "batch_delete_schematic_wire" {
+        let body = body_of(&result);
+        assert_eq!(body["deleted"], 1);
+        assert_eq!(body["errors"], json!([]));
+    }
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        without_first_wire(source),
+        "{tool}"
+    );
+}
+
+fn without_first_wire(source: &str) -> String {
+    // The fixture has adjacent wire blocks. Only the first should go.
+    let (before, wires) = source.split_once("\n\t(wire\n").unwrap();
+    let (_, after) = wires.split_once("\n\t(wire\n").unwrap();
+    format!("{before}\n\t(wire\n{after}")
+}
+
+fn wire_uuid_shared_with_sheet() -> String {
+    fixture("coincident_labels_kicad10.kicad_sch").replace(WIRE_UUID, SHEET_UUID)
+}
+
+fn wire_uuid_unquoted() -> String {
+    fixture("coincident_labels_kicad10.kicad_sch").replace(
+        &format!(r#"(uuid "{WIRE_UUID}")"#),
+        &format!("(uuid {WIRE_UUID})"),
+    )
+}
+
+#[tokio::test]
+async fn delete_wire_by_uuid_shared_with_sheet() {
+    assert_wire_delete(
+        "delete_schematic_wire",
+        &wire_uuid_shared_with_sheet(),
+        SHEET_UUID,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn batch_delete_wire_by_uuid_shared_with_sheet() {
+    assert_wire_delete(
+        "batch_delete_schematic_wire",
+        &wire_uuid_shared_with_sheet(),
+        SHEET_UUID,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn delete_wire_by_unquoted_uuid() {
+    assert_wire_delete("delete_schematic_wire", &wire_uuid_unquoted(), WIRE_UUID).await;
+}
+
+#[tokio::test]
+async fn batch_delete_wire_by_unquoted_uuid() {
+    assert_wire_delete(
+        "batch_delete_schematic_wire",
+        &wire_uuid_unquoted(),
+        WIRE_UUID,
+    )
+    .await;
+}
+
+async fn assert_duplicate_wire_refusal(tool: &str, arguments: Value) {
+    let source =
+        wire_uuid_shared_with_sheet().replace("9f3ae394-59a4-4621-b263-3c87d6b07268", SHEET_UUID);
+    let (_dir, path) = sheet(&source);
+    let body = refusal(&handler().await, &path, &source, tool, arguments).await;
+    assert_eq!(
+        body["error"],
+        json!({
+            "kind": "plan_blocked",
+            "operation": tool,
+            "reasons": [format!("Wire UUID '{SHEET_UUID}' is shared by multiple wires; repair the duplicate UUIDs")],
+        }),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn delete_wire_refuses_a_uuid_on_two_wires() {
+    assert_duplicate_wire_refusal("delete_schematic_wire", json!({ "uuid": SHEET_UUID })).await;
+}
+
+#[tokio::test]
+async fn batch_delete_wire_refuses_a_uuid_on_two_wires() {
+    assert_duplicate_wire_refusal(
+        "batch_delete_schematic_wire",
+        json!({ "uuids": [SHEET_UUID] }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn batch_delete_wire_skips_duplicate_uuid_and_deletes_unique_wire() {
+    // This KiCad-resaved sheet has the three wires needed for a mixed batch.
+    let unique = "7d5cb83f-bb17-497c-b762-4faa9ceedf8d";
+    let duplicate = "ad391354-ca5d-4f43-aea8-e28f3eea8814";
+    let source = fixture("route_obstacles_kicad10.kicad_sch")
+        .replace("eff54643-a648-435c-85ce-17c1551ba463", duplicate);
+    let (_dir, path) = sheet(&source);
+    let result = served_call(
+        &handler().await,
+        "batch_delete_schematic_wire",
+        json!({ "schematic": path, "uuids": [duplicate, unique] }),
+    )
+    .await;
+    assert!(!result.is_error, "{:?}", result.content);
+    let body = body_of(&result);
+    assert_eq!(body["deleted"], 1);
+    assert_eq!(
+        body["errors"],
+        json!([format!(
+            "Wire UUID '{duplicate}' is shared by multiple wires; repair the duplicate UUIDs"
+        )])
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        without_first_wire(&source)
+    );
+}
+
 #[tokio::test]
 async fn wire_refusals_are_typed() {
     let source = fixture("coincident_labels_kicad10.kicad_sch");

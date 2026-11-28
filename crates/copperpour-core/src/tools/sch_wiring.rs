@@ -1631,17 +1631,23 @@ fn locate_wire_for_delete(
     args: &serde_json::Value,
 ) -> Result<(usize, usize), CallToolResult> {
     let (range, target) = if let Some(uuid) = opt_str(args, "uuid") {
-        let search = format!(r#"(uuid "{uuid}")"#);
-        let Some(wire_offset) = content.find(&search) else {
+        let range = match wire_uuid_index(content).get(uuid) {
+            Some(None) => {
+                return Err(wire_delete_blocked(
+                    "delete_schematic_wire",
+                    vec![duplicate_wire_uuid(uuid)],
+                ))
+            }
+            Some(&range) => range,
+            None => None,
+        };
+        if range.is_none() && !content.contains(&format!(r#"(uuid "{uuid}")"#)) {
             return Err(stale_item(
                 format!("wire {uuid}"),
                 format!("Wire UUID '{uuid}' not found"),
             ));
-        };
-        (
-            wire_block_with_leading_whitespace(content, wire_offset),
-            format!("wire {uuid}"),
-        )
+        }
+        (range, format!("wire {uuid}"))
     } else {
         let keys = ["x1", "y1", "x2", "y2"];
         let [Some(x1), Some(y1), Some(x2), Some(y2)] = keys.map(|key| opt_f64(args, key)) else {
@@ -2460,17 +2466,20 @@ async fn handle_batch_delete_wire(
     let expected = content.clone();
     let mut errors = Vec::new();
 
+    let by_uuid = wire_uuid_index(&content);
+    let mut blocked = false;
     // Collect all delete ranges first, then apply in reverse order
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for uuid in &uuids {
-        let search = format!(r#"(uuid "{uuid}")"#);
-        match content.find(&search) {
-            Some(offset) => match wire_block_with_leading_whitespace(&content, offset) {
-                Some(range) => ranges.push(range),
-                None => errors.push(format!(
-                    "UUID '{uuid}' exists but is not inside a parseable wire block"
-                )),
-            },
+        match by_uuid.get(uuid) {
+            Some(Some(range)) => ranges.push(*range),
+            Some(None) => {
+                blocked = true;
+                errors.push(duplicate_wire_uuid(uuid));
+            }
+            None if content.contains(&format!(r#"(uuid "{uuid}")"#)) => errors.push(format!(
+                "UUID '{uuid}' exists but is not inside a parseable wire block"
+            )),
             None => errors.push(format!("Wire UUID '{uuid}' not found")),
         }
     }
@@ -2479,6 +2488,9 @@ async fn handle_batch_delete_wire(
     let deleted = ranges.len();
 
     if deleted == 0 && !uuids.is_empty() {
+        if blocked {
+            return Ok(wire_delete_blocked("batch_delete_schematic_wire", errors));
+        }
         return Ok(stale_item(
             "uuids",
             format!("No wires deleted: {}", errors.join("; ")),
@@ -2498,6 +2510,44 @@ async fn handle_batch_delete_wire(
         "junctions_pruned_count": pruned,
         "errors": errors
     })))
+}
+
+fn duplicate_wire_uuid(uuid: &str) -> String {
+    format!("Wire UUID '{uuid}' is shared by multiple wires; repair the duplicate UUIDs")
+}
+
+fn wire_delete_blocked(operation: &str, reasons: Vec<String>) -> CallToolResult {
+    let message = format!("No wires deleted: {}", reasons.join("; "));
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: operation.to_string(),
+            reasons,
+        },
+        message,
+    )
+}
+
+/// Index UUIDs on wire blocks only, accepting quoted strings and bare atoms.
+/// A UUID on multiple wires has no unique range.
+fn wire_uuid_index(content: &str) -> std::collections::HashMap<String, Option<(usize, usize)>> {
+    let mut by_uuid = std::collections::HashMap::new();
+    for (uuid, range) in find_direct_child_blocks(content, "kicad_sch")
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let node = parse_sexp(&content[start..end]).ok()?;
+            if node.head() != Some("wire") {
+                return None;
+            }
+            let uuid = node.find_str("uuid")?.to_owned();
+            Some((uuid, find_block_with_leading_whitespace(content, start)?))
+        })
+    {
+        by_uuid
+            .entry(uuid)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(range));
+    }
+    by_uuid
 }
 
 fn wire_block_with_leading_whitespace(
