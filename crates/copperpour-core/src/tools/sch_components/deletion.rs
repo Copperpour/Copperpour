@@ -298,7 +298,7 @@ pub(crate) fn plan_component_and_item_deletions(
             remaining.extend(points);
         }
     }
-    let affected = crate::tools::dedup_points(affected);
+    let nearby_affected = crate::tools::dedup_points(affected.iter().copied());
     let remaining = crate::tools::dedup_points(remaining);
 
     let mut marker_uuids = Vec::new();
@@ -311,7 +311,7 @@ pub(crate) fn plan_component_and_item_deletions(
         let Some((x, y, _)) = copperpour_sexp::schematic::parse_at(&node) else {
             continue;
         };
-        let attached = affected
+        let attached = nearby_affected
             .iter()
             .any(|&(px, py)| copperpour_sexp::geometry::points_coincident(x, y, px, py, 0.01));
         let still_owned = remaining
@@ -354,12 +354,15 @@ pub(crate) fn plan_component_and_item_deletions(
                 .is_some_and(|uuid| item_uuids.binary_search(uuid).is_ok())
         })
         .collect::<Vec<_>>();
-    let candidate = if removed_wires.is_empty() {
-        candidate
+    let (reconciled, _, _) = if removed_wires.is_empty() {
+        crate::tools::sch_wiring::reconcile_junctions_at(candidate, &nearby_affected)
     } else {
-        crate::tools::sch_wiring::prune_orphaned_junctions(candidate, &removed_wires).0
+        crate::tools::sch_wiring::reconcile_junctions_after_wire_deletions(
+            candidate,
+            &removed_wires,
+            &affected,
+        )
     };
-    let (reconciled, _, _) = crate::tools::sch_wiring::reconcile_junctions_at(candidate, &affected);
 
     let after_items = indexed_uuid_items(path, &reconciled)?;
     let before_ids = before_items.keys().cloned().collect::<BTreeSet<_>>();
