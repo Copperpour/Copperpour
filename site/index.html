@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Copperpour: AI-assisted PCB design for KiCad 10</title>
+<meta name="description" content="Copperpour is an open-source KiCad 10 plugin and MCP server that lets Claude and other AI assistants design schematics and PCBs.">
+<link rel="icon" type="image/png" href="icon.png">
+<style>
+  :root {
+    --bg: #0f1620;
+    --bg-raised: #17212d;
+    --line: #26323f;
+    --text: #e6e9ee;
+    --muted: #9aa5b1;
+    --copper: #e0a264;
+    --copper-deep: #b87333;
+    --code-bg: #0b1119;
+    --radius: 10px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  }
+  a { color: var(--copper); }
+  a:hover { color: #f9d2a8; }
+  code, pre { font-family: ui-monospace, "Cascadia Code", "Fira Code", Menlo, Consolas, monospace; font-size: .9em; }
+  :not(pre) > code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: .05em .35em; }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: .9em 1em; overflow-x: auto; margin: .6em 0 0; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  header.top { border-bottom: 1px solid var(--line); }
+  header.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; font-weight: 700; letter-spacing: .01em; }
+  .brand img { width: 28px; height: 28px; }
+  nav a { color: var(--muted); text-decoration: none; margin-left: 22px; font-size: .95em; }
+  nav a:hover { color: var(--text); }
+
+  .hero { padding: 64px 0 32px; text-align: center; }
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.1rem); line-height: 1.15; margin: 0 0 16px; letter-spacing: -.01em; }
+  .hero h1 span { color: var(--copper); }
+  .hero p.lead { max-width: 700px; margin: 0 auto; color: var(--muted); font-size: 1.15em; }
+  .actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-top: 28px; }
+  .btn { display: inline-block; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; border: 1px solid var(--line); color: var(--text); background: var(--bg-raised); }
+  .btn:hover { border-color: var(--copper-deep); color: var(--text); }
+  .btn.primary { background: var(--copper-deep); border-color: var(--copper-deep); color: #fff; }
+  .btn.primary:hover { background: #c98243; }
+
+
+  section { padding: 56px 0 8px; }
+  section h2 { font-size: 1.7rem; margin: 0 0 8px; }
+  section > .wrap > p.intro { color: var(--muted); margin: 0 0 24px; max-width: 760px; }
+
+  .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .feature { background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; }
+  .feature h3 { margin: 0 0 6px; font-size: 1.05rem; color: var(--copper); }
+  .feature p { margin: 0; color: var(--muted); font-size: .95em; }
+
+  ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 0; }
+  ol.steps > li { counter-increment: step; position: relative; padding: 0 0 28px 52px; }
+  ol.steps > li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 34px; height: 34px; border-radius: 50%; background: var(--bg-raised); border: 1px solid var(--copper-deep); color: var(--copper); display: grid; place-items: center; font-weight: 700; }
+  ol.steps h3 { margin: 2px 0 8px; font-size: 1.15rem; }
+  ol.steps p, ol.steps ul { margin: .4em 0; }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+  .tabs button { font: inherit; font-size: .9em; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+  .tabs button[aria-selected="true"] { background: var(--copper-deep); border-color: var(--copper-deep); color: #fff; }
+  .tabs button:focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+  .pickers { display: flex; flex-wrap: wrap; gap: 8px 32px; margin: 0 0 24px; }
+  .picker-label { display: block; color: var(--muted); font-size: .85em; text-transform: uppercase; letter-spacing: .06em; }
+  /* Without script every OS and client variant stays visible, each labelled. */
+  .js .panel-label, .js .nojs-only { display: none; }
+  .panel-label { font-weight: 600; margin: 14px 0 0; }
+  .nojs-only { color: var(--muted); font-weight: 400; }
+  .note { color: var(--muted); font-size: .92em; }
+
+  .next { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  .next a.card { display: block; text-decoration: none; color: var(--text); background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; }
+  .next a.card:hover { border-color: var(--copper-deep); }
+  .next a.card strong { color: var(--copper); display: block; margin-bottom: 4px; }
+  .next a.card span { color: var(--muted); font-size: .95em; }
+
+  footer { margin-top: 64px; border-top: 1px solid var(--line); padding: 24px 0 40px; color: var(--muted); font-size: .9em; }
+  footer p { margin: .3em 0; }
+
+  @media (max-width: 640px) {
+    nav a:not(.gh) { display: none; }
+    .hero { padding-top: 40px; }
+    ol.steps > li { padding-left: 0; padding-top: 44px; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="icon.png" alt="" width="28" height="28">Copperpour</a>
+    <nav aria-label="Main">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/Copperpour/Copperpour/blob/main/docs/GETTING_STARTED.md">Docs</a>
+      <a class="gh" href="https://github.com/Copperpour/Copperpour">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <div class="wrap">
+      <h1>AI-assisted PCB design<br>for <span>KiCad 10</span></h1>
+      <p class="lead">Copperpour is an open-source KiCad plugin and MCP server. It lets Claude and
+        other AI assistants work on your schematics and boards directly: placing and wiring
+        parts, laying out the PCB, running checks and exporting production files.</p>
+      <div class="actions">
+        <a class="btn primary" href="#install">Install Copperpour</a>
+        <a class="btn" href="https://github.com/Copperpour/Copperpour/blob/main/docs/GETTING_STARTED.md">Your first board</a>
+        <a class="btn" href="https://github.com/Copperpour/Copperpour">Source on GitHub</a>
+      </div>
+    </div>
+  </div>
+
+  <section id="features">
+    <div class="wrap">
+      <h2>What it does</h2>
+      <p class="intro">Instead of describing changes and applying them by hand, your assistant works
+        on the KiCad project itself, through the
+        <a href="https://modelcontextprotocol.io">Model Context Protocol</a>.</p>
+      <div class="features">
+        <div class="feature"><h3>Schematic capture</h3><p>Place symbols from KiCad's libraries and wire them by pin name, with revision-checked writes that stop rather than overwrite a newer save.</p></div>
+        <div class="feature"><h3>PCB layout</h3><p>Place, move and route footprints live through KiCad 10's IPC API, with KiCad's own undo and redo.</p></div>
+        <div class="feature"><h3>Design checks</h3><p>ERC, DRC, connectivity, decoupling and power-rail audits, and BOM health checks.</p></div>
+        <div class="feature"><h3>Production files</h3><p>Gerbers, drill files, BOM, pick-and-place, 3D models and PDF from <code>kicad-cli</code>.</p></div>
+        <div class="feature"><h3>Parts and templates</h3><p>Search a local JLCPCB catalog for in-stock parts, and start from reference circuits like USB-C, LDO, buck and I²C.</p></div>
+        <div class="feature"><h3>One small binary</h3><p>A single Rust executable, with no Node.js or Python to install. Toolsets load on demand to keep the assistant's context small.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <h2>Install</h2>
+      <p class="intro">You need <strong>KiCad 10</strong> on Windows, macOS or Linux, and an MCP
+        client such as Claude Desktop, Claude Code or Codex.</p>
+
+      <div class="pickers">
+        <div class="picker">
+          <span class="picker-label" id="label-os" hidden>Your system</span>
+          <div class="tabs" role="tablist" aria-labelledby="label-os" data-group="os" hidden>
+            <button role="tab" id="tab-os-windows" aria-controls="install-steps" data-key="windows">Windows</button>
+            <button role="tab" id="tab-os-macos" aria-controls="install-steps" data-key="macos">macOS</button>
+            <button role="tab" id="tab-os-linux" aria-controls="install-steps" data-key="linux">Linux</button>
+          </div>
+        </div>
+        <div class="picker">
+          <span class="picker-label" id="label-client" hidden>Your AI client</span>
+          <div class="tabs" role="tablist" aria-labelledby="label-client" data-group="client" hidden>
+            <button role="tab" id="tab-client-desktop" aria-controls="install-steps" data-key="desktop">Claude Desktop</button>
+            <button role="tab" id="tab-client-code" aria-controls="install-steps" data-key="code">Claude Code</button>
+            <button role="tab" id="tab-client-codex" aria-controls="install-steps" data-key="codex">Codex</button>
+            <button role="tab" id="tab-client-other" aria-controls="install-steps" data-key="other">Other clients</button>
+          </div>
+        </div>
+      </div>
+
+      <ol class="steps" id="install-steps" aria-live="polite">
+        <li data-client-only="desktop">
+          <h3>Install the Claude Desktop extension<span class="nojs-only"> (Claude Desktop)</span></h3>
+          <p>Download the extension for your system from the
+            <a href="https://github.com/Copperpour/Copperpour/releases/latest">latest release</a>:</p>
+          <p data-os-only="windows"><span class="panel-label">Windows: </span><code>copperpour-v&lt;version&gt;-windows-x86_64.mcpb</code></p>
+          <p data-os-only="macos"><span class="panel-label">macOS: </span><code>copperpour-v&lt;version&gt;-macos-universal.mcpb</code>,
+            a universal build for Apple Silicon and Intel Macs.</p>
+          <p data-os-only="linux"><span class="panel-label">Linux: </span><code>copperpour-v&lt;version&gt;-linux-x86_64.mcpb</code>.
+            Claude Desktop for Linux is a beta or community build; see the
+            <a href="https://github.com/Copperpour/Copperpour/blob/main/docs/CLAUDE_DESKTOP_EXTENSION.md#linux-notes">Linux
+            notes</a>.</p>
+          <p>In Claude Desktop, open <strong>Settings → Extensions → Advanced settings → Install
+            Extension…</strong> and choose the file<span data-os-only="windows macos">, or
+            double-click it</span>. There are no configuration files to edit.</p>
+          <p class="note">The extension carries its own Copperpour server, so you don't need the KiCad
+            plugin. Install it as well only for Copperpour's KiCad toolbar action and settings
+            dialog, or the native Specctra export bridge. See the
+            <a href="https://github.com/Copperpour/Copperpour/blob/main/docs/CLAUDE_DESKTOP_EXTENSION.md">Claude
+            Desktop extension guide</a>.</p>
+        </li>
+
+        <li data-client-only="desktop">
+          <h3>Turn on the KiCad API<span class="nojs-only"> (Claude Desktop)</span></h3>
+          <p>In KiCad 10, turn on <strong>Preferences → Plugins → Enable KiCad API</strong>. The PCB
+            tools need KiCad running with the board open. Schematic editing, exports, ERC and DRC
+            work without the KiCad window.</p>
+        </li>
+
+        <li data-client-only="code codex other">
+          <h3>Install the plugin into KiCad<span class="nojs-only"> (other clients)</span></h3>
+          <p>Download the KiCad package for your system from the
+            <a href="https://github.com/Copperpour/Copperpour/releases/latest">latest release</a>:</p>
+          <p data-os-only="windows"><span class="panel-label">Windows: </span><code>copperpour-pcm-v&lt;version&gt;-windows.zip</code></p>
+          <p data-os-only="macos"><span class="panel-label">macOS: </span><code>copperpour-pcm-v&lt;version&gt;-macos.zip</code>,
+            a universal build for Apple Silicon and Intel Macs.</p>
+          <p data-os-only="linux"><span class="panel-label">Linux: </span><code>copperpour-pcm-v&lt;version&gt;-linux.zip</code>, for x86_64.</p>
+          <p class="note"><code>copperpour-pcm-v&lt;version&gt;.zip</code>, without an OS in its name,
+            carries all three systems.</p>
+          <p>In KiCad, open <strong>Plugin and Content Manager → Install from File</strong>, choose
+            the zip and restart KiCad. Then turn on <strong>Preferences → Plugins → Enable KiCad
+            API</strong>, which the PCB tools need.</p>
+        </li>
+
+        <li data-client-only="code codex other">
+          <h3>Connect your AI client<span class="nojs-only"> (other clients)</span></h3>
+          <div data-client-only="code">
+            <p class="panel-label">Claude Code</p>
+            <p>Add the server to <code>.mcp.json</code> in your project's root:</p>
+            <pre><code>{
+  "mcpServers": {
+    "copperpour": { "command": "<span data-server-path>/path/to/copperpour</span>" }
+  }
+}</code></pre>
+          </div>
+
+          <div data-client-only="codex">
+            <p class="panel-label">Codex</p>
+            <pre><code>codex mcp add copperpour -- "<span data-server-path data-shell>/path/to/copperpour</span>" --client codex</code></pre>
+          </div>
+
+          <div data-client-only="other">
+            <p class="panel-label">Other MCP clients</p>
+            <p>Register a stdio server whose command is the Copperpour binary, with no arguments.
+              Most clients take this shape:</p>
+            <pre><code>{
+  "mcpServers": {
+    "copperpour": { "command": "<span data-server-path>/path/to/copperpour</span>" }
+  }
+}</code></pre>
+          </div>
+
+          <p class="note">The KiCad package installs the server at
+            <span data-os-only="windows"><code>C:\Users\&lt;YOU&gt;\Documents\KiCad\10.0\3rdparty\plugins\com_github_copperpour_copperpour\bin\copperpour.exe</code>
+              on Windows; replace <code>&lt;YOU&gt;</code> with your user name</span><span data-os-only="macos" data-sep>,
+              <code>~/Documents/KiCad/10.0/3rdparty/plugins/com_github_copperpour_copperpour/bin/copperpour</code>
+              on macOS</span><span data-os-only="linux" data-sep>,
+              <code>~/.local/share/kicad/10.0/3rdparty/plugins/com_github_copperpour_copperpour/bin/copperpour</code>
+              on Linux</span>.
+            <span data-os-only="macos linux">If your client doesn't expand <code>~</code>, write
+              out your home folder instead.</span></p>
+        </li>
+
+        <li>
+          <h3>Check that it works</h3>
+          <p>Ask your assistant something read-only about an existing project:</p>
+          <pre><code>Show the project info for ~/kicad/myboard/myboard.kicad_pro.</code></pre>
+          <p>It should answer with the project's name, its schematic and PCB paths, and the KiCad
+            version that wrote them. If the tools don't show up, ask for
+            <code>get_installation_info</code>, or see
+            <a href="https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md">Troubleshooting</a>.</p>
+        </li>
+      </ol>
+      <p class="note">Standalone server binaries, optional skills for Claude Code, Codex, Gemini CLI
+        and Cursor, and other setups are in the full
+        <a href="https://github.com/Copperpour/Copperpour#installation">installation guide</a>.
+        Coming from Konnect? Read
+        <a href="https://github.com/Copperpour/Copperpour/blob/main/docs/MIGRATING_FROM_KONNECT.md">Migrating
+        from Konnect</a> first.</p>
+    </div>
+  </section>
+
+  <section id="next">
+    <div class="wrap">
+      <h2>Next steps</h2>
+      <div class="next">
+        <a class="card" href="https://github.com/Copperpour/Copperpour/blob/main/docs/GETTING_STARTED.md">
+          <strong>Design your first board →</strong>
+          <span>From an empty project through schematic, layout, design review and manufacturing
+            files, with example prompts for each step.</span>
+        </a>
+        <a class="card" href="https://github.com/Copperpour/Copperpour/blob/main/tool-directory.md">
+          <strong>Browse the tools →</strong>
+          <span>Every tool and toolset Copperpour gives your assistant.</span>
+        </a>
+        <a class="card" href="https://github.com/Copperpour/Copperpour">
+          <strong>Source and issues →</strong>
+          <span>Report bugs, ask questions and contribute on GitHub.</span>
+        </a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Copperpour is free software under the
+      <a href="https://github.com/Copperpour/Copperpour/blob/main/LICENSE">AGPL-3.0</a>. It is the
+      community-maintained fork of Konnect, which went closed source in October 2026.</p>
+    <p>Copperpour is an independent project, not affiliated with KiCad or Anthropic.</p>
+  </div>
+</footer>
+
+<script>
+(() => {
+  document.documentElement.classList.add('js');
+  const serverPaths = {
+    windows: 'C:\\Users\\<YOU>\\Documents\\KiCad\\10.0\\3rdparty\\plugins\\com_github_copperpour_copperpour\\bin\\copperpour.exe',
+    macos: '~/Documents/KiCad/10.0/3rdparty/plugins/com_github_copperpour_copperpour/bin/copperpour',
+    linux: '~/.local/share/kicad/10.0/3rdparty/plugins/com_github_copperpour_copperpour/bin/copperpour',
+  };
+  // JSON wants backslashes escaped; the shell command does not.
+  const jsonPath = (os) => serverPaths[os].replace(/\\/g, '\\\\');
+
+  function guessOs() {
+    const p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent;
+    if (/win/i.test(p)) return 'windows';
+    if (/mac|iphone|ipad/i.test(p)) return 'macos';
+    return 'linux';
+  }
+
+  const only = (attr, key) => {
+    document.querySelectorAll(`[${attr}]`).forEach((el) => {
+      el.hidden = !el.getAttribute(attr).split(' ').includes(key);
+    });
+  };
+
+  function select(group, key) {
+    document.querySelectorAll(`[role="tablist"][data-group="${group}"] [role="tab"]`).forEach((tab) => {
+      const on = tab.dataset.key === key;
+      tab.setAttribute('aria-selected', String(on));
+      tab.tabIndex = on ? 0 : -1;
+    });
+    if (group === 'client') only('data-client-only', key);
+    if (group === 'os') applyOs(key);
+  }
+
+  function applyOs(os) {
+    document.querySelectorAll('[data-server-path]').forEach((el) => {
+      el.textContent = el.hasAttribute('data-shell') ? serverPaths[os] : jsonPath(os);
+    });
+    only('data-os-only', os);
+    document.querySelectorAll('[data-os-only][data-sep]').forEach((el) => {
+      // Drop the leading ", " once only one OS is shown.
+      if (!el.hidden && el.firstChild.nodeType === Node.TEXT_NODE) {
+        el.firstChild.textContent = el.firstChild.textContent.replace(/^,\s*/, '');
+      }
+    });
+  }
+
+  document.querySelectorAll('.picker-label').forEach((label) => { label.hidden = false; });
+  document.querySelectorAll('[role="tablist"]').forEach((list) => {
+    list.hidden = false;
+    const tabs = [...list.querySelectorAll('[role="tab"]')];
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(list.dataset.group, tab.dataset.key));
+      tab.addEventListener('keydown', (e) => {
+        const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+        if (!step) return;
+        const next = tabs[(i + step + tabs.length) % tabs.length];
+        next.focus();
+        select(list.dataset.group, next.dataset.key);
+      });
+    });
+  });
+
+  select('os', guessOs());
+  select('client', 'desktop');
+})();
+</script>
+</body>
+</html>
