@@ -47,7 +47,7 @@ use query::{
     handle_list_schematic_components,
 };
 pub(crate) use readback::{
-    compact_placement, load_committed_component_schematic, placed_component_readback,
+    compact_placement, load_committed_component_snapshot, placed_component_readback,
     verify_component_mutation_intents, wants_verbose, ComponentMutationIntent, ComponentTargetUnit,
 };
 pub(crate) use transform::handle_move_region;
@@ -79,6 +79,8 @@ use deletion::{component_delete_commit_refusal, plan_component_deletion};
 use properties::{placement_landed, symbol_unit_from_block, FieldPlacement, PlacementRefusal};
 #[cfg(test)]
 use query::{pin_locations_for_reference, schematic_view_dir};
+#[cfg(test)]
+pub(crate) use readback::COMPONENT_SAVE_BEFORE_SNAPSHOT;
 #[cfg(test)]
 use readback::{
     checked_instance_paths, component_mutation_readback_from_schematic,
@@ -175,6 +177,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Symbol rotation in degrees, an exact multiple of 90.", "default": 0 },
+                    "autoplace_fields": super::sch_field_autoplace::opt_in_schema(),
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric. The stored orientation is normalized to the rotation and mirror pair eeschema writes (for example, 180° with 'x' is stored and reported as 0° with 'y')." },
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers. A numbered one already placed on any sheet of the hierarchy is refused as invalid_argument, unless this is another unit of that part with its value" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
@@ -316,7 +319,11 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string" },
-                    "rotation": { "type": "number", "description": "Absolute symbol rotation in degrees, an exact multiple of 90." }
+                    "rotation": { "type": "number", "description": "Absolute symbol rotation in degrees, an exact multiple of 90." },
+                    "autoplace_fields": { "type":"boolean", "default":false, "description":"Preview the prospective rotation and clearer Reference and Value positions without writing. Repeat with the preview revision and individual approvals to apply both in one write." },
+                    "revision": { "type":"string", "description":"Saved revision from the rotation preview; requires approvals." },
+                    "turn": { "type":"string", "description":"Turn token from the rotation preview; required to apply even with no field approvals." },
+                    "approvals": super::sch_field_autoplace::approval_schema()
                 },
                 "required": ["schematic", "reference", "rotation"]
             }),

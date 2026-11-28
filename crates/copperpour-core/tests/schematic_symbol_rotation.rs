@@ -265,6 +265,10 @@ async fn symbol_rotation_legacy_angle_blocks_transforms() {
         ("mirror_schematic_component", json!({"mirror": "x"})),
         ("mirror_schematic_component", json!({"mirror": "y"})),
         ("rotate_schematic_component", json!({"rotation": 90})),
+        (
+            "rotate_schematic_component",
+            json!({"rotation": 90, "autoplace_fields": true}),
+        ),
     ] {
         let mut args = extra;
         args["reference"] = json!("R1");

@@ -101,6 +101,7 @@ mod sch_cleanup;
 pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
+mod sch_field_autoplace;
 pub mod sch_hierarchy;
 mod sch_instance_repair;
 mod sch_label_rename;

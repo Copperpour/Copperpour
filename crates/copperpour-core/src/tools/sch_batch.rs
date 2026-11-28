@@ -218,6 +218,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "lib_id": { "type": "string" },
                                 "x": { "type": "number" }, "y": { "type": "number" },
                                 "rotation": { "type": "number", "description": "Symbol rotation in degrees, an exact multiple of 90. An invalid angle refuses only this entry.", "default": 0 },
+                                "autoplace_fields": super::sch_field_autoplace::opt_in_schema(),
                                 "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric. The stored orientation is normalized to the rotation and mirror pair eeschema writes (for example, 180° with 'x' is stored and reported as 0° with 'y')." },
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
@@ -769,6 +770,7 @@ async fn handle_batch_place_components(
     };
 
     let mut placements = Vec::new();
+    let mut autoplace_uuids = Vec::new();
     // The catalog's report on each placement's LCSC number, in step with
     // `placements`.
     let mut lcsc_catalogs = Vec::new();
@@ -790,6 +792,15 @@ async fn handle_batch_place_components(
             errors.push(message.clone());
             failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
             continue;
+        };
+        let autoplace = match super::opt_bool_flag(comp, "autoplace_fields") {
+            Ok(value) => value == Some(true),
+            Err(error) => {
+                let message = error_text(&error);
+                errors.push(message.clone());
+                failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
+                continue;
+            }
         };
         // One malformed entry refuses only itself, as every other per-entry
         // problem in this loop does; the batch is not abandoned because a
@@ -845,6 +856,9 @@ async fn handle_batch_place_components(
             &mut in_use,
         ) {
             Ok(placed) => {
+                if autoplace {
+                    autoplace_uuids.push(placed.uuid.clone());
+                }
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
                 placements.push(super::sch_components::ComponentTargetUnit::placement(
                     &placed.uuid,
@@ -879,10 +893,16 @@ async fn handle_batch_place_components(
     let mut placed = Vec::new();
     let mut junctions_added = 0;
     let mut junctions_pruned = 0;
+    let mut field_readback = None;
     if !placements.is_empty() {
         let candidate = sch.to_source();
         let (candidate, added, pruned) =
             super::sch_wiring::reconcile_junctions_for_placement(&before_source, candidate);
+        let (candidate, fields) = super::sch_field_autoplace::autoplace_authoring(
+            &before_source,
+            candidate,
+            &autoplace_uuids,
+        );
         junctions_added = added;
         junctions_pruned = pruned;
         if let Err(error) = write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
@@ -913,28 +933,29 @@ async fn handle_batch_place_components(
                 ),
             ));
         }
-        let committed = match super::sch_components::load_committed_component_schematic(&sch_path) {
-            Ok(committed) => committed,
-            Err(error) => {
-                let result = super::mutation_outcome_uncertain(
-                    &sch_path,
-                    "batch_place_components",
-                    format!("saved schematic could not be reloaded: {error}"),
-                );
-                return Ok(crate::outcome::attach(
-                    result,
-                    crate::outcome::summary(
-                        crate::outcome::OutcomeStatus::Uncertain,
-                        sch_path.display().to_string(),
-                        "saved_file_readback",
-                        components.len(),
-                        0,
-                        components.len(),
-                        Some(crate::outcome::inspect_before_retry()),
-                    ),
-                ));
-            }
-        };
+        let (saved, committed) =
+            match super::sch_components::load_committed_component_snapshot(&sch_path) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let result = super::mutation_outcome_uncertain(
+                        &sch_path,
+                        "batch_place_components",
+                        format!("saved schematic could not be reloaded: {error}"),
+                    );
+                    return Ok(crate::outcome::attach(
+                        result,
+                        crate::outcome::summary(
+                            crate::outcome::OutcomeStatus::Uncertain,
+                            sch_path.display().to_string(),
+                            "saved_file_readback",
+                            components.len(),
+                            0,
+                            components.len(),
+                            Some(crate::outcome::inspect_before_retry()),
+                        ),
+                    ));
+                }
+            };
         for (placement, lcsc_catalog) in placements.iter().zip(&lcsc_catalogs) {
             match placed_component_readback(&sch_path, &committed, placement, &context) {
                 Ok(mut result) => {
@@ -968,6 +989,10 @@ async fn handle_batch_place_components(
                 }
             }
         }
+        if !autoplace_uuids.is_empty() {
+            field_readback =
+                Some(fields.observe(&saved, &sch_path, &candidate, "batch_place_components"));
+        }
     }
 
     let status = if failures.is_empty() {
@@ -997,6 +1022,26 @@ async fn handle_batch_place_components(
         "failures": failures
     });
     in_use.disclose(&mut reply);
+    match field_readback {
+        Some(Ok(fields)) => reply["autoplaced_fields"] = fields,
+        // The file was written and these placements were read back; keep them
+        // so the caller knows what not to repeat.
+        Some(Err(error)) => {
+            return Ok(crate::outcome::attach(
+                crate::outcome::extend(error, reply),
+                crate::outcome::summary(
+                    crate::outcome::OutcomeStatus::Uncertain,
+                    sch_path.display().to_string(),
+                    "saved_file_readback",
+                    components.len(),
+                    placed.len(),
+                    components.len() - placed.len(),
+                    Some(crate::outcome::inspect_before_retry()),
+                ),
+            ));
+        }
+        None => {}
+    }
     let mut result = CallToolResult::json(&reply);
     result.is_error = placed.is_empty() && !errors.is_empty();
     Ok(crate::outcome::attach(

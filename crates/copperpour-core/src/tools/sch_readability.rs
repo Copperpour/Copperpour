@@ -22,6 +22,7 @@ pub fn tools() -> Vec<ToolDef> {
         super::sch_block_placement::definition(),
         sch_placement_check::definition(),
         super::sch_split_plan::tool_def(),
+        super::sch_field_autoplace::definition(),
     ]
 }
 
@@ -210,5 +211,13 @@ mod tests {
     #[tokio::test]
     async fn wire_label_exchange_belongs_to_readability() {
         assert_readability_route("exchange_schematic_wires_and_labels").await;
+    }
+
+    #[tokio::test]
+    async fn field_placement_belongs_to_readability() {
+        assert!(crate::tools::sch_components::tools()
+            .iter()
+            .all(|tool| tool.name != "autoplace_schematic_fields"));
+        assert_readability_route("autoplace_schematic_fields").await;
     }
 }

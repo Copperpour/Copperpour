@@ -1,11 +1,13 @@
 //! Component placement and library symbol resolution/embedding.
 
 use super::readback::{
-    compact_placement, load_committed_component_schematic, placed_component_readback,
+    compact_placement, load_committed_component_snapshot, placed_component_readback,
     tool_error_summary, wants_verbose, ComponentTargetUnit,
 };
 use crate::mcp::protocol::CallToolResult;
-use crate::tools::{get_path, opt_str, opt_u32, require_f64, require_str, ToolContext};
+use crate::tools::{
+    get_path, opt_bool_flag, opt_str, opt_u32, require_f64, require_str, ToolContext,
+};
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::geometry::snap_point;
 use serde_json::json;
@@ -15,6 +17,10 @@ pub(crate) async fn handle_add_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let autoplace = match opt_bool_flag(args, "autoplace_fields") {
+        Ok(value) => value == Some(true),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
+    };
     let lib_id = match require_str(args, "lib_id") {
         Ok(s) => s.to_string(),
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -38,8 +44,8 @@ pub(crate) async fn handle_add_schematic_component(
         Ok(unit) => unit.unwrap_or(1),
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    // Load via copperpour-schematic-editor
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let before = copperpour_sexp::read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before.clone())?;
 
     // KiCAD's netlister resolves instances against the ROOT sheet's uuid and
     // the project's name, and silently forms no wire-only nets for symbols
@@ -119,9 +125,36 @@ pub(crate) async fn handle_add_schematic_component(
         &placed.fields,
         unit,
     );
-    if let Err(error) = sch.overwrite() {
+    let mut planned_junctions = None;
+    let mut field_readback = None;
+    let save = if autoplace {
+        use copperpour_sexp::{parse_sexp, schematic::extract_junctions};
+        let (candidate, added, _) =
+            crate::tools::sch_wiring::reconcile_junctions_for_placement(&before, sch.to_source());
+        planned_junctions = Some(if added == 0 {
+            Vec::new()
+        } else {
+            let existing = extract_junctions(&parse_sexp(&before)?);
+            extract_junctions(&parse_sexp(&candidate)?)
+                .into_iter()
+                .filter(|point| !existing.contains(point))
+                .collect()
+        });
+        let (candidate, fields) = crate::tools::sch_field_autoplace::autoplace_authoring(
+            &before,
+            candidate,
+            std::slice::from_ref(&placed.uuid),
+        );
+        let saved = copperpour_sexp::write_atomic_if_unchanged(&sch_path, &before, &candidate)
+            .map_err(anyhow::Error::from);
+        field_readback = Some((fields, candidate));
+        saved
+    } else {
+        sch.overwrite().map_err(anyhow::Error::from)
+    };
+    if let Err(error) = save {
         if let Some(refusal) =
-            crate::tools::unwritten_schematic_refusal("add_schematic_component", &error)
+            crate::tools::unwritten_schematic_refusal("add_schematic_component", error.as_ref())
         {
             return Ok(crate::outcome::refused_before_write(
                 refusal,
@@ -148,11 +181,12 @@ pub(crate) async fn handle_add_schematic_component(
         ));
     }
 
-    // A pin landing mid-segment on an existing wire needs a junction dot, or
-    // KiCad's netlister treats it as unconnected. Runs after the write because
-    // it re-reads the saved file; `place_one_component` stays pure so the batch
-    // path can do one junction pass for the whole batch instead of one per part.
-    let junctions = match crate::tools::add_pin_midwire_junctions(&sch_path, &placed.reference) {
+    // Keep the legacy post-write pass unless the opt-in candidate already
+    // reconciled and committed its junctions with the placement.
+    let junctions = match planned_junctions
+        .map(Ok)
+        .unwrap_or_else(|| crate::tools::add_pin_midwire_junctions(&sch_path, &placed.reference))
+    {
         Ok(junctions) => junctions,
         Err(error) => {
             let uncertain = crate::tools::mutation_outcome_uncertain(
@@ -174,7 +208,7 @@ pub(crate) async fn handle_add_schematic_component(
             ));
         }
     };
-    let committed = match load_committed_component_schematic(&sch_path) {
+    let (saved, committed) = match load_committed_component_snapshot(&sch_path) {
         Ok(committed) => committed,
         Err(error) => {
             let uncertain = crate::tools::mutation_outcome_uncertain(
@@ -234,6 +268,26 @@ pub(crate) async fn handle_add_schematic_component(
         result["lcsc_catalog"] = report.clone();
     }
     in_use.disclose(&mut result);
+    if let Some((fields, candidate)) = field_readback {
+        match fields.observe(&saved, &sch_path, &candidate, "add_schematic_component") {
+            Ok(fields) => result["autoplaced_fields"] = fields,
+            // The symbol itself was read back; report it with the uncertainty.
+            Err(error) => {
+                return Ok(crate::outcome::attach(
+                    crate::outcome::extend(error, json!({ "placed": result })),
+                    crate::outcome::summary(
+                        crate::outcome::OutcomeStatus::Uncertain,
+                        sch_path.display().to_string(),
+                        "saved_file_readback",
+                        1,
+                        1,
+                        0,
+                        Some(crate::outcome::inspect_before_retry()),
+                    ),
+                ))
+            }
+        }
+    }
 
     Ok(crate::outcome::attach(
         CallToolResult::json(&result),

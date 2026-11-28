@@ -992,6 +992,13 @@ fn set_property_placement(
                     cse::types::fmt_f64(placement.rotation.unwrap_or(current_rot))
                 ),
             ));
+            for (from, to) in copperpour_sexp::writer::direct_children_with_tag(
+                block,
+                "symbol",
+                "fields_autoplaced",
+            ) {
+                edits.push(SexpEdit::delete(start + from, start + to));
+            }
         }
 
         if let Some(hide) = placement.hide {

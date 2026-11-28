@@ -258,6 +258,7 @@ async fn a_visible_power_reference_is_not_checked_for_wire_crossings() {
     let wire = sheet.add_wire(45.72, 59.69, 55.88, 59.69).uuid.clone();
     let source = sheet.to_source();
     let body = served_overlaps(source.as_bytes()).await;
+    assert_eq!(body["overlap_count"], 2, "{body}");
     assert!(
         body["overlaps"]
             .as_array()
@@ -266,6 +267,20 @@ async fn a_visible_power_reference_is_not_checked_for_wire_crossings() {
             .all(|o| o["a"]["uuid"] != wire),
         "{body}"
     );
+    let tree = copperpour_sexp::parse_sexp(&source).unwrap();
+    let wires = copperpour_sexp::schematic::extract_wires(&tree);
+    let (clearance, _, _) = crate::tools::sch_analysis::overlap_findings_with_field_clearance(
+        &tree,
+        &wires,
+        crate::tools::sch_analysis::OVERLAP_TOLERANCE,
+        true,
+    );
+    assert!(clearance.iter().any(|o| {
+        o["a"]["uuid"] == wire
+            && o["type"] == "wire_field_overlap"
+            && o["b"]["reference"] == "#PWR01"
+            && o["b"]["field"] == "Reference"
+    }));
     let mut without_definition = cse::sexp::parser::parse(&source).unwrap();
     remove_power_definition(&mut without_definition);
     let control = served_overlaps(cse::sexp::writer::write(&without_definition).as_bytes()).await;

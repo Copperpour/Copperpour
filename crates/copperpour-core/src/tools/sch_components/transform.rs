@@ -2,18 +2,22 @@
 
 use super::placement::mirror_arg;
 use super::readback::{
-    component_target_from_source, copy_component_observation, load_component_mutation_readback,
+    component_target_from_source, copy_component_observation, load_committed_component_snapshot,
+    load_component_mutation_readback, tool_error_summary, verified_component_readback,
     ComponentTarget,
 };
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tools::sch_block_move::{misplaced_item, move_net_changes, translate_block, Region};
+use crate::tools::sch_field_autoplace::{
+    field_preview_conflict, read_preview_source, rotation_fields, RotationFields,
+};
 use crate::tools::sch_wiring::{
     carry_no_connects, observed_no_connect_moves, reconcile_junctions_for_placement,
 };
 use crate::tools::{
-    get_path, invalid_arg, is_symbol_quarter_turn, opt_str, opt_u32, require_f64, require_str,
-    symbol_rotation_arg, ToolContext,
+    get_path, invalid_arg, is_symbol_quarter_turn, opt_bool_flag, opt_str, opt_u32, require_f64,
+    require_str, symbol_rotation_arg, ToolContext,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
@@ -127,6 +131,20 @@ pub(super) async fn handle_rotate_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let autoplace = match opt_bool_flag(args, "autoplace_fields") {
+        Ok(value) => value == Some(true),
+        Err(error) => return Ok(error),
+    };
+    if !autoplace
+        && ["approvals", "revision", "turn"]
+            .iter()
+            .any(|key| !args[*key].is_null())
+    {
+        return Ok(invalid_arg(
+            "autoplace_fields",
+            "requires true when supplying revision, turn or approvals",
+        ));
+    }
     let reference = match require_str(args, "reference") {
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
@@ -135,7 +153,21 @@ pub(super) async fn handle_rotate_schematic_component(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let before_source = read_consistent(&sch_path)?;
+    let (before_source, authorization) = if autoplace {
+        match read_preview_source(args, &sch_path)? {
+            Ok((source, authorization)) => {
+                if let Err(error) =
+                    crate::tools::sch_layout_score::parse_saved_sheet(&sch_path, &source)
+                {
+                    return Ok(error);
+                }
+                (source, Some(authorization))
+            }
+            Err(error) => return Ok(error),
+        }
+    } else {
+        (read_consistent(&sch_path)?, None)
+    };
     let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
@@ -179,15 +211,66 @@ pub(super) async fn handle_rotate_schematic_component(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    let (candidate, field_readback) = if let Some(authorization) = authorization {
+        match rotation_fields(
+            args,
+            &before_source,
+            authorization,
+            candidate,
+            &selected,
+            rotation,
+        )? {
+            Ok(RotationFields::Preview(preview)) => return Ok(preview),
+            Ok(RotationFields::Apply(candidate, observe)) => (candidate, Some(observe)),
+            Err(error) => return Ok(error),
+        }
+    } else {
+        (candidate, None)
+    };
+    match write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
+        Ok(()) => {}
+        Err(copperpour_sexp::SexpError::Conflict { path }) if autoplace => {
+            return Ok(field_preview_conflict(&path));
+        }
+        Err(error) => return Err(error.into()),
+    }
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
             Ok(moved) => moved,
             Err(error) => return Ok(error),
         };
-    let observed = match load_component_mutation_readback(&sch_path, &target)? {
-        Ok(observed) => observed,
-        Err(error) => return Ok(error),
+    let (observed, fields) = if let Some(field_readback) = field_readback {
+        let uncertain_turn = |reason| {
+            crate::outcome::extend(
+                crate::tools::mutation_outcome_uncertain(
+                    &sch_path,
+                    "rotate_schematic_component",
+                    reason,
+                ),
+                json!({"observed_before_uncertainty": {"no_connects_moved": moved_markers}}),
+            )
+        };
+        let (saved, committed) = match load_committed_component_snapshot(&sch_path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(uncertain_turn(format!(
+                    "Could not read the saved turn: {error}"
+                )))
+            }
+        };
+        let observed = match verified_component_readback(&sch_path, &committed, &target) {
+            Ok(observed) => observed,
+            Err(error) => return Ok(uncertain_turn(tool_error_summary(&error))),
+        };
+        (
+            observed,
+            Some(field_readback.observe(&sch_path, &saved, &candidate)),
+        )
+    } else {
+        match load_component_mutation_readback(&sch_path, &target)? {
+            Ok(observed) => (observed, None),
+            Err(error) => return Ok(error),
+        }
     };
     let mut result = json!({
         "rotated": observed["reference"],
@@ -200,6 +283,23 @@ pub(super) async fn handle_rotate_schematic_component(
         "no_connects_moved": moved_markers
     });
     copy_component_observation(&mut result, &observed);
+    if let Some(fields) = fields {
+        match fields {
+            Ok((fields, withdrawn)) => {
+                result["approved_field_placements"] = json!(fields);
+                result["withdrawn_offers"] = json!(withdrawn);
+            }
+            Err(error) => {
+                return Ok(crate::outcome::extend(
+                    error,
+                    json!({"observed_before_uncertainty": {
+                        "placements": result["placements"],
+                        "no_connects_moved": moved_markers
+                    }}),
+                ));
+            }
+        }
+    }
     Ok(CallToolResult::json(&result))
 }
 
