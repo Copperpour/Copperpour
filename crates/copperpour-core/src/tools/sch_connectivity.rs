@@ -268,6 +268,20 @@ fn label_hits_segment(p: NetRoot, a: NetRoot, b: NetRoot) -> bool {
     axis_distance(p.0, a.0, b.0) <= 1 && axis_distance(p.1, a.1, b.1) <= 1
 }
 
+pub(super) fn saved_label_touches_wire(label: &Label, wire: &Wire) -> bool {
+    let p = schematic_point(label.x, label.y);
+    let [a, b] = wire_points(wire);
+    if matches!(
+        label.kind,
+        LabelKind::NetLabel | LabelKind::GlobalLabel | LabelKind::HierarchicalLabel
+    ) && (a.0 == b.0 || a.1 == b.1)
+    {
+        label_hits_segment(p, a, b)
+    } else {
+        on_saved_segment(p, a, b)
+    }
+}
+
 /// Axis-aligned wires indexed by their exact integer row or column.
 #[derive(Default)]
 struct SavedWireIndex {
@@ -906,12 +920,17 @@ impl UnitNotation {
     }
 
     pub(crate) fn project_notation(schematic: &std::path::Path) -> Option<Self> {
-        let default = UnitNotation::default();
-        let project = crate::tools::resolve_schematic_ownership(schematic)
+        let text = crate::tools::resolve_schematic_ownership(schematic)
             .ok()
             .flatten()
-            .and_then(|ownership| std::fs::read_to_string(ownership.project_file).ok())
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())?;
+            .and_then(|ownership| std::fs::read_to_string(ownership.project_file).ok())?;
+        Self::from_project_source(&text)
+    }
+
+    /// The notation a project file's text gives, or `None` when it is not JSON.
+    pub(super) fn from_project_source(source: &str) -> Option<Self> {
+        let default = Self::default();
+        let project = serde_json::from_str::<serde_json::Value>(source).ok()?;
         let setting = |key: &str, range: std::ops::RangeInclusive<u32>, fallback: u32| {
             project["schematic"][key]
                 .as_u64()
@@ -1055,6 +1074,31 @@ pub(super) struct NamingPin {
     pub(super) pin: LibPin,
     pub(super) alternate_name: Option<String>,
     pub(super) global_power: bool,
+}
+
+pub(super) fn placed_pin_alternates(symbol: &SexpNode) -> HashMap<&str, &str> {
+    symbol
+        .find_all("pin")
+        .into_iter()
+        .filter_map(|pin| Some((pin.get(1)?.as_str()?, pin.find_str("alternate")?)))
+        .collect()
+}
+
+pub(super) fn select_pin_alternate(
+    pin: &mut LibPin,
+    node: &SexpNode,
+    alternates: &HashMap<&str, &str>,
+) -> Option<String> {
+    let &alternate = alternates
+        .get(pin.number.as_str())
+        .filter(|name| !name.is_empty())?;
+    let kind = node.find_all("alternate").into_iter().find_map(|alt| {
+        (alt.get(1)?.as_str()? == alternate)
+            .then(|| alt.get(2)?.as_str())
+            .flatten()
+    })?;
+    pin.electrical_type = kind.to_owned();
+    Some(alternate.to_owned())
 }
 
 impl PinNetNames {

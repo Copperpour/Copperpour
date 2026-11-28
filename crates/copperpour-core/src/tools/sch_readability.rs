@@ -1,4 +1,4 @@
-//! Read-only checks of one saved schematic sheet's drawing and layout.
+//! Drawing and layout checks and preview-first edits of saved schematic sheets.
 
 mod connector_pin_signals;
 
@@ -16,6 +16,7 @@ pub fn tools() -> Vec<ToolDef> {
         sch_page_fit::tool_def(),
         sch_wire_runs::tool_def(),
         compare_tool_def(),
+        sch_wire_runs::label_edit_tool_def(),
         sch_pin_contacts::definition(),
         super::sch_cleanup::definition(),
         super::sch_block_placement::definition(),
@@ -204,5 +205,10 @@ mod tests {
     #[tokio::test]
     async fn placement_check_belongs_to_readability() {
         assert_readability_route("check_placement").await;
+    }
+
+    #[tokio::test]
+    async fn wire_label_exchange_belongs_to_readability() {
+        assert_readability_route("exchange_schematic_wires_and_labels").await;
     }
 }

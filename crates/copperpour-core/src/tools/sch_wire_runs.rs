@@ -1,7 +1,12 @@
 //! Advisory checks for the drawn route, not the electrically merged net.
 
+mod label_advice;
+mod label_edit;
+pub(super) use label_edit::tool_def as label_edit_tool_def;
+
 use super::{
-    drawn_pins_for_power_drivers, get_path, opt_positive_f64,
+    drawn_pins_for_power_drivers, drawn_symbol_pin_inventory, get_path, invalid_arg,
+    opt_positive_f64,
     sch_connectivity::{
         bus_entry_wire_ends, net_graph_for, schematic_pin_endpoint, PinNetNames, UnitNotation,
         WireIndex, COINCIDENT_TOLERANCE,
@@ -21,7 +26,10 @@ use copperpour_sexp::{
     SexpError, SexpNode,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::Path,
+};
 
 const LONG_MM: f64 = 100.0;
 const DETOUR_MM: f64 = 10.0;
@@ -33,13 +41,15 @@ pub(super) fn tool_def() -> ToolDef {
         "check_schematic_wire_runs",
         "Report long or indirect branch-free orthogonal wire runs on a saved sheet. Includes \
          lengths in mm, bends, endpoint status, and electrical net names where known. \
-         Run geometry uses drawn contacts. Makes no edits.",
+         Run geometry uses drawn contacts. Opt in to labels-versus-wires advice for a region \
+         or one selected run. Makes no edits.",
         json!({
             "type": "object",
             "properties": {
                 "schematic": { "type": "string", "description": "Path to the saved .kicad_sch file" },
                 "long_run_mm": { "type": "number", "default": LONG_MM, "description": "Minimum total length in mm for a long-run finding; must be positive" },
-                "detour_mm": { "type": "number", "default": DETOUR_MM, "description": "Minimum extra length in mm over the direct orthogonal distance; must be positive" }
+                "detour_mm": { "type": "number", "default": DETOUR_MM, "description": "Minimum extra length in mm over the direct orthogonal distance; must be positive" },
+                "label_advice": label_advice::Request::schema()
             },
             "required": ["schematic"]
         }),
@@ -77,6 +87,37 @@ struct Edge {
     a: Point,
     b: Point,
     wire: usize,
+}
+
+impl WireRun {
+    fn uses_whole_wires(&self, wires: &[Wire]) -> bool {
+        self.segments.iter().all(|edge| {
+            let wire = &wires[edge.wire];
+            let a = point(wire.x1, wire.y1);
+            let b = point(wire.x2, wire.y2);
+            (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a)
+        })
+    }
+}
+
+fn hidden_power_roots(
+    tree: &SexpNode,
+    graph: &mut super::sch_connectivity::NetGraph,
+) -> BTreeMap<super::sch_connectivity::NetRoot, BTreeSet<String>> {
+    let mut roots = BTreeMap::<_, BTreeSet<_>>::new();
+    drawn_pins_for_power_drivers(tree)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, pins)| pins)
+        .filter(|(pin, _)| pin.hidden && pin.electrical_type == "power_in")
+        .for_each(|(pin, transform)| {
+            let (x, y) = pin_endpoint(&pin, transform);
+            roots
+                .entry(graph.root_at(x, y))
+                .or_default()
+                .insert(pin.name);
+        });
+    roots
 }
 
 pub(crate) struct WireRun {
@@ -127,6 +168,38 @@ fn split_points(wires: &[Wire], taps: impl Iterator<Item = (f64, f64)>) -> Vec<V
     cuts
 }
 
+fn malformed_schematic(path: &Path, reason: String) -> CallToolResult {
+    let message = format!("Cannot check {}: {reason}", path.display());
+    CallToolResult::error_kind(
+        ToolErrorKind::MalformedFile {
+            path: path.display().to_string(),
+            reason,
+        },
+        message,
+    )
+}
+
+fn schematic_read_refusal(path: &Path, error: &SexpError) -> Option<CallToolResult> {
+    match error {
+        SexpError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(CallToolResult::error_kind(
+                ToolErrorKind::file_not_found(path),
+                format!("Schematic not found: {}", path.display()),
+            ))
+        }
+        // read_to_string reports non-UTF-8 input as invalid data.
+        SexpError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            Some(malformed_schematic(path, error.to_string()))
+        }
+        SexpError::Io(error) => Some(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(path),
+            format!("Cannot read schematic {}: {error}", path.display()),
+        )),
+        SexpError::Parse { .. } => Some(malformed_schematic(path, error.to_string())),
+        _ => None,
+    }
+}
+
 fn handle_check_schematic_wire_runs(args: &Value) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "schematic")?;
     let threshold = |key, default| opt_positive_f64(args, key).map(|v| v.unwrap_or(default));
@@ -137,42 +210,25 @@ fn handle_check_schematic_wire_runs(args: &Value) -> anyhow::Result<CallToolResu
         (Ok(long), Ok(detour)) => (long, detour),
         (Err(error), _) | (_, Err(error)) => return Ok(error),
     };
-    let malformed = |reason: String| {
-        let message = format!("Cannot check {}: {reason}", path.display());
-        CallToolResult::error_kind(
-            ToolErrorKind::MalformedFile {
-                path: path.display().to_string(),
-                reason,
-            },
-            message,
-        )
+    let advice = match args
+        .get("label_advice")
+        .map(label_advice::Request::parse)
+        .transpose()
+    {
+        Ok(advice) => advice,
+        Err(reason) => return Ok(invalid_arg("label_advice", reason)),
     };
     let tree = match read_schematic(&path) {
         Ok((_, tree)) => tree,
-        Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::file_not_found(&path),
-                format!("Schematic not found: {}", path.display()),
-            ));
-        }
-        // `read_to_string` reports a file that is not UTF-8 as invalid data.
-        Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return Ok(malformed(error.to_string()));
-        }
-        Err(error @ SexpError::Parse { .. }) => return Ok(malformed(error.to_string())),
-        Err(error) => return Err(error.into()),
+        Err(error) => return schematic_read_refusal(&path, &error).ok_or_else(|| error.into()),
     };
     if tree.head() != Some("kicad_sch") {
-        return Ok(malformed("expected a KiCad schematic sheet".to_owned()));
+        return Ok(malformed_schematic(
+            &path,
+            "expected a KiCad schematic sheet".to_owned(),
+        ));
     }
-    let WireRuns {
-        runs,
-        wires,
-        labels,
-        skipped_wire_count,
-        skipped_closed_segment_count,
-        pin_geometry_resolved,
-    } = match measure_wire_runs(&tree) {
+    let measured = match measure_wire_runs(&tree) {
         Ok(report) => report,
         Err(reason) => {
             return Ok(CallToolResult::error_kind(
@@ -184,6 +240,21 @@ fn handle_check_schematic_wire_runs(args: &Value) -> anyhow::Result<CallToolResu
             ));
         }
     };
+    let advice = match advice
+        .map(|request| label_advice::report(&request, &tree, &measured, detour_mm))
+        .transpose()
+    {
+        Ok(advice) => advice,
+        Err(reason) => return Ok(invalid_arg("label_advice", reason)),
+    };
+    let WireRuns {
+        runs,
+        wires,
+        labels,
+        skipped_wire_count,
+        skipped_closed_segment_count,
+        pin_geometry_resolved,
+    } = measured;
     let run_count = runs.len();
     let mut findings = Vec::new();
     let mut names = None;
@@ -235,7 +306,7 @@ fn handle_check_schematic_wire_runs(args: &Value) -> anyhow::Result<CallToolResu
             "reasons": reasons
         }));
     }
-    Ok(CallToolResult::json(&json!({
+    let mut result = json!({
         "schematic": path,
         "source": "saved_file",
         "thresholds": { "long_run_mm": long_mm, "detour_mm": detour_mm },
@@ -245,7 +316,11 @@ fn handle_check_schematic_wire_runs(args: &Value) -> anyhow::Result<CallToolResu
         "skipped_wire_count": skipped_wire_count,
         "skipped_closed_segment_count": skipped_closed_segment_count,
         "pin_geometry_resolved": pin_geometry_resolved
-    })))
+    });
+    if let Some(advice) = advice {
+        result["label_advice"] = json!(advice);
+    }
+    Ok(CallToolResult::json(&result))
 }
 
 /// Measure all runs on one saved sheet, before applying advisory thresholds.
@@ -459,8 +534,11 @@ mod tests {
         include_bytes!("../../tests/fixtures/schematic_wire_runs_kicad10.kicad_sch");
     const MIXED_POWER: &[u8] =
         include_bytes!("../../tests/fixtures/schematic_wire_runs_mixed-power.kicad_sch");
+    const ADVICE_FIXTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/labels_vs_wires_kicad10/crossing/crossing.kicad_sch");
+    const CROSSING_WIRE: &str = "0bb4199c-0170-4fa5-beb8-87ea04205c3a";
 
-    async fn served(
+    pub(super) async fn served(
         handler: &crate::mcp::handler::McpHandler,
         name: &str,
         arguments: Value,
@@ -530,6 +608,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn region_and_exact_run_return_the_same_label_advice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crossing.kicad_sch");
+        let (selected_result, selected) = call_on_fixture(
+            &path,
+            ADVICE_FIXTURE,
+            json!({ "label_advice": { "long_run_mm": 100.0, "wire_uuids": [CROSSING_WIRE] } }),
+            false,
+        )
+        .await;
+        let (region_result, region) = call_on_fixture(
+            &path,
+            ADVICE_FIXTURE,
+            json!({ "label_advice": { "long_run_mm": 100.0, "region": { "min": [65, 96], "max": [75, 97] } } }),
+            true,
+        )
+        .await;
+        assert_ne!(selected_result["isError"], true, "{selected_result}");
+        assert_ne!(region_result["isError"], true, "{region_result}");
+        assert_eq!(selected["label_advice"].as_array().unwrap().len(), 1);
+        assert_eq!(selected["label_advice"], region["label_advice"]);
+        assert_eq!(region["label_advice"][0]["crossed_blocks"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_advice_run_is_refused_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crossing.kicad_sch");
+        let (result, body) = call_on_fixture(
+            &path,
+            ADVICE_FIXTURE,
+            json!({ "label_advice": { "long_run_mm": 100.0, "wire_uuids": ["not-a-saved-wire"] } }),
+            false,
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("one measured run"));
+    }
+
+    #[tokio::test]
+    async fn label_advice_requires_a_positive_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crossing.kicad_sch");
+        let args = json!({"label_advice":{"wire_uuids":[CROSSING_WIRE],"long_run_mm":0}});
+        let (result, body) = call_on_fixture(&path, ADVICE_FIXTURE, args, false).await;
+        assert_eq!(result["isError"], true, "{body:#}");
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+    }
+
+    #[tokio::test]
     async fn wire_runs_report_meander_and_long_run() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runs.kicad_sch");
@@ -538,6 +670,7 @@ mod tests {
         assert_ne!(result["isError"], true, "{result}");
         assert_ne!(gateway_result["isError"], true, "{gateway_result}");
         assert_eq!(body, gateway_body);
+        assert!(body.get("label_advice").is_none());
         assert_eq!(body["source"], "saved_file");
         assert_eq!(
             body["thresholds"],
@@ -751,7 +884,8 @@ mod tests {
         // On Unix, a directory read fails before any bytes can be decoded.
         // This is an I/O refusal, not a malformed schematic.
         assert_eq!(result["isError"], true, "{body}");
-        assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["error"]["path"], json!(path), "{body}");
         assert!(path.is_dir());
         assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
