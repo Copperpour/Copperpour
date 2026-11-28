@@ -532,7 +532,10 @@ pub fn tools() -> Vec<ToolDef> {
             "replace_component",
             "Replace every placed unit of a component with a new library symbol while \
              preserving unit numbers. A unit override is accepted only for a single \
-             placement. Junction dots are re-judged once for the whole replacement, \
+             placement. The old embedded definition is removed after its last use on the \
+             sheet, reported as removed_lib_symbol (null if nothing was removed). \
+             New definitions use the schematic writer's nested layout. \
+             Junction dots are re-judged once for the whole replacement, \
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag follows the same symbol UUID, unit, and pin number when that mapping is \
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
@@ -557,7 +560,8 @@ pub fn tools() -> Vec<ToolDef> {
              symbol, so editing one in its library leaves the sheet drawing the old \
              shape — this refreshes it. A placed symbol whose definition the sheet \
              lacks, such as one repointed at another library, has it embedded \
-             (reported in added). A symbol whose pins moved or disappeared in \
+             (reported in added). New and refreshed definitions use the schematic writer's \
+             nested layout. A symbol whose pins moved or disappeared in \
              the library is refused (reported in pins_moved) unless allow_pin_moves \
              is set, because wires and labels attach at pin coordinates.",
             json!({

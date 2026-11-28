@@ -17,17 +17,20 @@ use crate::tools::sch_wiring::{
     plan_no_connect_carry_for_replacement, reconcile_junctions_for_placement,
 };
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_u32, reembed_lib_symbols, require_array,
-    require_str, ReembedOutcome, ToolContext,
+    find_all_symbol_instance_blocks, get_path, lib_symbol_name, opt_u32, reembed_lib_symbols,
+    require_array, require_str, ReembedOutcome, ToolContext,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
     parse_sexp,
     schematic::{extract_symbol_instances, read_schematic},
-    writer::{apply_edits, read_consistent, write_atomic_if_unchanged, SexpEdit},
+    writer::{
+        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
+    },
     SchematicCommand,
 };
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) async fn handle_add_component_annotation(
@@ -750,11 +753,25 @@ pub(super) async fn handle_replace_component(
         return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id, &src));
     }
 
+    let after_tree = parse_sexp(&content)?;
+    let old_key = embedded_definition_key(&target.units[0].lib_id);
+    // A repeated cache section makes it ambiguous which saved block is the
+    // effective definition. Keep those blocks intact.
+    let removed_lib_symbol = if old_key != embedded_definition_key(&new_lib_id)
+        && after_tree.find_all("lib_symbols").len() == 1
+        && !after_tree
+            .find_all("symbol")
+            .iter()
+            .any(|symbol| placed_symbol_key(symbol).as_deref() == Some(old_key.as_ref()))
+    {
+        remove_embedded_lib_symbol(&mut content, &old_key)
+    } else {
+        None
+    };
     // A replacement changes pin geometry while preserving only symbol UUID,
     // unit and pin number. Carry a marker through that narrower, explicitly
     // one-to-one identity before the junction pass sees the new endpoints;
     // removed, renumbered or duplicated protected pins refuse before writing.
-    let after_tree = parse_sexp(&content)?;
     let carries = match plan_no_connect_carry_for_replacement(&parsed, &after_tree) {
         Ok(carries) => carries,
         Err(error) => return Ok(error.into_result(&sch_path)),
@@ -793,10 +810,31 @@ pub(super) async fn handle_replace_component(
             ));
         }
     };
+    if let Some(removed) = &removed_lib_symbol {
+        let removed_key = embedded_definition_key(removed);
+        let removal_observed = read_schematic(&sch_path).is_ok_and(|(_, tree)| {
+            let sections = tree.find_all("lib_symbols");
+            sections.len() == 1
+                && sections[0].find_all("symbol").iter().all(|symbol| {
+                    symbol
+                        .get(1)
+                        .and_then(|name| name.as_str())
+                        .is_none_or(|name| embedded_definition_key(name) != removed_key)
+                })
+        });
+        if !removal_observed {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                format!("could not verify that the embedded definition '{removed}' was removed"),
+            ));
+        }
+    }
     let mut result = json!({
         "reference": observed["reference"],
         "old_lib_id": old_lib_id,
         "new_lib_id": observed["lib_id"],
+        "removed_lib_symbol": removed_lib_symbol,
         "unit": new_unit,
         "units_replaced": observed["unit_count"],
         "junctions_added_count": added,
@@ -808,4 +846,53 @@ pub(super) async fn handle_replace_component(
     Ok(CallToolResult::json(&result))
 }
 
-// Library symbol resolution moved to tools/mod.rs (shared with sch_wiring.rs)
+/// KiCad applies duplicate fields in file order and falls back to the library
+/// ID when the last sheet-local name is empty.
+fn placed_symbol_key(symbol: &copperpour_sexp::SexpNode) -> Option<Cow<'_, str>> {
+    let last_field = |tag| {
+        symbol
+            .children()?
+            .iter()
+            .rev()
+            .find(|field| field.head() == Some(tag))?
+            .get(1)?
+            .as_str()
+    };
+    last_field("lib_name")
+        .filter(|name| !name.is_empty())
+        .map(unescape_symbol_name)
+        .or_else(|| last_field("lib_id").map(embedded_definition_key))
+}
+
+/// KiCad parses an embedded definition name as a library ID. Formatting the
+/// parsed ID omits an empty nickname. Sheet-local aliases are plain names.
+fn embedded_definition_key(name: &str) -> Cow<'_, str> {
+    unescape_symbol_name(name.strip_prefix(':').unwrap_or(name))
+}
+
+fn unescape_symbol_name(name: &str) -> Cow<'_, str> {
+    if name.contains("{slash}") {
+        Cow::Owned(name.replace("{slash}", "/"))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Remove the obsolete definition and return its spelling as stored in the
+/// sheet. Edit from the end so any earlier definition retains its offset.
+fn remove_embedded_lib_symbol(content: &mut String, key: &str) -> Option<String> {
+    let mut removed = None;
+    for (start, end) in find_direct_child_blocks(content, "lib_symbols")
+        .into_iter()
+        .rev()
+    {
+        if let Some(name) = lib_symbol_name(&content[start..end])
+            .filter(|name| embedded_definition_key(name) == key)
+        {
+            let start = content[..start].trim_end().len();
+            content.replace_range(start..end, "");
+            removed = Some(name);
+        }
+    }
+    removed
+}

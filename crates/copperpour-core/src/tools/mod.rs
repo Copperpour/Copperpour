@@ -3786,11 +3786,10 @@ pub fn ensure_lib_symbol_in_schematic(
 
     // Flattened: a derived symbol must be embedded with its parent's units
     // copied in, not as a stub kicad-cli can't netlist (#35).
-    let sym_def =
-        match copperpour_schematic_editor::library::resolve_lib_symbol_flattened(lib_id, src) {
-            Some(s) => s,
-            None => return false,
-        };
+    let indent = copperpour_schematic_editor::sexp::writer::detect_indent(content);
+    let Some(sym_def) = format_embedded_lib_symbol(lib_id, src, &indent) else {
+        return false;
+    };
 
     // Edit a copy, so a definition that does not land leaves `content` as it
     // was for the caller to save or discard.
@@ -3824,15 +3823,14 @@ pub fn ensure_lib_symbol_in_schematic(
         else {
             return false;
         };
-        staged.insert_str(after, "\n\t(lib_symbols\n\t)");
+        staged.insert_str(after, &format!("\n{indent}(lib_symbols\n{indent})"));
     }
     if let Some((_, block_end)) = section(&staged)
         .and_then(|start| copperpour_sexp::writer::find_balanced_block(&staged, start))
     {
-        staged.insert_str(
-            block_end - 1,
-            &format!("\n{}\n\t", indent_lib_symbol(&sym_def)),
-        );
+        let close = block_end - 1;
+        let after_last_child = staged[..close].trim_end().len();
+        staged.replace_range(after_last_child..close, &format!("\n{sym_def}\n{indent}"));
     }
     // Report what the content now holds, not that an insert was attempted.
     let embedded = copperpour_sexp::writer::find_direct_child_blocks(&staged, "lib_symbols")
@@ -3844,20 +3842,18 @@ pub fn ensure_lib_symbol_in_schematic(
     embedded
 }
 
-/// A resolved library definition indented to sit inside `lib_symbols`. Shared
-/// so an embedded copy can be compared against the library it came from.
-fn indent_lib_symbol(sym_def: &str) -> String {
-    sym_def
-        .lines()
-        .map(|l| {
-            if l.is_empty() {
-                String::new()
-            } else {
-                format!("\t\t{}", l)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Serialize a flattened library definition as a child of `lib_symbols`,
+/// using the same writer and depth as the schematic model.
+fn format_embedded_lib_symbol(
+    lib_id: &str,
+    src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
+    indent: &str,
+) -> Option<String> {
+    use copperpour_schematic_editor::sexp::writer::write_at_depth;
+
+    let definition =
+        copperpour_schematic_editor::library::resolve_lib_symbol_flattened_node(lib_id, src)?;
+    Some(write_at_depth(&definition, indent, 2))
 }
 
 /// Outcome of re-embedding one symbol definition.
@@ -3894,6 +3890,7 @@ pub(crate) fn reembed_lib_symbols(
     src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
 ) -> Vec<ReembedOutcome> {
     let blocks = copperpour_sexp::writer::find_direct_child_blocks(content, "lib_symbols");
+    let indent = copperpour_schematic_editor::sexp::writer::detect_indent(content);
     let mut outcomes = Vec::with_capacity(lib_ids.len());
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
 
@@ -3907,19 +3904,15 @@ pub(crate) fn reembed_lib_symbols(
         };
         // Flattened, same as the embed path: a derived symbol's copy must
         // carry its parent's units, not an (extends …) stub (#35).
-        let Some(sym_def) =
-            copperpour_schematic_editor::library::resolve_lib_symbol_flattened(lib_id, src)
-        else {
+        let Some(sym_def) = format_embedded_lib_symbol(lib_id, src, &indent) else {
             outcomes.push(ReembedOutcome::Unresolved);
             continue;
         };
         // The leading indentation is already in place before `start`.
-        let indented = indent_lib_symbol(&sym_def);
-        let fresh = indented.trim_start();
-        // Compare parsed, not byte for byte: the two embed paths lay a
-        // definition out differently, and reflowing one is not an update worth
-        // writing. A block that won't parse counts as changed — and forfeits
-        // the pin guard below, which needs both trees to compare anchors.
+        let fresh = sym_def.trim_start();
+        // Layout alone is not a library update, including for files already
+        // written by older Copperpour versions. A block that won't parse
+        // counts as changed and forfeits the pin anchor comparison.
         if let (Ok(embedded), Ok(library)) = (
             copperpour_sexp::parse_sexp(&content[start..end]),
             copperpour_sexp::parse_sexp(fresh),
@@ -3949,9 +3942,8 @@ pub(crate) fn reembed_lib_symbols(
 
 /// The unescaped quoted name in a `(symbol "Lib:Name" …)` definition.
 ///
-/// The name may sit on the same line as `(symbol` or on the next one depending
-/// on which embed path wrote it, so this parses the header token rather than
-/// pattern-matching a single layout.
+/// Older Copperpour releases could put the name on a separate line, so parse
+/// the header token independently of layout.
 fn lib_symbol_name(block: &str) -> Option<String> {
     let block = block.trim_start();
     if !block.starts_with('(') {
