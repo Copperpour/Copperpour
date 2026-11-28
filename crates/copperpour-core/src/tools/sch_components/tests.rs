@@ -1926,6 +1926,10 @@ async fn update_symbols_from_library_refreshes_a_stale_embedded_copy() {
     assert!(!done.is_error, "{done:?}");
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.contains("WIDENED"), "{after}");
+    assert!(
+        after.contains("\n\t\t(symbol \"Device:R\"\n\t\t\t(property"),
+        "{after}"
+    );
     assert!(copperpour_sexp::parse_sexp(&after).is_ok(), "{after}");
 
     // Idempotent: a second run finds nothing to do.
@@ -2653,6 +2657,10 @@ async fn served_update_symbols_from_library_embeds_a_repointed_symbol_on_a_kicad
         .collect();
     assert_eq!(ys, vec![6.35, -6.35]);
     assert!(!embedded_names(&after).contains(&"Passives:RES_ALT".to_string()));
+    assert!(
+        after.contains("\n\t\t(symbol \"Passives:CAP_ALT\"\n\t\t\t(property"),
+        "{after}"
+    );
 
     // Every other item on the sheet, and every copy already embedded, is
     // byte for byte what it was.
@@ -2673,4 +2681,130 @@ async fn served_update_symbols_from_library_embeds_a_repointed_symbol_on_a_kicad
     let now = items(&after, "lib_symbols");
     assert_eq!(now.len(), kept.len() + 1);
     assert_eq!(now[..kept.len()], kept[..]);
+}
+
+#[tokio::test]
+async fn issue_846_replace_prunes_only_the_last_use_of_an_embedded_definition() {
+    let (dir, _env) = stub_symbol_dir();
+    let path = dir.path().join("replace_embedded_kicad10.kicad_sch");
+    let sheet = include_str!("../../../tests/fixtures/replace_embedded_kicad10.kicad_sch");
+    let witness = include_str!("../../../tests/fixtures/dnp_kicad10.kicad_sch");
+    let capacitor = copperpour_sexp::writer::find_direct_child_blocks(witness, "lib_symbols")
+        .into_iter()
+        .map(|(start, end)| &witness[start..end])
+        .find(|block| block.starts_with("(symbol \"Device:C\""))
+        .unwrap();
+    std::fs::write(
+        dir.path().join("Device.kicad_symdir/C.kicad_sym"),
+        format!(
+            "(kicad_symbol_lib (version 20241209) (generator \"eeschema\") {})",
+            capacitor.replacen("\"Device:C\"", "\"C\"", 1)
+        ),
+    )
+    .unwrap();
+
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        auto_load_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // R2 is the first placement in the resaved fixture. The variants change
+    // only its lookup fields unless the definition and both IDs are renamed.
+    let with_r2 = |fields| sheet.replacen("(lib_id \"Device:R\")", fields, 1);
+    let slash = sheet
+        .replace("\"Device:R\"", "\"Device:R/Legacy\"")
+        .replace("(symbol \"R_", "(symbol \"R/Legacy_")
+        .replacen(
+            "(lib_id \"Device:R/Legacy\")",
+            "(lib_id \"Device:R{slash}Legacy\")",
+            1,
+        );
+    let empty_nickname =
+        sheet
+            .replace("\"Device:R\"", "\"R\"")
+            .replacen("(lib_id \"R\")", "(lib_id \":R\")", 1);
+    let (cache_start, cache_end) =
+        copperpour_sexp::writer::find_direct_child_blocks(sheet, "kicad_sch")
+            .into_iter()
+            .find(|&(start, end)| sheet[start..end].starts_with("(lib_symbols"))
+            .unwrap();
+    let mut duplicate_cache = sheet.to_owned();
+    duplicate_cache.insert_str(
+        cache_end,
+        &format!("\n\t{}", &sheet[cache_start..cache_end]),
+    );
+    for (fixture, old_definition, replacements) in [
+        (
+            sheet.to_owned(),
+            "Device:R",
+            &[("R1", None), ("R2", Some("Device:R"))][..],
+        ),
+        (
+            with_r2("(lib_name \"Device:R\")\n\t\t(lib_id \"Device:C\")"),
+            "Device:R",
+            &[("R2", None), ("R1", None)][..],
+        ),
+        (
+            with_r2("(lib_name \"\")\n\t\t(lib_id \"Device:R\")"),
+            "Device:R",
+            &[("R1", None)][..],
+        ),
+        (
+            slash,
+            "Device:R/Legacy",
+            &[("R1", None), ("R2", Some("Device:R/Legacy"))][..],
+        ),
+        (empty_nickname, "R", &[("R1", None), ("R2", Some("R"))][..]),
+        (
+            with_r2("(lib_id \"Device:C\")\n\t\t(lib_id \"Device:R\")"),
+            "Device:R",
+            &[("R1", None)][..],
+        ),
+        (
+            with_r2(
+                "(lib_id \"Device:C\")\n\t\t(lib_name \"Device:C\")\n\t\t(lib_name \"Device:R\")",
+            ),
+            "Device:R",
+            &[("R1", None)][..],
+        ),
+        (
+            duplicate_cache,
+            "Device:R",
+            &[("R1", None), ("R2", None)][..],
+        ),
+    ] {
+        let cache_count = fixture.matches("\n\t(lib_symbols\n").count();
+        std::fs::write(&path, fixture).unwrap();
+        for &(reference, removed) in replacements {
+            let result = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 846, "method": "tools/call",
+                    "params": {"name": "replace_component", "arguments": {
+                        "schematic": path, "reference": reference, "new_lib_id": "Device:C"
+                    }}
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            assert_ne!(result["isError"], true, "{result}");
+            let body: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            let expected_names = if removed.is_some() {
+                vec!["Device:C"]
+            } else {
+                vec![old_definition, "Device:C"]
+            };
+            assert_eq!(after.matches("\n\t(lib_symbols\n").count(), cache_count);
+            assert_eq!(embedded_names(&after), expected_names, "{reference}");
+            assert_eq!(body.get("removed_lib_symbol"), Some(&json!(removed)));
+            let tree = copperpour_sexp::parse_sexp(&after).unwrap();
+            let instances = extract_symbol_instances(&tree);
+            let replaced = instances.iter().find(|i| i.reference == reference).unwrap();
+            assert_eq!(replaced.lib_id, "Device:C");
+            assert!(after.contains(&format!("\n\t\t{capacitor}\n")), "{after}");
+        }
+    }
 }

@@ -123,8 +123,8 @@ and Windows servers do not.
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same fields. |
 | `add_component_annotation` | Add or update a custom property supplied as `key` and `value` across every placed unit of a component. A key named `DNP` is refused: set the native attribute with `edit_schematic_component`'s `dnp`. |
 | `group_components` | Add or update a group property across every placed unit of multiple components. |
-| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
-| `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library", and embed one the sheet lacks (reported in `added`). Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
+| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. Write new definitions in KiCad layout and report the old definition as `removed_lib_symbol` when its last use is replaced. |
+| `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library", and embed one the sheet lacks (reported in `added`). Write new and refreshed definitions in KiCad layout. Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
 

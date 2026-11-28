@@ -21,8 +21,7 @@ pub fn write(node: &SexpNode) -> String {
 /// Callers that loaded a file should pass the indent that file already used,
 /// so a targeted edit stays a targeted diff.
 pub fn write_with_indent(node: &SexpNode, indent: &str) -> String {
-    let mut buf = String::with_capacity(16384);
-    write_node(node, &mut buf, 0, indent);
+    let mut buf = write_at_depth(node, indent, 0);
     buf.push('\n');
     buf
 }
@@ -31,6 +30,15 @@ pub fn write_with_indent(node: &SexpNode, indent: &str) -> String {
 pub fn write_schematic_item(node: &SexpNode, indent: &str) -> String {
     let mut buf = String::new();
     write_node(node, &mut buf, 1, indent);
+    buf
+}
+
+/// Write a node at its depth in a containing document, including its leading
+/// indentation. The caller supplies the surrounding line breaks.
+pub fn write_at_depth(node: &SexpNode, indent: &str, depth: usize) -> String {
+    let mut buf = String::with_capacity(16384);
+    write_indent(&mut buf, depth, indent);
+    write_node(node, &mut buf, depth, indent);
     buf
 }
 

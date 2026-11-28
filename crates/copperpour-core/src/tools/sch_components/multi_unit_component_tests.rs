@@ -2873,9 +2873,8 @@ async fn replace_rejects_an_ambiguous_unit_override_without_writing() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
-/// Parts replaced in turn by one symbol share one embedded copy of it:
-/// the copy the first replace writes, its name on the line after
-/// `(symbol`, and the copy eeschema wrote, its name on the same line.
+/// Parts replaced in turn by one symbol share one embedded copy, whether
+/// the existing copy uses KiCad's layout or the old Copperpour split header.
 #[tokio::test]
 async fn replace_by_one_symbol_keeps_one_embedded_copy() {
     const SHEET: &str = include_str!("../../../tests/fixtures/trace_point_kicad10.kicad_sch");
@@ -2894,10 +2893,13 @@ async fn replace_by_one_symbol_keeps_one_embedded_copy() {
             assert!(!result.is_error, "{new_lib_id} {reference}: {result:?}");
             let written = std::fs::read_to_string(&path).unwrap();
             if new_lib_id == "Fields:FIELDS_BARE" && reference == "R1" {
+                let header = "(symbol \"Fields:FIELDS_BARE\"";
                 assert!(
-                    !written.contains("(symbol \"Fields:FIELDS_BARE\""),
-                    "premise: the first replace writes the name on its own line"
+                    written.contains(header),
+                    "the first replacement embeds the symbol"
                 );
+                let legacy = written.replacen(header, "(symbol\n\t\t  \"Fields:FIELDS_BARE\"", 1);
+                std::fs::write(&path, legacy).unwrap();
             }
             let tree = parse_sexp(&written).unwrap();
             let copies = tree.find("lib_symbols").map_or(0, |libraries| {
