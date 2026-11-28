@@ -264,7 +264,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete",
             "Delete multiple schematic items (wires, labels, junctions, components) by UUID \
-             (`uuids`) or component reference designator (`references`) — single file write.",
+              (`uuids`) or component reference designator (`references`) in a single file write. \
+              Prunes redundant junctions touched by removed wires.",
             json!({
                 "type": "object",
                 "properties": {

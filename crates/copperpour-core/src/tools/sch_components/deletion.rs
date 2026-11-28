@@ -5,7 +5,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tools::{get_path, require_str, ToolContext};
 use copperpour_sexp::{
     commit_command, parse_sexp, prepare_command,
-    schematic::{extract_symbol_instances, pin_endpoint},
+    schematic::{extract_symbol_instances, extract_wires, pin_endpoint},
     writer::{find_direct_child_blocks, read_consistent},
     ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
@@ -346,6 +346,19 @@ pub(crate) fn plan_component_and_item_deletions(
     let candidate = prepare_command(path, content, &initial)
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
         .0;
+    let removed_wires = extract_wires(&tree)
+        .into_iter()
+        .filter(|wire| {
+            wire.uuid
+                .as_ref()
+                .is_some_and(|uuid| item_uuids.binary_search(uuid).is_ok())
+        })
+        .collect::<Vec<_>>();
+    let candidate = if removed_wires.is_empty() {
+        candidate
+    } else {
+        crate::tools::sch_wiring::prune_orphaned_junctions(candidate, &removed_wires).0
+    };
     let (reconciled, _, _) = crate::tools::sch_wiring::reconcile_junctions_at(candidate, &affected);
 
     let after_items = indexed_uuid_items(path, &reconciled)?;
