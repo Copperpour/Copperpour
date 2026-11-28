@@ -3,8 +3,8 @@
 //! Everything inside the box moves by one `(dx, dy)`, so connectivity inside
 //! the box cannot change. What can change is the boundary, and none of
 //! eeschema's drag rules (#315) are needed to guard it: a wire, bus, bus entry
-//! or sheet that crosses the edge refuses the move, and the pin nets of the
-//! whole sheet must come out of the move exactly as they went in.
+//! or sheet that crosses the edge refuses the move, and the sheet's pin nets
+//! and named nets must stay unchanged.
 
 use crate::tools::sch_connectivity::{
     net_graph_for, saved_net_labels, snapshot_net_graph, NetGraph, NetRoot, PinNetNames,
@@ -322,14 +322,13 @@ pub(super) enum NetComparison {
     Cleanup,
 }
 
-/// Every symbol and sheet pin's net, or `None` if pin geometry is unresolved.
-fn pin_nets(tree: &SexpNode) -> Option<PinNets> {
+fn move_net_graph(tree: &SexpNode) -> NetGraph {
     let wires = extract_wires(tree);
     let labels = saved_net_labels(tree);
-    let mut graph = net_graph_for(tree, &wires, &labels);
-    collect_pin_nets(tree, &mut graph, &BTreeSet::new(), NetComparison::Move)
+    net_graph_for(tree, &wires, &labels)
 }
 
+/// Every symbol and sheet pin's net, or `None` if pin geometry is unresolved.
 fn collect_pin_nets(
     tree: &SexpNode,
     graph: &mut NetGraph,
@@ -410,12 +409,33 @@ fn collect_pin_nets(
     Some(nets)
 }
 
-/// How the move would change the sheet's pin nets.
+/// How the move would change the sheet's pin nets or named nets.
 ///
 /// Pins are compared by the net they share with other pins and by the net's
 /// name, never by position, since every pin in the box moves.
-pub(crate) fn pin_net_changes(before: &SexpNode, after: &SexpNode) -> Vec<String> {
-    compare_pin_nets(pin_nets(before), pin_nets(after))
+pub(crate) fn move_net_changes(before: &SexpNode, after: &SexpNode) -> Vec<String> {
+    let (mut was, mut now) = (move_net_graph(before), move_net_graph(after));
+    let mut reasons = compare_pin_nets(
+        collect_pin_nets(before, &mut was, &BTreeSet::new(), NetComparison::Move),
+        collect_pin_nets(after, &mut now, &BTreeSet::new(), NetComparison::Move),
+    );
+    if reasons.is_empty() {
+        compare_named_nets(&mut reasons, &mut was, &mut now);
+    }
+    reasons
+}
+
+#[cfg(test)]
+pub(super) fn pin_net_changes(before: &SexpNode, after: &SexpNode) -> Vec<String> {
+    let pins = |tree| {
+        collect_pin_nets(
+            tree,
+            &mut move_net_graph(tree),
+            &BTreeSet::new(),
+            NetComparison::Move,
+        )
+    };
+    compare_pin_nets(pins(before), pins(after))
 }
 
 /// Omit only the removed pins from the comparison, not their original
@@ -439,6 +459,11 @@ pub(super) fn snapshot_net_changes(
         collect_pin_nets(before, &mut was, removed, comparison),
         collect_pin_nets(after, &mut now, &BTreeSet::new(), comparison),
     );
+    compare_named_nets(&mut reasons, &mut was, &mut now);
+    reasons
+}
+
+fn compare_named_nets(reasons: &mut Vec<String>, was: &mut NetGraph, now: &mut NetGraph) {
     // A named net can have no surviving pins that witness a name or scope change.
     let (was, now) = (was.named_net_aliases(), now.named_net_aliases());
     for (_, (name, _)) in was.difference(&now) {
@@ -449,7 +474,6 @@ pub(super) fn snapshot_net_changes(
     for (_, (name, _)) in now.difference(&was) {
         reasons.push(format!("net {name} has a new name or scope on the sheet"));
     }
-    reasons
 }
 
 fn compare_pin_nets(before: Option<PinNets>, after: Option<PinNets>) -> Vec<String> {
@@ -580,7 +604,7 @@ mod tests {
         (directory, path)
     }
 
-    async fn served_move(path: &Path, area: [f64; 4], dx: f64, dy: f64) -> (bool, Value) {
+    async fn served_call(name: &str, arguments: Value) -> (bool, Value) {
         let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
             auto_load_toolsets: true,
             ..ServerConfig::default()
@@ -589,11 +613,7 @@ mod tests {
         .unwrap();
         let result = handler
             .handle_message(json!({"jsonrpc": "2.0", "id": 896, "method": "tools/call",
-            "params": {"name": "move_region", "arguments": {
-                "schematic": path.display().to_string(),
-                "x1": area[0], "y1": area[1], "x2": area[2], "y2": area[3],
-                "dx": dx, "dy": dy, "include": "all"
-            }}}))
+            "params": {"name": name, "arguments": arguments}}))
             .await
             .unwrap()
             .result
@@ -601,6 +621,18 @@ mod tests {
         let is_error = result["isError"].as_bool().unwrap_or(false);
         let text = result["content"][0]["text"].as_str().unwrap();
         (is_error, serde_json::from_str(text).unwrap())
+    }
+
+    async fn served_move(path: &Path, area: [f64; 4], dx: f64, dy: f64) -> (bool, Value) {
+        served_call(
+            "move_region",
+            json!({
+                "schematic": path.display().to_string(),
+                "x1": area[0], "y1": area[1], "x2": area[2], "y2": area[3],
+                "dx": dx, "dy": dy, "include": "all"
+            }),
+        )
+        .await
     }
 
     /// The `(at …)`, or first `(xy …)`, of the top-level item with `uuid`.
@@ -628,7 +660,13 @@ mod tests {
     fn nets(content: &str) -> BTreeSet<(Option<String>, BTreeSet<String>)> {
         let tree = copperpour_sexp::parse_sexp(content).unwrap();
         let mut by_root: HashMap<NetRoot, (Option<String>, BTreeSet<String>)> = HashMap::new();
-        for (root, name, label) in pin_nets(&tree).unwrap().into_values() {
+        let pins = collect_pin_nets(
+            &tree,
+            &mut move_net_graph(&tree),
+            &BTreeSet::new(),
+            NetComparison::Move,
+        );
+        for (root, name, label) in pins.unwrap().into_values() {
             let name = name.map(|(name, _)| name);
             by_root
                 .entry(root)
@@ -883,6 +921,158 @@ mod tests {
             &format!("the net of [{SHEET_PIN}] would be renamed from SP_NET to D0"),
         )
         .await;
+    }
+
+    const NAMED_ROOT: &str =
+        include_str!("../../tests/fixtures/region_move_named_nets_kicad10/opamp_stage.kicad_sch");
+    const NAMED_CHILDREN: [(&str, &str); 2] = [
+        (
+            "a.kicad_sch",
+            include_str!("../../tests/fixtures/region_move_named_nets_kicad10/a.kicad_sch"),
+        ),
+        (
+            "b.kicad_sch",
+            include_str!("../../tests/fixtures/region_move_named_nets_kicad10/b.kicad_sch"),
+        ),
+    ];
+    const LABEL_A: &str = "307e9220-7a50-41ef-99dc-53923d7076cb";
+    const LABEL_B: &str = "43c12ee5-d4d6-406e-84ab-9db309968186";
+
+    fn named_net_fixture() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opamp_stage.kicad_sch");
+        std::fs::write(&path, NAMED_ROOT).unwrap();
+        for (name, content) in NAMED_CHILDREN {
+            std::fs::write(path.with_file_name(name), content).unwrap();
+        }
+        (directory, path)
+    }
+
+    fn assert_children_unchanged(path: &Path) {
+        for (name, content) in NAMED_CHILDREN {
+            assert_eq!(
+                std::fs::read(path.with_file_name(name)).unwrap(),
+                content.as_bytes()
+            );
+        }
+    }
+
+    async fn offset_label_a(path: &Path, dy: f64) {
+        let (is_error, response) = served_call(
+            "move_labels_by_offset",
+            json!({
+                "schematic": path.display().to_string(), "net": "A", "dx": 0, "dy": dy
+            }),
+        )
+        .await;
+        assert!(!is_error, "{response}");
+        assert_eq!(response["moved_labels"], 1);
+    }
+
+    async fn assert_named_join_refused(path: &Path, y: f64) {
+        let before = std::fs::read_to_string(path).unwrap();
+        assert_eq!(anchor_of(&before, LABEL_A), (40.0, y));
+        let area = [39.99, y - 0.00005, 40.01, y + 0.00005];
+        let (is_error, response) = served_move(path, area, 0.0, 40.0 - y).await;
+        assert!(is_error, "{response}");
+        assert_eq!(response["error"]["kind"], "plan_blocked");
+        let reasons = response["error"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons.contains(&json!(
+                "net B no longer has its baseline name and scope on the sheet"
+            )),
+            "{response}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before.as_bytes());
+        assert_children_unchanged(path);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn rigid_move_blocks_named_joins_without_pins_on_the_root_sheet() {
+        let (_directory, path) = named_net_fixture();
+        offset_label_a(&path, -0.019).await;
+        assert_named_join_refused(&path, 40.001).await;
+    }
+
+    #[tokio::test]
+    async fn rigid_move_preserves_a_label_just_off_the_wire() {
+        let (_directory, path) = named_net_fixture();
+        let area = [39.99, 40.0199, 40.01, 40.0201];
+        let (is_error, response) = served_move(&path, area, 0.0, -0.0198).await;
+        assert!(!is_error, "{response}");
+        assert_eq!(response["items_moved"], json!({"global_labels": 1}));
+        let observed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(anchor_of(&observed, LABEL_A), (40.0, 40.0002));
+        assert_eq!(anchor_of(&observed, LABEL_B), (30.0, 40.0));
+        let wires = extract_wires(&copperpour_sexp::parse_sexp(&observed).unwrap());
+        assert_eq!(wires.len(), 1);
+        let wire = &wires[0];
+        assert_eq!(
+            (wire.x1, wire.y1, wire.x2, wire.y2),
+            (30.0, 40.0, 50.32, 40.0)
+        );
+        assert_children_unchanged(&path);
+    }
+
+    #[tokio::test]
+    async fn rigid_move_blocks_a_split_across_the_label_attachment_boundary() {
+        let (_directory, path) = named_net_fixture();
+        offset_label_a(&path, -0.0199).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(anchor_of(&before, LABEL_A), (40.0, 40.0001));
+        // The starting anchor attaches electrically but is outside the wire's
+        // geometry, so the selection can move the label without cutting a wire.
+        let area = [39.99, 40.00005, 40.01, 40.00015];
+        let (is_error, response) = served_move(&path, area, 0.0, 0.0001).await;
+        assert!(is_error, "{response}");
+        assert_eq!(response["error"]["kind"], "plan_blocked");
+        assert_eq!(
+            response["error"]["reasons"],
+            json!([
+                "net B no longer has its baseline name and scope on the sheet",
+                "net B has a new name or scope on the sheet"
+            ])
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before.as_bytes());
+        assert_children_unchanged(&path);
+    }
+
+    #[tokio::test]
+    async fn rigid_move_blocks_a_named_join_at_a_diagonal_interior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opamp_stage.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!(
+                "../../tests/fixtures/label_attachment_kicad10/diagonal-two/opamp_stage.kicad_sch"
+            ),
+        )
+        .unwrap();
+        // A wins before and after at J2.1; only the alias comparison can
+        // detect the join to TOLERANT_OUT at the diagonal's interior.
+        let (is_error, response) = served_call(
+            "add_schematic_net_label",
+            json!({"schematic": path, "net": "A", "x": 134.62, "y": 88.9048}),
+        )
+        .await;
+        assert!(!is_error, "{response}");
+        let before = std::fs::read(&path).unwrap();
+        let (is_error, response) =
+            served_move(&path, [165.09, 88.90245, 165.11, 88.90255], 0.0, -0.0002).await;
+        assert!(is_error, "{response}");
+        assert_eq!(response["error"]["kind"], "plan_blocked");
+        assert_eq!(
+            response["error"]["reasons"],
+            json!([
+                "net TOLERANT_OUT no longer has its baseline name and scope on the sheet",
+                "net TOLERANT_OUT has a new name or scope on the sheet"
+            ])
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// Unannotated, R2 and R4 are both `R?`. R2 lands on R4, stacking the two

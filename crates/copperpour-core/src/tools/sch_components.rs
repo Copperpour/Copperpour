@@ -380,8 +380,8 @@ pub fn tools() -> Vec<ToolDef> {
              no-connects, texts, text boxes, directive labels and sheets inside the box, counted \
              by kind in items_moved (no-connects in no_connects_moved); graphic shapes and \
              images stay. It is refused before writing (plan_blocked) when a wire, \
-             bus, bus entry, symbol or sheet crosses the box edge, or when any pin's net would \
-             change. \
+             bus, bus entry, symbol or sheet crosses the box edge, or when a pin's net or \
+             a named net would change. \
              Junction dots are re-judged once for the whole region where its pins moved, \
              reported as junctions_pruned_count and junctions_added_count. No-connect flags \
              travel with the pins they protect, reported as no_connects_moved; the move is \
