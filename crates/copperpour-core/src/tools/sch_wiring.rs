@@ -2417,7 +2417,7 @@ pub(crate) fn reconcile_junctions_at(
 /// [`reconcile_junctions_at`], the rule a component move is judged by, so a T
 /// whose branch is deleted loses its dot at the corner left (#136). Junctions
 /// no removed wire touched are left alone.
-fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
+pub(crate) fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
     const TOL: f64 = 0.01;
     // The dots the removed wires ran through. Most deletions find none, and
     // the reconcile's document parse is only for those.
@@ -11389,6 +11389,139 @@ mod wire_end_junction_tests {
         .await;
         assert_eq!(text, "Wire deleted. Removed 1 orphaned junction(s).");
         assert_dots("the corner left", &file(&path), &[]);
+    }
+
+    const DELETE_TEE: [Segment; 3] = [((101.6, 101.6), T), (T, (127.0, 101.6)), (T, (114.3, 88.9))];
+
+    async fn compare_batch_wire_deletes(
+        handler: &crate::mcp::handler::McpHandler,
+        path: &std::path::Path,
+        removed: &[Segment],
+        expected_dots: &[(f64, f64)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, dedicated_path) = sheet();
+        std::fs::copy(path, &dedicated_path).unwrap();
+        let before = parse_sexp(&file(path)).unwrap();
+        let wires = extract_wires(&before);
+        let uuids = removed
+            .iter()
+            .map(|&(a, b)| {
+                let wire = wires
+                    .iter()
+                    .find(|w| [(w.x1, w.y1), (w.x2, w.y2)] == [a, b])
+                    .expect("selected segment exists on disk");
+                wire.uuid.clone().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for (tool, target) in [
+            ("batch_delete_schematic_wire", dedicated_path.as_path()),
+            ("batch_delete", path),
+        ] {
+            let text = call(handler, tool, target, json!({ "uuids": uuids })).await;
+            let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["errors"], json!([]), "{tool}: {result}");
+            let saved = file(target);
+            assert_dots(tool, &saved, expected_dots);
+            let after = parse_sexp(&saved).unwrap();
+            let surviving_wires = extract_wires(&after);
+            assert_eq!(
+                result["junctions_pruned_count"],
+                before.find_all("junction").len() - expected_dots.len(),
+                "{tool}: {result}"
+            );
+            assert_eq!(surviving_wires.len(), wires.len() - uuids.len(), "{tool}");
+            assert!(surviving_wires
+                .iter()
+                .all(|w| !uuids.contains(w.uuid.as_ref().unwrap())));
+            results.push(after);
+        }
+        assert_eq!(results[0], results[1], "the tools must save the same items");
+        (dir, dedicated_path)
+    }
+
+    #[tokio::test]
+    async fn batch_delete_prunes_a_tees_branch_dot_like_wire_delete() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(&handler, &path, &DELETE_TEE).await;
+        assert_dots("before deletion", &file(&path), &[T]);
+        compare_batch_wire_deletes(&handler, &path, &DELETE_TEE[2..], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn batch_delete_prunes_a_dot_when_all_its_wires_go() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        let mut cross = DELETE_TEE.to_vec();
+        cross.push(((114.3, 114.3), T));
+        draw(&handler, &path, &cross).await;
+        assert_dots("before deletion", &file(&path), &[T]);
+        compare_batch_wire_deletes(&handler, &path, &cross, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn batch_delete_keeps_needed_and_untouched_dots() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        let cross = (137.16, 97.79);
+        let left = (132.08, 97.79);
+        let arm = (cross, (137.16, 106.68));
+        let untouched = (114.3, 127.0);
+        let untouched_end = (101.6, 127.0);
+        draw(&handler, &path, &DELETE_TEE).await;
+        draw(
+            &handler,
+            &path,
+            &[
+                (left, cross),
+                (cross, PIN_1),
+                (cross, (137.16, 88.9)),
+                arm,
+                (untouched_end, untouched),
+                (untouched, (127.0, 127.0)),
+                (untouched, (114.3, 119.38)),
+            ],
+        )
+        .await;
+        // An unrelated dot that a whole-sheet prune would incorrectly remove.
+        call(
+            &handler,
+            "add_junction",
+            &path,
+            json!({ "x": untouched_end.0, "y": untouched_end.1 }),
+        )
+        .await;
+        call(
+            &handler,
+            "add_schematic_net_label",
+            &path,
+            json!({ "net": "CROSS", "x": left.0, "y": left.1 }),
+        )
+        .await;
+        assert_dots(
+            "before deletion",
+            &file(&path),
+            &[T, cross, untouched, untouched_end],
+        );
+        let (_peer_dir, peer) = compare_batch_wire_deletes(
+            &handler,
+            &path,
+            &[DELETE_TEE[2], arm],
+            &[cross, untouched, untouched_end],
+        )
+        .await;
+        for target in [&path, &peer] {
+            let text = call(
+                &handler,
+                "get_pin_net_name",
+                target,
+                json!({ "reference": "R1", "pin_number": "1" }),
+            )
+            .await;
+            let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(pin["net"], "CROSS", "{pin}");
+        }
     }
 
     /// One arm off a cross leaves a T, three exits, and the dot stays.
